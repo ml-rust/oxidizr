@@ -2,12 +2,12 @@
 name = "oxidizr"
 version = "0.1.0"
 edition = "2021"
-authors = ["Farhan Syah <farhan@fs90.dev>"]
+authors = ["Farhan Syah "]
 description = "A Rust-based LLM training framework"
 license = "Apache-2.0"
-repository = "https://github.com/farhan-syah/oxidizr"
-homepage = "https://github.com/farhan-syah/oxidizr"
-documentation = "https://github.com/farhan-syah/oxidizr/tree/main/docs"
+repository = "https://github.com/ml-rust/oxidizr"
+homepage = "https://github.com/ml-rust/oxidizr"
+documentation = "https://github.com/ml-rust/oxidizr/tree/main/docs"
 readme = "README.md"
 keywords = ["llm", "machine-learning", "transformer", "mamba", "training"]
 categories = ["science", "command-line-utilities", "development-tools"]
@@ -23,19 +23,19 @@ exclude = [
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# CUDA GPU acceleration (via boostr CubeCL backend)
+cuda = ["boostr/cuda"]
 # NCCL backend for high-performance multi-GPU gradient synchronization
 # Requires NCCL library installed on the system
-nccl = ["cuda", "dep:cudarc"]
+nccl = ["cuda", "boostr/nccl"]
 # HuggingFace Hub integration for model publishing
 huggingface = ["dep:hf-hub"]
 
 [dependencies]
-# The Core ML Framework (git version for CUDA 13.x support)
-# For crates.io publishing, use Cargo.crates-io.toml (CUDA 12.x only)
-candle-core = { git = "https://github.com/huggingface/candle.git" }
-candle-nn = { git = "https://github.com/huggingface/candle.git" }
-candle-transformers = { git = "https://github.com/huggingface/candle.git" }
+# boostr: Complete ML framework replacing Candle
+# Provides: Tensor, Device, DType, Linear, Embedding, VarBuilder, etc.
+# Also re-exports cubecl_cuda::CudaRuntime when cuda feature is enabled
+boostr = { path = "../boostr" }
 
 # Data & Config
 serde = { version = "1.0", features = ["derive"] }
@@ -63,10 +63,3 @@ dialoguer = "0.11"
 
 # HuggingFace Hub (optional, for model publishing)
 hf-hub = { version = "0.4", optional = true }
-
-# CUDA runtime (for NCCL support)
-# Uses same version as candle-core for compatibility
-cudarc = { version = "0.18", optional = true, default-features = false, features = [
-    "driver",
-    "nccl",
-] }

@@ -1,9 +1,12 @@
-use candle_core::{Device, Result, Tensor};
-use candle_nn::{Optimizer, VarMap};
+use crate::prelude::{
+    FusedAdamW, cross_entropy, Device, Error, GradStore,
+    Result, Tensor, VarMap
+};
+use boostr::AdamWConfig;
 use crate::config::{BlazrConfig, CheckpointMeta, ModelConfig, TrainerConfig};
 use crate::data::DataLoader;
 use crate::distributed::{
-    GradientSynchronizer, DistributedAdamW, AdamWConfig,
+    GradientSynchronizer, DistributedAdamW, AdamWConfig as DistAdamWConfig,
     create_synchronizer, compute_grad_norm,
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -16,8 +19,8 @@ use std::io::Write;
 /// It owns the loop state, the optimizer, and handles the "boring" stuff.
 pub struct LitTrainer<'a> {
     config: TrainerConfig,
-    varmap: &'a VarMap,
-    optimizer: candle_nn::AdamW,
+    varmap: &'a mut VarMap,
+    optimizer: FusedAdamW,
     #[allow(dead_code)]  // Kept for potential future use (e.g., device-specific optimizations)
     device: Device,
     global_step: usize,
@@ -45,7 +48,7 @@ pub struct LitTrainer<'a> {
 impl<'a> LitTrainer<'a> {
     pub fn new(
         config: TrainerConfig,
-        varmap: &'a VarMap,
+        varmap: &'a mut VarMap,
         device: Device,
         dataset_size: usize,
         batch_size: usize,
@@ -56,12 +59,15 @@ impl<'a> LitTrainer<'a> {
         model_config: ModelConfig,
         data_file_path: Option<String>,
     ) -> Result<Self> {
-        // Init AdamW with standard parameters
-        let params = candle_nn::ParamsAdamW {
-            lr: config.learning_rate,
-            ..Default::default()
-        };
-        let optimizer = candle_nn::AdamW::new(varmap.all_vars(), params)?;
+        // Init FusedAdamW with standard parameters
+        let optimizer = FusedAdamW::from_varmap_with_config(
+            varmap,
+            AdamWConfig {
+                lr: config.learning_rate as f32,
+                weight_decay: 0.01,
+                ..Default::default()
+            },
+        );
 
         // Calculate total steps from dataset
         let effective_batch_size = batch_size * seq_len * config.gradient_accumulation;
@@ -73,7 +79,7 @@ impl<'a> LitTrainer<'a> {
             let sync = create_synchronizer(&config.distributed)?;
             let dist_opt = DistributedAdamW::new(
                 varmap,
-                AdamWConfig::with_lr(config.learning_rate),
+                DistAdamWConfig::with_lr(config.learning_rate),
             )?;
             (Some(sync), Some(dist_opt))
         } else {
@@ -114,35 +120,27 @@ impl<'a> LitTrainer<'a> {
         data_loader: &mut D
     ) -> Result<(f64, f64)> {
 
-        let mut total_loss = 0.0;
+        let mut total_loss_for_logging = 0.0;
+        #[allow(unused_assignments)]
         let mut last_grad_norm = 0.0;
         let accum_steps = self.config.gradient_accumulation;
         let load_balance_alpha = self.config.load_balance_alpha;
-        let max_grad_norm = 1.0; // Standard clipping threshold
 
-        // Compute loss pre-scale factor based on previous step's gradient norm.
-        // This is a heuristic that effectively clips gradients without modifying GradStore.
-        //
-        // IMPORTANT: This has a one-step lag - if gradients explode at step N, clipping
-        // won't take effect until step N+1. This is acceptable because:
-        // 1. Gradient explosions typically build up over multiple steps
-        // 2. The alternative (two backward passes) doubles compute cost
-        // 3. AdamW's momentum naturally smooths out single-step spikes
-        let loss_prescale = if let Some(prev_norm) = self.prev_grad_norm {
-            if prev_norm > max_grad_norm {
-                // Scale factor to bring gradients within bounds
-                // No lower clamp - if gradients are 100x too large, we need 100x reduction
-                max_grad_norm / (prev_norm + 1e-6)
-            } else {
-                1.0
-            }
-        } else {
-            1.0 // First step: no scaling (gradients typically small at init)
-        };
+        // Note: max_grad_value (per-element clipping) is handled by FusedAdamW's built-in clamping (±1e4)
+        // Global gradient clipping and normalization are applied below before optimizer.step()
+        let _max_grad_value = self.config.max_grad_value;
 
-        // Gradient Accumulation Loop
-        for _ in 0..accum_steps {
+        // Accumulated loss tensor across micro-batches
+        // We accumulate losses as tensors (keeping computation graph), then call backward once
+        let mut accumulated_loss: Option<Tensor> = None;
+
+        // Gradient Accumulation Loop - only forward passes, accumulate losses
+        for _micro_batch_idx in 0..accum_steps {
             let (input, target) = data_loader.next_batch()?;
+
+            // Register parameters as requires_grad on the tape for this forward pass
+            // This ensures gradient computation works correctly after tape.clear()
+            self.varmap.register_requires_grad();
 
             // Forward pass (returns logits + auxiliary losses)
             let output = model.forward(&input)?;
@@ -150,43 +148,27 @@ impl<'a> LitTrainer<'a> {
             let aux_losses = output.aux_losses;
 
             // Check for NaN in logits (indicates model forward pass issue)
-            if let Ok(logits_vec) = logits.flatten_all()?.to_vec1::<f32>() {
+            if let Ok(logits_vec) = logits.flatten_all()?.to_vec::<f32>() {
                 if logits_vec.iter().any(|x| x.is_nan() || x.is_infinite()) {
                     eprintln!("\n❌ NaN/Inf in model logits! This indicates:");
                     eprintln!("   1. Numerical instability in forward pass");
                     eprintln!("   2. RoPE or attention computation overflow");
                     eprintln!("   3. Mamba SSM state explosion");
-                    return Err(candle_core::Error::Msg("NaN in logits".to_string()));
+                    return Err(Error::Msg("NaN in logits".to_string()));
                 }
             }
 
             // Calculate Loss (Cross Entropy)
             // Flatten batch/seq dims for cross_entropy: [Batch*Seq, Vocab]
             // Note: logits are already F32 from model forward (cast for stable loss computation)
+            // Use reshape_tracked to record on tape for gradient flow
             let (b, s, v) = logits.dims3()?;
-            let logits_flat = logits.reshape((b * s, v))?;
+            let logits_flat = logits.reshape_tracked((b * s, v))?;
             let target_flat = target.reshape(b * s)?;
 
-            let ce_loss_per_token = candle_nn::loss::cross_entropy(&logits_flat, &target_flat)?;
+            let ce_loss_per_token = cross_entropy(&logits_flat, &target_flat)?;
             let ce_loss = ce_loss_per_token.mean_all()?;
             // Note: mean_all() returns a scalar on CPU but may need squeezing on CUDA in some cases
-
-            // Add auxiliary losses (e.g., MoE load balancing)
-            let mut total_aux_loss = 0.0;
-            for aux_loss in &aux_losses {
-                // CRITICAL: CUDA can return [1,1] instead of scalar - squeeze manually
-                let mut loss_t = aux_loss.clone();
-                while loss_t.rank() > 0 && loss_t.elem_count() == 1 {
-                    loss_t = loss_t.squeeze(0)?;
-                }
-                let loss_val = loss_t.to_vec0::<f32>()? as f64;
-                total_aux_loss += loss_val;
-            }
-            let avg_aux_loss = if !aux_losses.is_empty() {
-                total_aux_loss / aux_losses.len() as f64
-            } else {
-                0.0
-            };
 
             // Check for NaN in CE loss before combining
             let ce_loss_val = ce_loss.to_vec0::<f32>()? as f64;
@@ -196,64 +178,137 @@ impl<'a> LitTrainer<'a> {
                 eprintln!("   2. Gradient explosion (sequence too long)");
                 eprintln!("   3. Numerical instability in model");
                 eprintln!("   Current CE loss: {}", ce_loss_val);
-                return Err(candle_core::Error::Msg("NaN loss detected".to_string()));
+                return Err(Error::Msg("NaN loss detected".to_string()));
             }
 
-            // Combine losses: total = ce_loss + alpha * avg_aux_loss
-            let aux_tensor = Tensor::new(avg_aux_loss as f32, ce_loss.device())?.to_dtype(ce_loss.dtype())?;
-            let alpha_tensor = Tensor::new(load_balance_alpha as f32, ce_loss.device())?.to_dtype(ce_loss.dtype())?;
-            let weighted_aux = aux_tensor.mul(&alpha_tensor)?;
-            let loss = ce_loss.clone().add(&weighted_aux)?;
+            // Add auxiliary losses (e.g., MoE load balancing) - keep as tensors for gradient flow
+            // IMPORTANT: Don't use to_vec0 here as it breaks the gradient chain!
+            let mut loss = ce_loss.clone();
+            let mut avg_aux_loss = 0.0;  // For logging only
+            if !aux_losses.is_empty() {
+                // Sum all aux losses as tensors, then scale by alpha/count
+                let num_aux = aux_losses.len() as f32;
+                for aux_loss in &aux_losses {
+                    // CRITICAL: CUDA can return [1,1] instead of scalar - squeeze manually
+                    let mut loss_t = aux_loss.clone();
+                    while loss_t.rank() > 0 && loss_t.elem_count() == 1 {
+                        loss_t = loss_t.squeeze(0)?;
+                    }
+                    // For logging, extract scalar value (doesn't affect gradient)
+                    avg_aux_loss += loss_t.to_vec0::<f32>()? as f64;
+                    // Add scaled aux loss to total loss (preserves gradient chain)
+                    let scaled_aux = loss_t.scale((load_balance_alpha / num_aux as f64) as f32)?;
+                    loss = loss.add(&scaled_aux)?;
+                }
+                avg_aux_loss /= num_aux as f64;
+            }
 
             // Check combined loss
             let total_loss_val = loss.to_vec0::<f32>()? as f64;
             if total_loss_val.is_nan() || total_loss_val.is_infinite() {
                 eprintln!("\n❌ NaN/Inf in combined loss! CE: {:.4}, Aux: {:.4}, Alpha: {:.4}",
                     ce_loss_val, avg_aux_loss, load_balance_alpha);
-                return Err(candle_core::Error::Msg("NaN loss detected".to_string()));
+                return Err(Error::Msg("NaN loss detected".to_string()));
             }
 
-            // Scale loss for accumulation AND apply gradient clipping pre-scale
-            // The prescale factor effectively clips gradients by reducing the loss magnitude
-            // before backprop, which proportionally reduces all gradient magnitudes.
-            let scaled_loss = ((loss.clone() / accum_steps as f64)? * loss_prescale)?;
+            // Scale loss for gradient accumulation
+            let scaled_loss = loss.clone().mul_scalar((1.0 / accum_steps as f64) as f32)?;
 
-            // Backward pass (accumulates grads into tensors)
-            let grads = scaled_loss.backward()?;
-
-            // Apply gradients - either single-GPU or distributed path
-            if let (Some(ref sync), Some(ref mut dist_opt)) =
-                (&self.synchronizer, &mut self.distributed_optimizer)
-            {
-                // DISTRIBUTED PATH: Synchronize gradients across GPUs
-                // 1. Synchronize gradients (all-reduce across GPUs)
-                let synced_grads = sync.synchronize_gradients(&grads, self.varmap)?;
-
-                // 2. Compute gradient norm from synchronized gradients
-                let grad_norm = compute_grad_norm(&synced_grads)?;
-                last_grad_norm = grad_norm;
-
-                // 3. Apply gradients via distributed optimizer
-                dist_opt.step(&synced_grads)?;
-            } else {
-                // SINGLE-GPU PATH: Original behavior
-                // Compute gradient norm (for monitoring and next step's pre-scaling)
-                let (grads, grad_norm) = self.clip_gradients(grads, max_grad_norm)?;
-                last_grad_norm = grad_norm;
-
-                // Apply gradients via optimizer
-                self.optimizer.step(&grads)?;
-            }
+            // Accumulate scaled loss (keeps computation graph for single backward)
+            accumulated_loss = Some(match accumulated_loss {
+                None => scaled_loss,
+                Some(acc) => acc.add(&scaled_loss)?,
+            });
 
             // Track loss for logging (just CE loss, not aux)
-            total_loss += ce_loss.to_vec0::<f32>()? as f64;
+            total_loss_for_logging += ce_loss.to_vec0::<f32>()? as f64;
         }
 
-        // Store gradient norm for next step's loss pre-scaling
+        // ===== AFTER ACCUMULATION LOOP: Single backward pass =====
+        // All micro-batches have been processed, now do backward on accumulated loss
+
+        let total_loss = accumulated_loss.ok_or_else(|| Error::Msg("No loss accumulated".to_string()))?;
+
+        // Single backward pass over all micro-batches
+        let grads = total_loss.backward()?;
+
+        // Apply gradients - either single-GPU or distributed path
+        if let (Some(ref sync), Some(ref mut dist_opt)) =
+            (&self.synchronizer, &mut self.distributed_optimizer)
+        {
+            // DISTRIBUTED PATH: Synchronize gradients across GPUs
+            // 1. Synchronize gradients (all-reduce across GPUs)
+            let synced_grads = sync.synchronize_gradients(&grads, self.varmap)?;
+
+            // 2. Compute gradient norm from synchronized gradients
+            let grad_norm = compute_grad_norm(&synced_grads)?;
+            last_grad_norm = grad_norm;
+
+            // 3. Apply gradients via distributed optimizer
+            dist_opt.step(&synced_grads, self.varmap)?;
+        } else {
+            // SINGLE-GPU PATH
+            // 1. Compute gradient norm
+            let grad_norm = self.compute_grad_norm_from_grads(&grads)?;
+
+            // 2. Skip step if gradient norm is invalid (inf/NaN)
+            if grad_norm.is_infinite() || grad_norm.is_nan() {
+                eprintln!("[GradClip] Skipping step {} - gradient norm: {}", self.global_step + 1, grad_norm);
+                // Identify which parameters have problematic gradients
+                self.diagnose_bad_gradients(&grads);
+                last_grad_norm = grad_norm;
+            } else {
+                // 3. Global gradient clipping: scale gradients if norm > max_grad_norm
+                let max_grad_norm = self.config.max_grad_norm;
+                let grads = if grad_norm > max_grad_norm {
+                    let scale = (max_grad_norm / (grad_norm + 1e-6)) as f32;
+                    let mut scaled = GradStore::new();
+                    for (id, grad) in grads.iter() {
+                        scaled.insert(*id, grad.scale(scale)?);
+                    }
+                    scaled
+                } else {
+                    grads
+                };
+
+                // 4. Optional: Clip to target_grad_norm (only scale DOWN if norm exceeds target)
+                // This is proper "norm clipping" - preserves gradient direction while preventing explosion
+                // Unlike normalization, this does NOT scale up small gradients
+                let grads = if let Some(target) = self.config.target_grad_norm {
+                    let current_norm = grad_norm.min(max_grad_norm);
+                    // Only clip if norm exceeds target (never scale up)
+                    if current_norm > target && current_norm > 1e-8 {
+                        let scale = (target / current_norm) as f32;
+                        let mut clipped = GradStore::new();
+                        for (id, grad) in grads.iter() {
+                            clipped.insert(*id, grad.scale(scale)?);
+                        }
+                        clipped
+                    } else {
+                        grads
+                    }
+                } else {
+                    grads
+                };
+
+                // 5. Apply gradients via optimizer
+                self.optimizer.step(&grads, self.varmap);
+
+                // Report final grad norm (after clipping)
+                // With norm clipping, report the actual norm (capped at target if it was clipped)
+                last_grad_norm = if let Some(target) = self.config.target_grad_norm {
+                    grad_norm.min(target).min(max_grad_norm)
+                } else {
+                    grad_norm.min(max_grad_norm)
+                };
+            }
+        }
+
+        // Store gradient norm for monitoring/logging (no longer used for pre-scaling)
         self.prev_grad_norm = Some(last_grad_norm);
 
         self.global_step += 1;
-        Ok((total_loss / accum_steps as f64, last_grad_norm))
+        Ok((total_loss_for_logging / accum_steps as f64, last_grad_norm))
     }
 
     pub fn fit<D: DataLoader>(
@@ -315,14 +370,22 @@ impl<'a> LitTrainer<'a> {
 
         // Resume support: start from start_step
         for step in self.start_step..effective_steps {
-            let (loss, grad_norm) = self.training_step(model, data_loader)?;
+            let step_result = self.training_step(model, data_loader);
+            let (loss, grad_norm) = match step_result {
+                Ok(result) => result,
+                Err(e) => {
+                    let err_msg = format!("{}", e);
+                    eprintln!("{{\"error\": \"Training error at step {}\", \"message\": \"{}\"}}", step + 1, err_msg.replace('"', "'"));
+                    std::process::exit(1);
+                }
+            };
             let current_epoch = (step + 1) as f64 / steps_per_epoch as f64;
 
             // Log at intervals
             if step % self.config.log_interval == 0 || step == 0 {
                 let elapsed = training_start.elapsed().as_secs_f64();
                 let samples_processed = (step + 1) * self.batch_size * self.config.gradient_accumulation;
-                let it_s = samples_processed as f64 / elapsed;
+                let samples_s = samples_processed as f64 / elapsed;
 
                 // Get VRAM usage via nvidia-smi
                 let vram = std::process::Command::new("nvidia-smi")
@@ -333,8 +396,8 @@ impl<'a> LitTrainer<'a> {
                     .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
                     .unwrap_or_else(|| "0".to_string());
 
-                println!("{{\"step\": {}, \"loss\": {:.4}, \"grad_norm\": {:.4}, \"learning_rate\": {:.6e}, \"epoch\": {:.2}, \"it/s\": {:.2}, \"vram\": \"{}\"}}",
-                    step + 1, loss, grad_norm, self.config.learning_rate, current_epoch, it_s, vram);
+                println!("{{\"step\": {}, \"loss\": {:.4}, \"grad_norm\": {:.4}, \"learning_rate\": {:.6e}, \"epoch\": {:.2}, \"samples/s\": {:.2}, \"vram\": \"{}\"}}",
+                    step + 1, loss, grad_norm, self.config.learning_rate, current_epoch, samples_s, vram);
             }
         }
 
@@ -343,7 +406,10 @@ impl<'a> LitTrainer<'a> {
         println!("Saving final checkpoint to {}/{}_final.safetensors", self.config.checkpoint_dir, prefix);
         self.save_checkpoint_named("final")?;
 
-        Ok(())
+        println!("{{\"status\": \"complete\"}}");
+
+        // Force exit to avoid CUDA cleanup hang (boostr/CubeCL resources)
+        std::process::exit(0);
     }
 
     fn fit_normal<D: DataLoader>(
@@ -389,7 +455,33 @@ impl<'a> LitTrainer<'a> {
         let mut step_start = Instant::now();
 
         for step in self.start_step..effective_steps {
-            let (loss, grad_norm) = self.training_step(model, data_loader)?;
+            let step_result = self.training_step(model, data_loader);
+
+            // Handle errors explicitly so TUI shows them properly
+            let (loss, grad_norm) = match step_result {
+                Ok(result) => result,
+                Err(e) => {
+                    // Clear progress bar and show error
+                    pb.finish_and_clear();
+                    let err_msg = format!("{}", e);
+                    mp.println(format!("\n❌ Training error at step {}:", step + 1)).ok();
+
+                    // Check for common CUDA errors
+                    if err_msg.contains("out of memory") || err_msg.contains("CUDA") || err_msg.contains("cuda") {
+                        mp.println(format!("   🔥 CUDA Error: {}", err_msg)).ok();
+                        mp.println("   💡 Try: reduce batch_size, seq_len, or use gradient accumulation".to_string()).ok();
+                    } else if err_msg.contains("NaN") || err_msg.contains("nan") {
+                        mp.println(format!("   🔥 Numerical Error: {}", err_msg)).ok();
+                        mp.println("   💡 Try: lower learning rate or check data".to_string()).ok();
+                    } else {
+                        mp.println(format!("   🔥 Error: {}", err_msg)).ok();
+                    }
+
+                    // Force exit - CUDA cleanup can hang
+                    mp.println("".to_string()).ok();
+                    std::process::exit(1);
+                }
+            };
             last_loss = loss;
             last_grad_norm = grad_norm;
 
@@ -403,9 +495,11 @@ impl<'a> LitTrainer<'a> {
 
             let current_epoch = (step + 1) as f64 / steps_per_epoch as f64;
 
-            // Calculate it/s as rolling average of recent steps
+            // Calculate samples/s as rolling average of recent steps
+            // Each step processes batch_size * gradient_accumulation samples
             let avg_step_time: f64 = step_times.iter().sum::<f64>() / step_times.len() as f64;
-            let it_s = if avg_step_time > 0.0 { 1.0 / avg_step_time } else { 0.0 };
+            let samples_per_step = (self.batch_size * self.config.gradient_accumulation) as f64;
+            let samples_s = if avg_step_time > 0.0 { samples_per_step / avg_step_time } else { 0.0 };
 
             // Silent log to file at intervals (no terminal output for steps)
             if step % self.config.log_interval == 0 || step == 0 {
@@ -433,8 +527,8 @@ impl<'a> LitTrainer<'a> {
             // Update progress bar (sticky at bottom)
             pb.set_position((step + 1) as u64);
             pb.set_message(format!(
-                "{}] loss: {:.4} | grad: {:.4} | {:.2} it/s",
-                eta_str, loss, grad_norm, it_s
+                "{}] loss: {:.4} | grad: {:.4} | {:.2} samples/s",
+                eta_str, loss, grad_norm, samples_s
             ));
 
             // Checkpoint messages go to scrollable area above
@@ -466,7 +560,7 @@ impl<'a> LitTrainer<'a> {
         let prefix = self.model_config.checkpoint_prefix();
         let checkpoint_path = format!("{}/{}_step_{}.safetensors", self.config.checkpoint_dir, prefix, step);
         if !Path::new(&self.config.checkpoint_dir).exists() {
-            std::fs::create_dir_all(&self.config.checkpoint_dir).map_err(candle_core::Error::wrap)?;
+            std::fs::create_dir_all(&self.config.checkpoint_dir).map_err(Error::wrap)?;
         }
         self.varmap.save(&checkpoint_path)?;
 
@@ -544,7 +638,7 @@ impl<'a> LitTrainer<'a> {
         let prefix = self.model_config.checkpoint_prefix();
         let path = format!("{}/{}_{}.safetensors", self.config.checkpoint_dir, prefix, name);
         if !Path::new(&self.config.checkpoint_dir).exists() {
-            std::fs::create_dir_all(&self.config.checkpoint_dir).map_err(candle_core::Error::wrap)?;
+            std::fs::create_dir_all(&self.config.checkpoint_dir).map_err(Error::wrap)?;
         }
         self.varmap.save(&path)?;
         Ok(())
@@ -557,42 +651,156 @@ impl<'a> LitTrainer<'a> {
     ///
     /// # Returns
     /// Global L2 gradient norm across all parameters
-    fn compute_grad_norm_from_grads(&self, grads: &candle_core::backprop::GradStore) -> Result<f64> {
-        let all_vars = self.varmap.all_vars();
+    fn compute_grad_norm_from_grads(&self, grads: &GradStore) -> Result<f64> {
         let mut total_norm_sq = 0.0f64;
 
-        for var in &all_vars {
-            if let Some(grad) = grads.get(var) {
-                let grad_norm_sq = grad.powf(2.0)?
-                    .sum_all()?
-                    .to_vec0::<f32>()? as f64;
-                total_norm_sq += grad_norm_sq;
-            }
+        // Iterate over all gradients directly using the values iterator
+        for grad in grads.values() {
+            let grad_norm_sq = grad.powf(2.0)?
+                .sum_all()?
+                .to_vec0::<f32>()? as f64;
+            total_norm_sq += grad_norm_sq;
         }
 
         Ok(total_norm_sq.sqrt())
     }
 
+    /// Diagnose which parameters have inf/NaN gradients
+    /// Prints the parameter name and gradient norm for problematic parameters
+    fn diagnose_bad_gradients(&self, grads: &GradStore) {
+        let mut bad_params: Vec<(String, f64)> = Vec::new();
+
+        for (name, tensor) in self.varmap.all_vars_named() {
+            if let Some(grad) = grads.get(tensor.id()) {
+                if let Ok(norm_sq) = grad.powf(2.0).and_then(|g| g.sum_all()).and_then(|g| g.to_vec0::<f32>()) {
+                    let norm = (norm_sq as f64).sqrt();
+                    if norm.is_infinite() || norm.is_nan() || norm > 1e6 {
+                        bad_params.push((name.clone(), norm));
+                    }
+                }
+            }
+        }
+
+        // Sort by norm (largest first) and show top offenders
+        bad_params.sort_by(|a, b| {
+            // NaN/Inf first, then by magnitude
+            match (a.1.is_nan() || a.1.is_infinite(), b.1.is_nan() || b.1.is_infinite()) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal),
+            }
+        });
+
+        if !bad_params.is_empty() {
+            eprintln!("  Problematic gradients (top 5):");
+            for (name, norm) in bad_params.iter().take(5) {
+                eprintln!("    {} : grad_norm={:.2e}", name, norm);
+            }
+        }
+    }
+
     /// Gradient clipping via norm-based scaling
     ///
     /// # Implementation Note
-    /// Candle's GradStore is opaque, so we implement clipping by:
+    /// We implement true gradient clipping by:
     /// 1. Computing the global L2 norm from all gradients
-    /// 2. Logging warnings when norm exceeds max_norm
+    /// 2. If norm > max_norm, scale all gradients by (max_norm / norm)
+    /// 3. Return the clipped gradients
     ///
-    /// Actual clipping is achieved via loss pre-scaling in training_step(),
-    /// which scales the loss based on the previous step's gradient norm.
-    /// This preserves AdamW's momentum/variance tracking.
+    /// This prevents gradient explosion on the current step, unlike loss pre-scaling
+    /// which has a one-step lag.
     ///
     /// # Arguments
     /// * `grads` - GradStore from backward pass
     /// * `max_norm` - Maximum allowed gradient norm (typically 1.0)
+    /// Process gradients with full gradient control pipeline:
+    /// 1. Per-element clipping (max_grad_value) - clips individual values to [-max, +max]
+    /// 2. Global norm clipping (max_grad_norm) - scales entire gradient if ||grad|| > max
+    /// 3. Gradient normalization (target_grad_norm) - normalizes to target norm
     ///
     /// # Returns
-    /// Tuple of (GradStore, computed_grad_norm)
-    fn clip_gradients(&self, grads: candle_core::backprop::GradStore, _max_norm: f64) -> Result<(candle_core::backprop::GradStore, f64)> {
+    /// Tuple of (processed_GradStore, original_grad_norm, should_skip_step)
+    ///
+    /// Note: Currently unused for single-GPU training (FusedAdamW has built-in clamping),
+    /// but kept for distributed training path.
+    #[allow(dead_code)]
+    fn process_gradients(
+        &self,
+        grads: GradStore,
+        max_grad_norm: f64,
+        target_grad_norm: Option<f64>,
+        max_grad_value: Option<f64>,
+    ) -> Result<(GradStore, f64, bool)> {
+        // Step 1: Per-element clipping (if enabled)
+        let grads = if let Some(max_val) = max_grad_value {
+            let mut clipped = GradStore::new();
+            for (id, grad) in grads.iter() {
+                let clamped = grad.clamp(-(max_val as f32), max_val as f32)?;
+                clipped.insert(*id, clamped);
+            }
+            clipped
+        } else {
+            grads
+        };
+
+        // Compute gradient norm after per-element clipping
         let total_norm = self.compute_grad_norm_from_grads(&grads)?;
-        Ok((grads, total_norm))
+
+        // If gradient norm is inf/nan, skip this optimizer step
+        if total_norm.is_infinite() || total_norm.is_nan() {
+            eprintln!("[GradClip] WARN: Gradient norm is {}, skipping step", total_norm);
+            // Identify which parameters have problematic gradients
+            for (name, tensor) in self.varmap.all_vars_named() {
+                if let Some(grad) = grads.get(tensor.id()) {
+                    if let Ok(norm_sq) = grad.powf(2.0).and_then(|g| g.sum_all()).and_then(|g| g.to_vec0::<f32>()) {
+                        let norm = (norm_sq as f64).sqrt();
+                        if norm.is_infinite() || norm.is_nan() || norm > 1e6 {
+                            eprintln!("  └─ {}: grad_norm={:.2e}", name, norm);
+                        }
+                    }
+                }
+            }
+            return Ok((grads, total_norm, true));
+        }
+
+        // Step 2: Global norm clipping - clips if ||grad|| > max_grad_norm
+        let (grads, clipped) = if total_norm > max_grad_norm {
+            let scale = (max_grad_norm / (total_norm + 1e-6)) as f32;
+            let mut scaled = GradStore::new();
+            for (id, grad) in grads.iter() {
+                scaled.insert(*id, grad.scale(scale)?);
+            }
+            (scaled, true)
+        } else {
+            (grads, false)
+        };
+
+        // Step 3: Gradient norm clipping (if enabled) - clips to target_grad_norm
+        // After max_grad_norm clipping, the effective norm is min(total_norm, max_grad_norm)
+        // We only scale DOWN if norm exceeds target (proper norm clipping, not normalization)
+        let grads = if let Some(target) = target_grad_norm {
+            // Compute current norm after clipping
+            let current_norm = if clipped { max_grad_norm } else { total_norm };
+            // Only clip if norm exceeds target (never scale up small gradients)
+            if current_norm > target && current_norm > 1e-8 {
+                let scale = (target / current_norm) as f32;
+                let mut clipped_grads = GradStore::new();
+                for (id, grad) in grads.iter() {
+                    clipped_grads.insert(*id, grad.scale(scale)?);
+                }
+                clipped_grads
+            } else {
+                grads
+            }
+        } else {
+            grads
+        };
+
+        // Compute the FINAL gradient norm after all processing (clipping + normalization)
+        // This is what's actually applied to the optimizer
+        let final_norm = self.compute_grad_norm_from_grads(&grads)?;
+
+        Ok((grads, final_norm, false))
     }
 }
 

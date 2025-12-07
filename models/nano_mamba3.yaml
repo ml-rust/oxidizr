@@ -44,6 +44,9 @@ model:
   mamba2_expand: 2 # Expansion factor (intermediate = 768)
 
   vocab_size: 128354 # Llama 3 + splintr agent tokens
+  # REQUIRED: Tokenizer vocabulary name - must match the vocab used to tokenize training data
+  # Options: cl100k_base, o200k_base, llama3, deepseek_v3, custom
+  tokenizer_vocab: llama3
   max_seq_len: 512 # MATCHES nano.yaml
   rope_theta: 10000.0 # MATCHES nano.yaml
 

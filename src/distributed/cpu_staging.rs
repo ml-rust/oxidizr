@@ -11,8 +11,7 @@
 //! - Overhead: ~2x GPU-CPU memory transfers per gradient sync
 //! - Practical for 2-4 GPUs; consider NCCL for more
 
-use candle_core::{Device, Result};
-use candle_nn::VarMap;
+use crate::prelude::{Device, Error, GradStore, Result, VarMap};
 use std::sync::{Arc, Barrier};
 
 use super::sync::{GradientSynchronizer, SyncedGradient};
@@ -47,7 +46,7 @@ impl CpuStagingSynchronizer {
     pub fn new(gpu_ids: &[usize]) -> Result<Self> {
         let world_size = gpu_ids.len();
         if world_size == 0 {
-            return Err(candle_core::Error::Msg(
+            return Err(Error::Msg(
                 "CpuStagingSynchronizer requires at least 1 GPU".to_string()
             ));
         }
@@ -55,7 +54,7 @@ impl CpuStagingSynchronizer {
         let devices: Vec<Device> = gpu_ids
             .iter()
             .map(|&id| Device::new_cuda(id))
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
         let barrier = Arc::new(Barrier::new(world_size));
 
@@ -81,7 +80,7 @@ impl CpuStagingSynchronizer {
 impl GradientSynchronizer for CpuStagingSynchronizer {
     fn synchronize_gradients(
         &self,
-        grads: &candle_core::backprop::GradStore,
+        grads: &GradStore,
         varmap: &VarMap,
     ) -> Result<Vec<SyncedGradient>> {
         // For single GPU, just pass through gradients
@@ -123,15 +122,15 @@ impl CpuStagingSynchronizer {
     /// Pass through gradients without modification (single GPU case)
     fn passthrough_gradients(
         &self,
-        grads: &candle_core::backprop::GradStore,
+        grads: &GradStore,
         varmap: &VarMap,
     ) -> Result<Vec<SyncedGradient>> {
-        let data = varmap.data().lock().unwrap();
+        let data = varmap.data();
         let mut result = Vec::with_capacity(data.len());
 
-        for (name, var) in data.iter() {
-            if let Some(grad) = grads.get(var) {
-                result.push((name.clone(), var.clone(), grad.clone()));
+        for (name, tensor) in data.iter() {
+            if let Some(grad) = grads.get(tensor.id()) {
+                result.push((name.clone(), tensor.clone(), grad.clone()));
             }
         }
 
@@ -145,17 +144,17 @@ impl CpuStagingSynchronizer {
     /// to multi-process or multi-thread, this would collect and average.
     fn average_gradients(
         &self,
-        grads: &candle_core::backprop::GradStore,
+        grads: &GradStore,
         varmap: &VarMap,
     ) -> Result<Vec<SyncedGradient>> {
-        let data = varmap.data().lock().unwrap();
+        let data = varmap.data();
         let mut result = Vec::with_capacity(data.len());
         let scale = 1.0 / self.world_size as f64;
 
-        for (name, var) in data.iter() {
-            if let Some(grad) = grads.get(var) {
+        for (name, tensor) in data.iter() {
+            if let Some(grad) = grads.get(tensor.id()) {
                 // Copy to CPU for averaging
-                let grad_cpu = grad.to_device(&Device::Cpu)?;
+                let grad_cpu = grad.to_device(&Device::cpu())?;
 
                 // Scale by 1/world_size
                 // In multi-GPU, gradients from each GPU would be summed first
@@ -164,7 +163,7 @@ impl CpuStagingSynchronizer {
                 // Copy back to original device
                 let grad_synced = scaled_grad.to_device(grad.device())?;
 
-                result.push((name.clone(), var.clone(), grad_synced));
+                result.push((name.clone(), tensor.clone(), grad_synced));
             }
         }
 

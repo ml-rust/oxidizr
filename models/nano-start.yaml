@@ -137,6 +137,9 @@ model:
   #   - Higher values extend effective context length
 
   vocab_size: 100315
+  # REQUIRED: Tokenizer vocabulary name - must match the vocab used to tokenize training data
+  # Options: cl100k_base, o200k_base, llama3, deepseek_v3, custom
+  tokenizer_vocab: cl100k_base
   max_seq_len: 64
   rope_theta: 10000.0
 
@@ -193,9 +196,33 @@ trainer:
   # max_checkpoints: Keep only the N most recent (saves disk space)
 
   checkpoint_dir: "./checkpoints/nano-start"
-  log_interval: 20
+  log_interval: 10
   save_interval: 200
   max_checkpoints: 3
+
+  # ---------------------------------------------------------------------------
+  # GRADIENT CONTROL (from "Keep the Gradients Flowing" research)
+  # ---------------------------------------------------------------------------
+  # Three controls work together to stabilize gradient flow:
+  #
+  # max_grad_norm: Global gradient clipping threshold (REQUIRED)
+  #   - If ||grad|| > max_grad_norm, scale entire gradient down
+  #   - Prevents gradient explosion
+  #   - Typical values: 1.0 - 10.0
+  #
+  # target_grad_norm: Gradient normalization target (OPTIONAL)
+  #   - Normalize gradients to this target magnitude
+  #   - Keeps gradient flow stable and consistent
+  #   - Typical values: 1.0 - 5.0 (null = disabled)
+  #
+  # max_grad_value: Per-element gradient clipping (OPTIONAL)
+  #   - Clips individual gradient values to [-max, +max]
+  #   - Prevents single outlier gradients from dominating
+  #   - Typical values: 1.0 - 10.0 (null = disabled)
+
+  max_grad_norm: 1.0 # Global clipping threshold (standard value for stability)
+  target_grad_norm: null # Disabled - use standard max_grad_norm clipping only
+  max_grad_value: null # Per-element clipping disabled
 
   # ---------------------------------------------------------------------------
   # MOE LOAD BALANCING

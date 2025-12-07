@@ -10,13 +10,13 @@ A Rust-based LLM training framework built on [Candle](https://github.com/hugging
 
 ```bash
 # CPU-only
-cargo install --git https://github.com/farhan-syah/oxidizr
+cargo install --git https://github.com/ml-rust/oxidizr
 
 # With CUDA support
-cargo install --git https://github.com/farhan-syah/oxidizr --features cuda
+cargo install --git https://github.com/ml-rust/oxidizr --features cuda
 
 # With CUDA + HuggingFace model publishing
-cargo install --git https://github.com/farhan-syah/oxidizr --features cuda,huggingface
+cargo install --git https://github.com/ml-rust/oxidizr --features cuda,huggingface
 ```
 
 **From crates.io** (CUDA 12.x only):
@@ -33,7 +33,7 @@ cargo install oxidizr --features cuda,huggingface
 
 ```bash
 # Clone and build
-git clone https://github.com/farhan-syah/oxidizr
+git clone https://github.com/ml-rust/oxidizr
 cd oxidizr
 cargo build --release
 
@@ -586,6 +586,6 @@ If you use Splintr in your research, please cite:
   author = {Farhan Syah},
   title = {Oxidzr: A Rust-based LLM training framework},
   year = {2025},
-  url = {https://github.com/farhan-syah/oxidizr}
+  url = {https://github.com/ml-rust/oxidizr}
 }
 ```

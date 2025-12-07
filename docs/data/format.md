@@ -23,6 +23,7 @@ Each token is 4 bytes. File size = `num_tokens × 4` bytes.
 ### Example
 
 A file with 6,379 tokens:
+
 - Size: 6,379 × 4 = 25,516 bytes
 - Contains: Raw u32 values in sequence
 
@@ -101,7 +102,7 @@ Before creating binary files, you need to tokenize your text. The tokenizer conv
 
 ### Using splintr (Recommended)
 
-[splintr](https://github.com/farhan-syah/splintr) is our tokenizer library:
+[splintr](https://github.com/ml-rust/splintr) is our tokenizer library:
 
 ```python
 from splintr import Tokenizer
@@ -160,15 +161,15 @@ np.array(all_tokens, dtype=np.uint32).tofile("data.bin")
 
 Your config's `vocab_size` must match or exceed your tokenizer's vocabulary:
 
-| Tokenizer | Vocab Size |
-|-----------|------------|
-| cl100k_base | 100,331 |
-| llama3 | ~128,000 |
-| deepseek_v3 | ~128,000 |
+| Tokenizer   | Vocab Size |
+| ----------- | ---------- |
+| cl100k_base | 100,331    |
+| llama3      | ~128,000   |
+| deepseek_v3 | ~128,000   |
 
 ```yaml
 model:
-  vocab_size: 128354  # Llama 3 + agent tokens
+  vocab_size: 128354 # Llama 3 + agent tokens
 ```
 
 ## Dummy Data
@@ -181,6 +182,7 @@ cargo run --release -- -f models/nano.yaml
 ```
 
 Or in code:
+
 ```rust
 use oxidizr::data::create_dummy_data;
 
@@ -190,10 +192,10 @@ let tokens = create_dummy_data(vocab_size, num_tokens);
 ## File Size Guidelines
 
 | Tokens | File Size | Training Time (rough) |
-|--------|-----------|----------------------|
-| 10K | 40 KB | Minutes |
-| 100K | 400 KB | ~Hour |
-| 1M | 4 MB | Hours |
-| 10M | 40 MB | Day+ |
+| ------ | --------- | --------------------- |
+| 10K    | 40 KB     | Minutes               |
+| 100K   | 400 KB    | ~Hour                 |
+| 1M     | 4 MB      | Hours                 |
+| 10M    | 40 MB     | Day+                  |
 
 Actual training time depends on model size, hardware, and settings.

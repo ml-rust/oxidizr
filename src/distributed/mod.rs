@@ -37,10 +37,12 @@ pub use optimizer::{DistributedAdamW, AdamWConfig, compute_grad_norm};
 #[cfg(feature = "nccl")]
 pub use nccl::NcclSynchronizer;
 
+use crate::prelude::{Error, Result};
+
 /// Create a synchronizer based on configuration
 pub fn create_synchronizer(
     config: &DistributedConfig,
-) -> candle_core::Result<Box<dyn GradientSynchronizer>> {
+) -> Result<Box<dyn GradientSynchronizer>> {
     if !config.enabled || config.gpu_ids.len() <= 1 {
         // Single GPU - use no-op synchronizer
         return Ok(Box::new(CpuStagingSynchronizer::single_gpu(
@@ -63,7 +65,7 @@ pub fn create_synchronizer(
         }
         #[cfg(not(feature = "nccl"))]
         SyncBackend::Nccl => {
-            Err(candle_core::Error::Msg(
+            Err(Error::Msg(
                 "NCCL backend requested but 'nccl' feature is not enabled. \
                  Compile with --features nccl to enable NCCL support.".to_string()
             ))

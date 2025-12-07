@@ -1,11 +1,11 @@
 //! NCCL-based gradient synchronization backend
 //!
-//! This module provides high-performance gradient synchronization using NVIDIA's
-//! NCCL (NVIDIA Collective Communications Library) for all-reduce operations.
+//! This module provides high-performance gradient synchronization using boostr's
+//! NCCL wrapper for all-reduce operations.
 //!
 //! # Requirements
 //!
-//! - CUDA 12.x
+//! - CUDA 12.x or 13.x
 //! - NCCL library installed on the system
 //! - Compile with `--features nccl`
 //!
@@ -17,36 +17,31 @@
 //!
 //! For 4+ GPUs, NCCL is significantly faster than CPU staging.
 
-use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::VarMap;
-use cudarc::driver::{CudaContext, CudaStream};
-use cudarc::nccl::{Comm, ReduceOp};
-use std::sync::{Arc, Mutex};
+use crate::prelude::{DType, Device, Error, GradStore, Result, Tensor, VarMap};
+use std::sync::Arc;
+
+use boostr::distributed::{AllReduceOp, NcclContext};
 
 use super::sync::{GradientSynchronizer, SyncedGradient};
 
 /// NCCL-based gradient synchronizer
 ///
-/// Uses NCCL all-reduce operations for high-performance gradient synchronization
+/// Uses boostr's NCCL wrapper for high-performance gradient synchronization
 /// across multiple GPUs.
 ///
 /// # Thread Safety
 ///
-/// This struct wraps NCCL communicators in a Mutex for thread safety. While the
-/// GradientSynchronizer trait requires Send+Sync, NCCL operations are serialized
-/// to ensure correctness.
+/// This struct wraps boostr's NcclContext which handles thread safety internally.
 pub struct NcclSynchronizer {
     /// GPU devices participating in training (Candle devices)
     devices: Vec<Device>,
-    /// cudarc CUDA streams (hold references to keep contexts alive)
-    streams: Vec<Arc<CudaStream>>,
-    /// NCCL communicators (wrapped in Mutex for thread safety)
-    comms: Mutex<Vec<Comm>>,
+    /// boostr NCCL context for all-reduce operations
+    nccl: Arc<NcclContext>,
     /// Number of GPUs
     world_size: usize,
 }
 
-// SAFETY: The Mutex ensures that NCCL operations are serialized
+// SAFETY: NcclContext handles thread safety internally via Mutex
 unsafe impl Send for NcclSynchronizer {}
 unsafe impl Sync for NcclSynchronizer {}
 
@@ -63,7 +58,7 @@ impl NcclSynchronizer {
     pub fn new(gpu_ids: &[usize]) -> Result<Self> {
         let world_size = gpu_ids.len();
         if world_size < 2 {
-            return Err(candle_core::Error::Msg(
+            return Err(Error::Msg(
                 "NcclSynchronizer requires at least 2 GPUs. Use CpuStagingSynchronizer for single GPU.".to_string()
             ));
         }
@@ -74,30 +69,19 @@ impl NcclSynchronizer {
             .map(|&id| Device::new_cuda(id))
             .collect::<Result<Vec<_>>>()?;
 
-        // Create cudarc CUDA contexts and streams
-        let streams: Vec<Arc<CudaStream>> = gpu_ids
-            .iter()
-            .map(|&id| {
-                CudaContext::new(id)
-                    .map(|ctx| ctx.default_stream())
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| candle_core::Error::Msg(format!("Failed to create CUDA context: {:?}", e)))?;
-
-        // Initialize NCCL communicators from streams
-        let comms = Comm::from_devices(streams.clone())
-            .map_err(|e| candle_core::Error::Msg(format!("Failed to create NCCL comms: {:?}", e)))?;
+        // Create boostr NCCL context
+        let nccl = NcclContext::new(gpu_ids)
+            .map_err(|e| Error::Msg(format!("Failed to create NCCL context: {}", e)))?;
 
         log::info!(
-            "NCCL synchronizer initialized with {} GPUs: {:?}",
+            "NCCL synchronizer initialized with {} GPUs: {:?} (via boostr)",
             world_size,
             gpu_ids
         );
 
         Ok(Self {
             devices,
-            streams,
-            comms: Mutex::new(comms),
+            nccl: Arc::new(nccl),
             world_size,
         })
     }
@@ -108,10 +92,10 @@ impl NcclSynchronizer {
         &self.devices[0]
     }
 
-    /// Perform NCCL all-reduce on a tensor using rank 0's communicator
+    /// Perform NCCL all-reduce on a tensor
     ///
-    /// This sums the tensor values across all GPUs and divides by world_size.
-    fn all_reduce_tensor(&self, tensor: &Tensor, comms: &[Comm]) -> Result<Tensor> {
+    /// This uses boostr's CPU-staged all-reduce for Candle tensor interop.
+    fn all_reduce_tensor(&self, tensor: &Tensor) -> Result<Tensor> {
         let dtype = tensor.dtype();
 
         // Flatten tensor for all-reduce
@@ -121,14 +105,14 @@ impl NcclSynchronizer {
         match dtype {
             DType::F32 => {
                 let data: Vec<f32> = flat.to_vec1()?;
-                let reduced = self.all_reduce_f32(&data, comms)?;
+                let reduced = self.all_reduce_f32(&data)?;
                 Tensor::from_vec(reduced, tensor.shape(), tensor.device())
             }
             DType::F16 => {
                 // Convert to f32 for all-reduce, then back
                 let f32_tensor = flat.to_dtype(DType::F32)?;
                 let data: Vec<f32> = f32_tensor.to_vec1()?;
-                let reduced = self.all_reduce_f32(&data, comms)?;
+                let reduced = self.all_reduce_f32(&data)?;
                 let result = Tensor::from_vec(reduced, tensor.shape(), tensor.device())?;
                 result.to_dtype(DType::F16)
             }
@@ -136,70 +120,38 @@ impl NcclSynchronizer {
                 // Convert to f32 for all-reduce, then back
                 let f32_tensor = flat.to_dtype(DType::F32)?;
                 let data: Vec<f32> = f32_tensor.to_vec1()?;
-                let reduced = self.all_reduce_f32(&data, comms)?;
+                let reduced = self.all_reduce_f32(&data)?;
                 let result = Tensor::from_vec(reduced, tensor.shape(), tensor.device())?;
                 result.to_dtype(DType::BF16)
             }
-            _ => Err(candle_core::Error::Msg(format!(
+            _ => Err(Error::Msg(format!(
                 "NCCL all-reduce not supported for dtype {:?}",
                 dtype
             ))),
         }
     }
 
-    /// All-reduce f32 data using NCCL
-    ///
-    /// Uses rank 0's stream and communicator for the operation.
-    fn all_reduce_f32(&self, data: &[f32], comms: &[Comm]) -> Result<Vec<f32>> {
-        // Use the first GPU's stream and communicator
-        let stream = &self.streams[0];
-        let comm = &comms[0];
-
-        // Copy data to GPU
-        let gpu_data = stream
-            .clone_htod(data)
-            .map_err(|e| candle_core::Error::Msg(format!("Failed to copy to GPU: {:?}", e)))?;
-
-        // Allocate output buffer
-        let mut output = stream
-            .alloc_zeros::<f32>(data.len())
-            .map_err(|e| candle_core::Error::Msg(format!("Failed to allocate output: {:?}", e)))?;
-
-        // Perform all-reduce (sum across all GPUs)
-        comm.all_reduce(&gpu_data, &mut output, &ReduceOp::Sum)
-            .map_err(|e| candle_core::Error::Msg(format!("NCCL all_reduce failed: {:?}", e)))?;
-
-        // Copy result back to CPU
-        let mut result: Vec<f32> = stream
-            .clone_dtoh(&output)
-            .map_err(|e| candle_core::Error::Msg(format!("Failed to copy from GPU: {:?}", e)))?;
-
-        // Average by dividing by world size
-        let scale = 1.0 / self.world_size as f32;
-        for v in &mut result {
-            *v *= scale;
-        }
-
-        Ok(result)
+    /// All-reduce f32 data using boostr's NCCL
+    fn all_reduce_f32(&self, data: &[f32]) -> Result<Vec<f32>> {
+        self.nccl
+            .all_reduce_cpu_staged_f32(data, AllReduceOp::Avg)
+            .map_err(|e| Error::Msg(format!("NCCL all_reduce failed: {}", e)))
     }
 }
 
 impl GradientSynchronizer for NcclSynchronizer {
     fn synchronize_gradients(
         &self,
-        grads: &candle_core::backprop::GradStore,
+        grads: &GradStore,
         varmap: &VarMap,
     ) -> Result<Vec<SyncedGradient>> {
         let data = varmap.data().lock().unwrap();
         let mut result = Vec::with_capacity(data.len());
 
-        // Lock the communicators for the duration of synchronization
-        let comms = self.comms.lock().unwrap();
-
         for (name, var) in data.iter() {
             if let Some(grad) = grads.get(var) {
                 // Perform NCCL all-reduce to average gradients
-                let synced_grad = self.all_reduce_tensor(&grad, &comms)?;
+                let synced_grad = self.all_reduce_tensor(&grad)?;
                 result.push((name.clone(), var.clone(), synced_grad));
             }
         }
@@ -216,21 +168,8 @@ impl GradientSynchronizer for NcclSynchronizer {
     }
 
     fn barrier(&self) -> Result<()> {
-        // NCCL doesn't have an explicit barrier, but we can synchronize
-        // by doing a dummy all-reduce on a small tensor
-        let comms = self.comms.lock().unwrap();
-        let stream = &self.streams[0];
-        let comm = &comms[0];
-
-        let data = stream
-            .alloc_zeros::<f32>(1)
-            .map_err(|e| candle_core::Error::Msg(format!("Barrier alloc failed: {:?}", e)))?;
-        let mut output = stream
-            .alloc_zeros::<f32>(1)
-            .map_err(|e| candle_core::Error::Msg(format!("Barrier alloc failed: {:?}", e)))?;
-        comm.all_reduce(&data, &mut output, &ReduceOp::Sum)
-            .map_err(|e| candle_core::Error::Msg(format!("Barrier failed: {:?}", e)))?;
-
-        Ok(())
+        self.nccl
+            .barrier()
+            .map_err(|e| Error::Msg(format!("Barrier failed: {}", e)))
     }
 }

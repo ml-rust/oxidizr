@@ -8,6 +8,9 @@ use std::path::Path;
 // Default value functions for serde
 fn default_max_checkpoints() -> usize { 10 }
 fn default_model_name() -> String { "model".to_string() }
+fn default_max_grad_norm() -> f64 { 1.0 }
+fn default_target_grad_norm() -> Option<f64> { None }  // None = no normalization
+fn default_max_grad_value() -> Option<f64> { None }    // None = no per-element clipping
 
 // Re-export distributed config types
 pub use crate::distributed::sync::DistributedConfig;
@@ -62,6 +65,10 @@ pub struct ModelConfig {
     pub mamba3_use_conv: Option<bool>,       // Optional conv (default: false, trapezoidal replaces it)
 
     pub vocab_size: usize,
+    /// Tokenizer vocabulary name (cl100k_base, o200k_base, llama3, deepseek_v3, custom)
+    /// REQUIRED: Must match the vocabulary used to tokenize your training data
+    /// Use "custom" if you have a custom tokenizer not listed above
+    pub tokenizer_vocab: String,
     pub max_seq_len: usize,
     pub rope_theta: f32,
 
@@ -92,11 +99,11 @@ pub enum DTypePrecision {
 }
 
 impl DTypePrecision {
-    pub fn to_candle_dtype(&self) -> candle_core::DType {
+    pub fn to_dtype(&self) -> crate::prelude::DType {
         match self {
-            DTypePrecision::F32 => candle_core::DType::F32,
-            DTypePrecision::F16 => candle_core::DType::F16,
-            DTypePrecision::BF16 => candle_core::DType::BF16,
+            DTypePrecision::F32 => crate::prelude::DType::F32,
+            DTypePrecision::F16 => crate::prelude::DType::F16,
+            DTypePrecision::BF16 => crate::prelude::DType::BF16,
         }
     }
 
@@ -181,6 +188,21 @@ pub struct TrainerConfig {
     #[serde(default = "default_max_checkpoints")]
     pub max_checkpoints: usize,  // Max checkpoints to keep (0 = unlimited)
     pub load_balance_alpha: f64, // For MoE auxiliary loss
+
+    // Gradient control parameters (from "Keep the Gradients Flowing" research)
+    #[serde(default = "default_max_grad_norm")]
+    pub max_grad_norm: f64,      // Global gradient clipping threshold (default: 1.0)
+                                 // If ||grad|| > max_grad_norm, scale down to max_grad_norm
+
+    #[serde(default = "default_target_grad_norm")]
+    pub target_grad_norm: Option<f64>,  // Target gradient normalization (None = disabled)
+                                        // If set, normalize gradients to this target norm
+                                        // Good values: 1.0 - 5.0
+
+    #[serde(default = "default_max_grad_value")]
+    pub max_grad_value: Option<f64>,    // Per-element gradient clipping (None = disabled)
+                                        // Clips individual gradient values to [-max, +max]
+                                        // Good values: 1.0 - 10.0
 
     /// Target device: "gpu" (default) or "cpu"
     #[serde(default)]
@@ -295,6 +317,7 @@ impl LitConfig {
                 mamba3_mimo_rank: None,
                 mamba3_use_conv: None,
                 vocab_size: 128354, // Llama 3 + splintr agent tokens
+                tokenizer_vocab: "llama3".to_string(),
                 max_seq_len: 512,
                 rope_theta: 10000.0,
                 dtype: DTypePrecision::F32,
@@ -310,6 +333,9 @@ impl LitConfig {
                 save_interval: 500,
                 max_checkpoints: 10,      // Keep last 10 checkpoints
                 load_balance_alpha: 0.0, // No MoE
+                max_grad_norm: 1.0,      // Gradient clipping threshold
+                target_grad_norm: None,  // No normalization
+                max_grad_value: None,    // No per-element clipping
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
                 group_size: 4,           // GRPO: 4 rollouts per prompt
@@ -361,6 +387,7 @@ impl LitConfig {
                 mamba3_use_conv: None,
 
                 vocab_size: 128354, // Llama 3 + splintr agent tokens
+                tokenizer_vocab: "llama3".to_string(),
                 max_seq_len: 512, // Can handle longer context with MLA
                 rope_theta: 10000.0,
                 dtype: DTypePrecision::F32,
@@ -376,6 +403,9 @@ impl LitConfig {
                 save_interval: 500,
                 max_checkpoints: 10,      // Keep last 10 checkpoints
                 load_balance_alpha: 0.01, // For MoE load balancing
+                max_grad_norm: 1.0,       // Gradient clipping threshold
+                target_grad_norm: None,   // No normalization
+                max_grad_value: None,     // No per-element clipping
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
                 group_size: 4,            // GRPO: 4 rollouts per prompt
@@ -492,9 +522,18 @@ impl CheckpointValidation {
 }
 
 /// Compute hash of ModelConfig for validation
+///
+/// Only hashes architecture-affecting fields, excluding metadata like:
+/// - name (cosmetic)
+/// - tokenizer_vocab (inference metadata, doesn't affect weights)
 pub fn compute_model_config_hash(config: &ModelConfig) -> String {
-    // Serialize to JSON for consistent hashing (avoids f32 Hash issues)
-    let json = serde_json::to_string(config).unwrap_or_default();
+    // Create a JSON Value and remove non-architecture fields before hashing
+    let mut value = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.remove("name");
+        map.remove("tokenizer_vocab");
+    }
+    let json = serde_json::to_string(&value).unwrap_or_default();
     let mut hasher = DefaultHasher::new();
     json.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -526,6 +565,9 @@ pub struct BlazrConfig {
     pub hidden_size: usize,
     pub num_layers: usize,
     pub vocab_size: usize,
+    /// Tokenizer vocabulary name (cl100k_base, o200k_base, llama3, deepseek_v3)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokenizer_vocab: Option<String>,
 
     // Mamba2 parameters
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -589,6 +631,7 @@ impl BlazrConfig {
             hidden_size: cfg.hidden_size,
             num_layers: cfg.num_layers,
             vocab_size: cfg.vocab_size,
+            tokenizer_vocab: Some(cfg.tokenizer_vocab.clone()),
 
             // Mamba2 parameters
             mamba2_num_heads: cfg.mamba2_num_heads,

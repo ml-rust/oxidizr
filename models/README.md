@@ -73,11 +73,49 @@ model:
   mamba2_expand: 2
 ```
 
+## Tokenizer Vocabulary
+
+The `tokenizer_vocab` field is **required** and must match the vocabulary used to tokenize your training data.
+
+```yaml
+model:
+  vocab_size: 128354
+  tokenizer_vocab: llama3  # REQUIRED: must match your training data
+```
+
+### Supported Vocabularies
+
+| Name | Description | Vocab Size (with agents) |
+|------|-------------|--------------------------|
+| `cl100k_base` | GPT-4, GPT-3.5-turbo | ~100,331 |
+| `o200k_base` | GPT-4o | ~200,073 |
+| `llama3` | Meta Llama 3 family | ~128,354 |
+| `deepseek_v3` | DeepSeek V3/R1 | ~128,954 |
+| `custom` | Custom vocabulary | varies |
+
+**Note:** `custom` vocabularies are not yet supported in blazr for inference. If you use a custom tokenizer, you'll need to modify blazr's tokenizer module to load your `.tiktoken` file.
+
+### .tiktoken Format
+
+The `.tiktoken` format is a simple text file where each line contains:
+```
+<base64_token> <rank>
+```
+
+Example:
+```
+SGVsbG8= 0
+V29ybGQ= 1
+```
+
+Where `SGVsbG8=` decodes to "Hello" (rank 0, highest priority for BPE merging).
+
 ## Creating Custom Configs
 
 1. Copy an existing config as template
 2. Adjust parameters
-3. Ensure constraint: `hidden_size × expand == num_heads × head_dim`
+3. Set `tokenizer_vocab` to match your training data
+4. Ensure constraint: `hidden_size × expand == num_heads × head_dim`
 
 ```bash
 cargo run --release -- -f path/to/your/config.yaml -d path/to/data.bin

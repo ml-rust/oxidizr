@@ -1,4 +1,4 @@
-use candle_core::{Device, Tensor, Result};
+use crate::prelude::{Device, Error, Result, Tensor};
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::Path;
@@ -107,16 +107,16 @@ impl LitDataLoader {
         device: Device,
     ) -> Result<Self> {
         let file = File::open(path.as_ref())
-            .map_err(|e| candle_core::Error::Msg(format!("Failed to open data file: {}", e)))?;
+            .map_err(|e| Error::Msg(format!("Failed to open data file: {}", e)))?;
 
         let mmap = unsafe {
             Mmap::map(&file)
-                .map_err(|e| candle_core::Error::Msg(format!("Failed to mmap file: {}", e)))?
+                .map_err(|e| Error::Msg(format!("Failed to mmap file: {}", e)))?
         };
 
         // Validate alignment and size
         if mmap.len() % std::mem::size_of::<u32>() != 0 {
-            return Err(candle_core::Error::Msg(
+            return Err(Error::Msg(
                 "File size is not a multiple of u32 size".to_string()
             ));
         }
@@ -456,7 +456,7 @@ impl PrefetchDataLoader {
     pub fn next_batch(&mut self) -> Result<(Tensor, Tensor)> {
         // Receive prefetched batch (blocks if none available)
         let batch = self.receiver.recv()
-            .map_err(|_| candle_core::Error::Msg("Prefetch thread stopped".to_string()))?;
+            .map_err(|_| Error::Msg("Prefetch thread stopped".to_string()))?;
 
         // Transfer to GPU (this is the only blocking GPU operation)
         let inputs = Tensor::from_slice(

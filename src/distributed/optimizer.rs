@@ -14,8 +14,7 @@
 //! This optimizer takes explicit gradient tensors instead of a GradStore,
 //! allowing it to work with the synchronized gradients.
 
-use candle_core::{Result, Tensor, DType};
-use candle_nn::VarMap;
+use crate::prelude::{DType, Error, Result, Tensor, VarMap};
 use std::collections::HashMap;
 
 use super::sync::SyncedGradient;
@@ -88,7 +87,7 @@ impl DistributedAdamW {
     /// * `varmap` - VarMap containing all parameters (used to initialize moment buffers)
     /// * `config` - Optimizer configuration
     pub fn new(varmap: &VarMap, config: AdamWConfig) -> Result<Self> {
-        let data = varmap.data().lock().unwrap();
+        let data = varmap.data();
         let mut m = HashMap::with_capacity(data.len());
         let mut v = HashMap::with_capacity(data.len());
 
@@ -118,12 +117,13 @@ impl DistributedAdamW {
     ///
     /// # Arguments
     ///
-    /// * `synced_grads` - Vector of (param_name, var, gradient) from gradient synchronizer
+    /// * `synced_grads` - Vector of (param_name, tensor, gradient) from gradient synchronizer
+    /// * `varmap` - VarMap containing all parameters (for updating)
     ///
     /// # Returns
     ///
     /// Ok(()) on success, or error if shapes don't match
-    pub fn step(&mut self, synced_grads: &[SyncedGradient]) -> Result<()> {
+    pub fn step(&mut self, synced_grads: &[SyncedGradient], varmap: &mut VarMap) -> Result<()> {
         self.step_count += 1;
         let t = self.step_count as f64;
 
@@ -131,22 +131,22 @@ impl DistributedAdamW {
         let bias_correction1 = 1.0 - self.config.beta1.powf(t);
         let bias_correction2 = 1.0 - self.config.beta2.powf(t);
 
-        for (name, var, grad) in synced_grads {
+        for (name, param_tensor, grad) in synced_grads {
             // Get moment buffers
             let m_t = self.m.get_mut(name).ok_or_else(|| {
-                candle_core::Error::Msg(format!("Unknown parameter: {}", name))
+                Error::Msg(format!("Unknown parameter: {}", name))
             })?;
             let v_t = self.v.get_mut(name).ok_or_else(|| {
-                candle_core::Error::Msg(format!("Unknown parameter: {}", name))
+                Error::Msg(format!("Unknown parameter: {}", name))
             })?;
 
             // Ensure gradient is on the same device as parameter
             // Note: Device doesn't implement PartialEq, so we compare by debug representation
             let grad = {
                 let grad_device = format!("{:?}", grad.device());
-                let param_device = format!("{:?}", var.device());
+                let param_device = format!("{:?}", param_tensor.device());
                 if grad_device != param_device {
-                    grad.to_device(var.device())?
+                    grad.to_device(param_tensor.device())?
                 } else {
                     grad.clone()
                 }
@@ -177,15 +177,15 @@ impl DistributedAdamW {
             let adam_update = (m_hat.div(&v_sqrt_eps)? * self.config.lr)?;
 
             // Weight decay: lr * λ * θ
-            let param = var.as_tensor();
+            let param = param_tensor.as_tensor();
             let weight_decay_update = (param * (self.config.lr * self.config.weight_decay))?;
 
             // θ = θ - adam_update - weight_decay_update
             let param_after_adam = param.sub(&adam_update)?;
             let new_param = param_after_adam.sub(&weight_decay_update)?;
 
-            // Update the variable
-            var.set(&new_param)?;
+            // Update the parameter in VarMap
+            varmap.set(name, new_param);
         }
 
         Ok(())

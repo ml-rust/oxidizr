@@ -3,8 +3,7 @@
 //! This module contains the training logic, extracted from the original main.rs.
 
 use anyhow::Result;
-use candle_core::Device;
-use candle_nn::VarBuilder;
+use crate::prelude::{Device, VarBuilder};
 use clap::Args;
 
 use crate::config::{find_latest_checkpoint, CheckpointMeta, DTypePrecision, LitConfig, ModelConfig};
@@ -359,9 +358,9 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
         if !headless {
             println!("Using CPU device");
         }
-        Device::Cpu
+        Device::cpu()
     } else {
-        Device::cuda_if_available(0)?
+        Device::cuda_if_available()?
     };
     if !headless {
         println!("Using device: {:?}", device);
@@ -375,11 +374,15 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
         );
     }
 
-    let mut varmap = candle_nn::VarMap::new();
+    // For training, we use VarBuilder with Kaiming initialization
+    // This creates tensors with proper random initialization during model construction
     // Use configured dtype (F32/F16/BF16) for model weights
     // RmsNorm and SSM computations use F32 internally for numerical stability
-    let vb = VarBuilder::from_varmap(&varmap, config.model.dtype.to_candle_dtype(), &device);
-    let model = LitGPT::new(&config.model, vb)?;
+    let vb = VarBuilder::kaiming(config.model.dtype.to_dtype(), &device);
+    let model = LitGPT::new(&config.model, vb.clone())?;
+
+    // Get the VarMap from VarBuilder (contains all initialized weights)
+    let varmap_arc = vb.var_map();
 
     // Load checkpoint if resuming
     let start_step = if let Some(ref resume_arg) = args.resume {
@@ -460,7 +463,7 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
                                 );
                             }
 
-                            varmap.load(&checkpoint_path)?;
+                            varmap_arc.write().unwrap().load(&checkpoint_path)?;
                             if !headless {
                                 println!("Resuming from step {}", step);
                             }
@@ -470,7 +473,7 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
                         if !headless {
                             println!("⚠️  No data file specified, skipping validation");
                         }
-                        varmap.load(&checkpoint_path)?;
+                        varmap_arc.write().unwrap().load(&checkpoint_path)?;
                         if !headless {
                             println!("Resuming from step {}", step);
                         }
@@ -489,7 +492,7 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
             if !headless {
                 println!("Loading checkpoint from: {}", resume_arg);
             }
-            varmap.load(resume_arg)?;
+            varmap_arc.write().unwrap().load(resume_arg)?;
             if !headless {
                 println!("Checkpoint loaded successfully!");
             }
@@ -575,10 +578,28 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
     // Effective batch size is the number of samples per optimizer step
     let effective_batch_size = batch_size * config_trainer.gradient_accumulation;
 
+    // Extract VarMap from the Arc<RwLock> for use with the trainer
+    // At this point we're done with VarBuilder, so we can clone out the VarMap
+    let mut varmap = varmap_arc.read().unwrap().clone();
+
+    // Calculate total parameters and mark them as requiring gradients
+    let (total_params, trainable_params) = {
+        use crate::prelude::global_tape;
+
+        let mut total = 0usize;
+        for tensor in varmap.all_vars() {
+            total += tensor.elem_count();
+            // Mark this tensor as requiring gradients and record it in the tape
+            global_tape::set_requires_grad(tensor.id(), true);
+            global_tape::record_tensor(tensor.id(), tensor.clone());
+        }
+        (total, total) // For now, all params are trainable
+    };
+
     let steps_json_path = format!("{}/steps.json", run_dir);
     let mut trainer = LitTrainer::new(
         config_trainer.clone(),
-        &varmap,
+        &mut varmap,
         device.clone(),
         dataset_size,
         batch_size,
@@ -640,15 +661,6 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
         println!("  Learning Rate: {:.6}", config_trainer.learning_rate);
         println!("  Epochs: {}", config_trainer.num_epochs);
         println!("");
-
-        // Calculate total parameters
-        let (total_params, trainable_params) = {
-            let mut total = 0usize;
-            for var in varmap.all_vars() {
-                total += var.as_tensor().elem_count();
-            }
-            (total, total) // For now, all params are trainable
-        };
 
         println!("📊 Training Plan:");
         println!(

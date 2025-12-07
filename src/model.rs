@@ -1,35 +1,10 @@
-use candle_core::{Device, Result, Tensor, DType, Module, D};
-use candle_nn::{VarBuilder, Embedding, Linear, linear_no_bias};
+use crate::prelude::{
+    D, DType, Device, Embedding, Linear, Result, RmsNorm, Tensor, VarBuilder,
+    embedding, linear_no_bias, ops, rms_norm,
+};
 use crate::config::ModelConfig;
 use crate::mamba2::Mamba2Block;
 use crate::mamba3::Mamba3Block;
-
-// --- RMSNorm (more efficient than LayerNorm for LLMs) ---
-
-struct RmsNorm {
-    scale: Tensor,
-    eps: f64,
-}
-
-impl RmsNorm {
-    fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let scale = vb.get(size, "weight")?;
-        Ok(Self { scale, eps })
-    }
-}
-
-impl Module for RmsNorm {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_dtype = x.dtype();
-        let internal_dtype = DType::F32;
-
-        let x = x.to_dtype(internal_dtype)?;
-        let variance = x.powf(2.)?.mean_keepdim(D::Minus1)?;
-        let x_normed = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-
-        x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.scale)
-    }
-}
 
 // --- Rotary Positional Embeddings (RoPE) ---
 
@@ -51,8 +26,7 @@ impl RotaryEmbedding {
         let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?
             .to_dtype(DType::F32)?; // Convert to F32 to match model dtype
 
-        let t = Tensor::arange(0u32, max_seq_len as u32, device)?
-            .to_dtype(DType::F32)?
+        let t = Tensor::arange(0f32, max_seq_len as f32, device)?
             .reshape((max_seq_len, 1))?;
 
         let freqs = t.matmul(&inv_freq)?;
@@ -70,6 +44,10 @@ impl RotaryEmbedding {
         let (b_sz_k, n_heads_k, _seq_len_k, head_dim_k) = k.dims4()?;
         let q_dtype = q.dtype();  // Match model dtype
         let k_dtype = k.dtype();
+
+        // Debug: Check input values
+        LitGPT::check_nan(q, "rope_input_q")?;
+        LitGPT::check_nan(k, "rope_input_k")?;
 
         // cos and sin are (seq_len, head_dim), need to broadcast to match Q and K separately
         let cos_q = self.cos
@@ -102,6 +80,8 @@ impl RotaryEmbedding {
 
         let q_rot = Self::rotate_half(q)?;
         let k_rot = Self::rotate_half(k)?;
+        LitGPT::check_nan(&q_rot, "rope_q_rot")?;
+        LitGPT::check_nan(&k_rot, "rope_k_rot")?;
 
         let q_embed = ((q * &cos_q)? + (q_rot * &sin_q)?)?;
         let k_embed = ((k * &cos_k)? + (k_rot * &sin_k)?)?;
@@ -111,9 +91,29 @@ impl RotaryEmbedding {
 
     fn rotate_half(x: &Tensor) -> Result<Tensor> {
         let last_dim = x.dim(D::Minus1)?;
-        let x1 = x.narrow(D::Minus1, 0, last_dim / 2)?;
-        let x2 = x.narrow(D::Minus1, last_dim / 2, last_dim / 2)?;
-        Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)
+        // Use narrow_tracked for gradient flow through the split
+        let x1 = x.narrow_tracked(D::Minus1, 0, last_dim / 2)?;
+        let x2 = x.narrow_tracked(D::Minus1, last_dim / 2, last_dim / 2)?;
+        LitGPT::check_nan(&x1, "rotate_half_x1")?;
+        LitGPT::check_nan(&x2, "rotate_half_x2")?;
+        let x2_neg = x2.neg()?;
+        LitGPT::check_nan(&x2_neg, "rotate_half_x2_neg")?;
+        // cat() now records on tape automatically
+        let result = Tensor::cat(&[&x2_neg, &x1], D::Minus1)?;
+        LitGPT::check_nan(&result, "rotate_half_result")?;
+        Ok(result)
+    }
+
+    /// Get cos tensor narrow'd to seq_len: [seq_len, dim]
+    #[allow(dead_code)]
+    fn get_cos(&self, seq_len: usize) -> Result<Tensor> {
+        self.cos.narrow(0, 0, seq_len)
+    }
+
+    /// Get sin tensor narrow'd to seq_len: [seq_len, dim]
+    #[allow(dead_code)]
+    fn get_sin(&self, seq_len: usize) -> Result<Tensor> {
+        self.sin.narrow(0, 0, seq_len)
     }
 }
 
@@ -200,59 +200,94 @@ impl MultiHeadLatentAttention {
         let c_kv = self.w_dkv.forward(x)?;  // [B, Seq, kv_latent_dim]
         let c_q = self.w_dq.forward(x)?;    // [B, Seq, q_latent_dim]
 
-        // 2. Generate decoupled RoPE components
-        let q_rope = self.w_qr.forward(x)?  // [B, Seq, d_rope * num_heads]
-            .reshape((b_sz, seq_len, self.num_heads, self.d_rope))?
-            .transpose(1, 2)?               // [B, num_heads, Seq, d_rope]
-            .contiguous()?;
+        // 2. Generate decoupled RoPE components (before RoPE application)
+        // Use _tracked variants for gradient flow through view operations
+        let q_rope_raw = self.w_qr.forward(x)?  // [B, Seq, d_rope * num_heads]
+            .reshape_tracked(&[b_sz, seq_len, self.num_heads, self.d_rope])?
+            .transpose_tracked(1, 2)?               // [B, num_heads, Seq, d_rope]
+            .contiguous_tracked()?;
 
-        let k_rope = self.w_kr.forward(x)?  // [B, Seq, d_rope]
-            .unsqueeze(1)?                  // [B, 1, Seq, d_rope]
-            .broadcast_as((b_sz, self.num_heads, seq_len, self.d_rope))?;
-
-        // 3. Apply RoPE to decoupled heads
-        let (q_rope, k_rope) = self.rope.apply_rotary_emb(&q_rope, &k_rope, seq_len)?;
+        let k_rope_raw = self.w_kr.forward(x)?;  // [B, Seq, d_rope] - keep raw for boostr
 
         // 4. Decompress latent to full Q, K, V
+        // Use _tracked variants for gradient flow
         let q_content = self.w_uq.forward(&c_q)?
-            .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?                // [B, num_heads, Seq, head_dim]
-            .contiguous()?;
+            .reshape_tracked(&[b_sz, seq_len, self.num_heads, self.head_dim])?
+            .transpose_tracked(1, 2)?                // [B, num_heads, Seq, head_dim]
+            .contiguous_tracked()?;
 
         let k_content = self.w_uk.forward(&c_kv)?
-            .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+            .reshape_tracked(&[b_sz, seq_len, self.num_heads, self.head_dim])?
+            .transpose_tracked(1, 2)?
+            .contiguous_tracked()?;
 
         let v = self.w_uv.forward(&c_kv)?
-            .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+            .reshape_tracked(&[b_sz, seq_len, self.num_heads, self.head_dim])?
+            .transpose_tracked(1, 2)?
+            .contiguous_tracked()?;
 
-        // 5. Combine content and position for attention
-        // Concatenate: Q = [q_content, q_rope], K = [k_content, k_rope]
-        let q = Tensor::cat(&[&q_content, &q_rope], D::Minus1)?;  // [B, H, Seq, head_dim+d_rope]
-        let k = Tensor::cat(&[&k_content, &k_rope], D::Minus1)?;
+        // 3 & 5. Apply RoPE + combine content and position
+        // RoPE application + concatenation
+        let (q, k) = {
+            // Broadcast k_rope for RoPE application
+            // Use _tracked variants for gradient flow
+            LitGPT::check_nan(&k_rope_raw, "mla_k_rope_raw")?;
+            let k_rope = k_rope_raw
+                .unsqueeze_tracked(1)?                  // [B, 1, Seq, d_rope]
+                .broadcast_as_tracked((b_sz, self.num_heads, seq_len, self.d_rope))?;
+            LitGPT::check_nan(&k_rope, "mla_k_rope_broadcast")?;
+            LitGPT::check_nan(&q_rope_raw, "mla_q_rope_raw")?;
+
+            // Apply RoPE to decoupled heads
+            let (q_rope, k_rope) = self.rope.apply_rotary_emb(&q_rope_raw, &k_rope, seq_len)?;
+            LitGPT::check_nan(&q_rope, "mla_q_rope_after_rope")?;
+            LitGPT::check_nan(&k_rope, "mla_k_rope_after_rope")?;
+            LitGPT::check_nan(&q_content, "mla_q_content")?;
+            LitGPT::check_nan(&k_content, "mla_k_content")?;
+
+            // Concatenate: Q = [q_content, q_rope], K = [k_content, k_rope]
+            // cat() now records on tape automatically
+            let q = Tensor::cat(&[&q_content, &q_rope], D::Minus1)?;  // [B, H, Seq, head_dim+d_rope]
+            let k = Tensor::cat(&[&k_content, &k_rope], D::Minus1)?;
+
+            (q, k)
+        };
 
         // 6. Scaled Dot-Product Attention
-        let att_scores = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        // Use transpose_tracked for gradient flow
+        LitGPT::check_nan(&q, "mla_q")?;
+        LitGPT::check_nan(&k, "mla_k")?;
+        LitGPT::check_nan(&v, "mla_v")?;
+        let att_scores = q.matmul(&k.transpose_tracked(2, 3)?)?;
+        LitGPT::check_nan(&att_scores, "mla_att_scores_raw")?;
+
         let att_scores = (att_scores * self.scale)?;
+        LitGPT::check_nan(&att_scores, "mla_att_scores_scaled")?;
 
         // Apply causal mask (cached to avoid recomputation)
         let mask = self.get_or_create_causal_mask(seq_len, att_scores.device())?
             .to_dtype(att_scores.dtype())?;  // Match model dtype
+        LitGPT::check_nan(&mask, "mla_causal_mask")?;
         let att_scores = att_scores.broadcast_add(&mask)?;
+        LitGPT::check_nan(&att_scores, "mla_att_scores_masked")?;
 
         // Softmax and apply to values
-        let att_weights = candle_nn::ops::softmax_last_dim(&att_scores)?;
+        let att_weights = ops::softmax_last_dim(&att_scores)?;
+        LitGPT::check_nan(&att_weights, "mla_att_weights")?;
+
         let output = att_weights.matmul(&v)?;  // [B, H, Seq, head_dim]
+        LitGPT::check_nan(&output, "mla_attn_v_out")?;
 
         // 7. Reshape and project output
+        // Use _tracked variants for gradient flow
         let output = output
-            .transpose(1, 2)?
-            .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
+            .transpose_tracked(1, 2)?
+            .reshape_tracked(&[b_sz, seq_len, self.num_heads * self.head_dim])?;
 
-        self.o_proj.forward(&output)
+        let output = self.o_proj.forward(&output)?;
+        LitGPT::check_nan(&output, "mla_o_proj")?;
+
+        Ok(output)
     }
 
     /// Get or create cached causal mask for efficient reuse
@@ -263,14 +298,15 @@ impl MultiHeadLatentAttention {
         let mut cache = self.causal_mask_cache.borrow_mut();
 
         // Check if cached mask exists and has correct shape
-        if let Some(ref mask) = *cache {
-            if mask.dims()[2] == seq_len {
-                return Ok(mask.clone());
+        if let Some(ref cached_mask) = *cache {
+            let cached_mask: &Tensor = cached_mask;
+            if cached_mask.dims()[2] == seq_len {
+                return Ok(cached_mask.clone());
             }
         }
 
         // Create new mask
-        let mask: Vec<_> = (0..seq_len)
+        let mask_data: Vec<f32> = (0..seq_len)
             .flat_map(|i| {
                 (0..seq_len).map(move |j| {
                     if j > i { f32::NEG_INFINITY } else { 0.0 }
@@ -278,7 +314,7 @@ impl MultiHeadLatentAttention {
             })
             .collect();
 
-        let mask_tensor = Tensor::from_vec(mask, (1, 1, seq_len, seq_len), device)?;
+        let mask_tensor = Tensor::from_vec(mask_data, (1, 1, seq_len, seq_len), device)?;
         *cache = Some(mask_tensor.clone());
 
         Ok(mask_tensor)
@@ -343,18 +379,18 @@ impl CausalSelfAttention {
         let q = q
             .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
-            .contiguous()?;
+            .contiguous_tracked()?;
 
         // K, V: [B, Seq, KV_H, D] -> [B, KV_H, Seq, D]
         let k = k
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?
-            .contiguous()?;
+            .contiguous_tracked()?;
 
         let v = v
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?
-            .contiguous()?;
+            .contiguous_tracked()?;
 
         // Apply RoPE
         let (q, k) = self.rope.apply_rotary_emb(&q, &k, seq_len)?;
@@ -373,7 +409,7 @@ impl CausalSelfAttention {
         let att_scores = att_scores.broadcast_add(&mask)?;
 
         // Softmax and apply to values
-        let att_weights = candle_nn::ops::softmax_last_dim(&att_scores)?;
+        let att_weights = ops::softmax_last_dim(&att_scores)?;
         let output = att_weights.matmul(&v)?;
 
         // Reshape back: [B, H, Seq, D] -> [B, Seq, H, D] -> [B, Seq, Hidden]
@@ -403,14 +439,15 @@ impl CausalSelfAttention {
         let mut cache = self.causal_mask_cache.borrow_mut();
 
         // Check if cached mask exists and has correct shape
-        if let Some(ref mask) = *cache {
-            if mask.dims()[2] == seq_len {
-                return Ok(mask.clone());
+        if let Some(ref cached_mask) = *cache {
+            let cached_mask: &Tensor = cached_mask;
+            if cached_mask.dims()[2] == seq_len {
+                return Ok(cached_mask.clone());
             }
         }
 
         // Create new mask
-        let mask: Vec<_> = (0..seq_len)
+        let mask_data: Vec<f32> = (0..seq_len)
             .flat_map(|i| {
                 (0..seq_len).map(move |j| {
                     if j > i { f32::NEG_INFINITY } else { 0.0 }
@@ -418,7 +455,7 @@ impl CausalSelfAttention {
             })
             .collect();
 
-        let mask_tensor = Tensor::from_vec(mask, (1, 1, seq_len, seq_len), device)?;
+        let mask_tensor = Tensor::from_vec(mask_data, (1, 1, seq_len, seq_len), device)?;
         *cache = Some(mask_tensor.clone());
 
         Ok(mask_tensor)
@@ -447,7 +484,7 @@ impl Mlp {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // SwiGLU: silu(gate) * up
-        let gate = candle_nn::ops::silu(&self.gate_proj.forward(x)?)?;
+        let gate = ops::silu(&self.gate_proj.forward(x)?)?;
         let up = self.up_proj.forward(x)?;
         let fused = (gate * up)?;
         self.down_proj.forward(&fused)
@@ -475,7 +512,7 @@ impl Expert {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // SwiGLU activation
-        let gate = candle_nn::ops::silu(&self.gate_proj.forward(x)?)?;
+        let gate = ops::silu(&self.gate_proj.forward(x)?)?;
         let up = self.up_proj.forward(x)?;
         let fused = (gate * up)?;
         self.down_proj.forward(&fused)
@@ -517,7 +554,7 @@ impl MoeLayer {
             experts.push(Expert::new(
                 cfg.hidden_size,
                 intermediate,
-                vb.pp(format!("experts.{}", i))
+                vb.pp(&format!("experts.{}", i))
             )?);
         }
 
@@ -541,53 +578,76 @@ impl MoeLayer {
     fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         let (b_sz, seq_len, hidden) = x.dims3()?;
 
+        LitGPT::check_nan(x, "moe_input")?;
+
         // 1. Get router logits
         let router_logits = self.router.forward(x)?;  // [B, Seq, num_experts]
+        LitGPT::check_nan(&router_logits, "moe_router_logits")?;
 
         // 2. Compute routing probabilities (for load balancing loss)
-        let router_probs = candle_nn::ops::softmax_last_dim(&router_logits)?;
+        let router_probs = ops::softmax_last_dim(&router_logits)?;
+        LitGPT::check_nan(&router_probs, "moe_router_probs")?;
 
         // 3. Select top-k experts (still uses CPU for top-k, but greatly optimized routing)
-        let flat_logits = router_logits.reshape((b_sz * seq_len, self.num_experts))?;
+        // Use reshape_tracked for gradient flow
+        let flat_logits = router_logits.reshape_tracked(&[b_sz * seq_len, self.num_experts])?;
+        LitGPT::check_nan(&flat_logits, "moe_flat_logits")?;
         let (top_k_values, top_k_indices) = self.top_k(&flat_logits, self.experts_per_tok)?;
-        let top_k_weights = candle_nn::ops::softmax_last_dim(&top_k_values)?;
+        LitGPT::check_nan(&top_k_values, "moe_top_k_values")?;
+        let top_k_weights = ops::softmax_last_dim(&top_k_values)?;
+        LitGPT::check_nan(&top_k_weights, "moe_top_k_weights")?;
 
         // 4. OPTIMIZED: Batch-process all expert outputs, then use einsum-style combination
-        let x_flat = x.reshape((b_sz * seq_len, hidden))?;
+        // Use reshape_tracked for gradient flow
+        let x_flat = x.reshape_tracked(&[b_sz * seq_len, hidden])?;
 
         // NOTE: We run ALL num_experts on ALL tokens, even though we only use top-k per token.
         // This is FASTER than selective computation due to GPU parallelization, but uses more memory.
         // Trade-off: ~75% wasted computation for k=2, but 10x faster than token-by-token routing.
         let mut expert_outputs = Vec::with_capacity(self.num_experts);
-        for expert in &self.experts {
-            expert_outputs.push(expert.forward(&x_flat)?);  // Each: [tokens, hidden]
+        for (i, expert) in self.experts.iter().enumerate() {
+            let out = expert.forward(&x_flat)?;
+            LitGPT::check_nan(&out, &format!("moe_expert_{}_out", i))?;
+            expert_outputs.push(out);  // Each: [tokens, hidden]
         }
-        let all_expert_outs = Tensor::stack(&expert_outputs, 1)?;  // [tokens, num_experts, hidden]
+        // Use stack_tracked for gradient flow through expert outputs
+        let all_expert_outs = Tensor::stack_tracked(&expert_outputs, 1)?;  // [tokens, num_experts, hidden]
+        LitGPT::check_nan(&all_expert_outs, "moe_all_expert_outs")?;
 
         // GPU-native routing matrix construction (no CPU transfers!)
         // routing_weights: [tokens, num_experts] - sparse matrix with weights at top-k positions
+        // Note: routing weights have zero gradients (discrete selection), gradients flow through expert outputs
         let routing_weights = self.build_routing_matrix_gpu(&top_k_indices, &top_k_weights)?;
+        LitGPT::check_nan(&routing_weights, "moe_routing_weights")?;
 
         // Weighted sum: output[tok] = sum_over_experts(routing_weights[tok, exp] * expert_outs[tok, exp])
         // broadcasting: [tokens, experts, 1] * [tokens, experts, hidden] -> [tokens, experts, hidden]
-        let weighted_experts = all_expert_outs.broadcast_mul(&routing_weights.unsqueeze(2)?)?;  // [tokens, experts, hidden]
+        // Use unsqueeze_tracked for gradient flow
+        let weighted_experts = all_expert_outs.broadcast_mul(&routing_weights.unsqueeze_tracked(2)?)?;  // [tokens, experts, hidden]
+        LitGPT::check_nan(&weighted_experts, "moe_weighted_experts")?;
+
         let mut output = weighted_experts.sum(1)?;  // Sum over experts dim: [tokens, hidden]
+        LitGPT::check_nan(&output, "moe_weighted_sum")?;
 
         // 5. Add shared expert output (always active)
         let shared_out = self.shared_expert.forward(&x_flat)?;
+        LitGPT::check_nan(&shared_out, "moe_shared_expert_out")?;
+
         output = output.add(&shared_out)?;
+        LitGPT::check_nan(&output, "moe_combined_out")?;
 
         // 6. Reshape back to [B, Seq, Hidden]
-        let output = output.reshape((b_sz, seq_len, hidden))?;
+        // Use reshape_tracked for gradient flow
+        let output = output.reshape_tracked(&[b_sz, seq_len, hidden])?;
+        LitGPT::check_nan(&output, "moe_final_out")?;
 
         // 7. Compute load balancing loss
         // Minimize variance of expert usage to encourage even distribution
         let expert_usage = router_probs.mean(0)?.mean(0)?;  // [num_experts] - no keepdim
 
         // L2 loss: sum of squared usage (encourages even distribution)
-        // CRITICAL: Convert to scalar value and back to ensure proper shape (CUDA can return [1,1])
-        let loss_val = expert_usage.powf(2.0)?.mean_all()?;
-        let load_balance_loss = Tensor::new(loss_val.to_vec0::<f32>()?, loss_val.device())?.to_dtype(loss_val.dtype())?;
+        // Use contiguous_tracked to ensure proper gradient flow (avoid to_vec0 which breaks chain)
+        let load_balance_loss = expert_usage.powf(2.0)?.mean_all()?.contiguous_tracked()?;
 
         Ok((output, load_balance_loss))
     }
@@ -642,7 +702,8 @@ impl MoeLayer {
             // Create one-hot mask: [batch, num_experts]
             let one_hot = Self::one_hot_from_indices(&idx, num_experts, device)?;
             // Where one_hot is 0 (not selected), keep original; where 1 (selected), use -inf
-            let keep_mask = one_hot.eq(0.0)?;  // U8 boolean: true where we keep original
+            let zero_tensor = Tensor::zeros(one_hot.shape().clone(), one_hot.dtype(), device)?;
+            let keep_mask = one_hot.eq(&zero_tensor)?;  // U8 boolean: true where we keep original
             masked = keep_mask.where_cond(&masked, &neg_inf)?;
         }
 
@@ -669,10 +730,10 @@ impl MoeLayer {
 
         // Mask out first max by setting to -inf
         let one_hot1 = Self::one_hot_from_indices(&idx1, num_experts, device)?;
-        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?
-            .broadcast_as((batch_size, num_experts))?;
+        let neg_inf = Tensor::full(f32::NEG_INFINITY, (batch_size, num_experts), device)?;
         // Where one_hot is 0 (not selected), keep x_f32; where 1 (selected), use -inf
-        let keep_mask = one_hot1.eq(0.0)?;  // U8 boolean: true where we keep original
+        let zero_one_hot = Tensor::zeros(one_hot1.shape().clone(), one_hot1.dtype(), device)?;
+        let keep_mask = one_hot1.eq(&zero_one_hot)?;  // U8 boolean: true where we keep original
         let masked = keep_mask.where_cond(&x_f32, &neg_inf)?;
 
         // Second max
@@ -693,18 +754,18 @@ impl MoeLayer {
         let batch_size = indices.dim(0)?;
 
         // Create range tensor [0, 1, 2, ..., num_classes-1] and broadcast to [batch, num_classes]
-        let range: Vec<i64> = (0..num_classes as i64).collect();
-        let range_tensor = Tensor::new(range.as_slice(), device)?
+        // IMPORTANT: Use F32 because boostr's eq() only supports F32 tensors
+        let range: Vec<f32> = (0..num_classes).map(|i| i as f32).collect();
+        let range_tensor = Tensor::from_vec(range, num_classes, device)?
             .unsqueeze(0)?  // [1, num_classes]
             .broadcast_as((batch_size, num_classes))?;  // [batch, num_classes]
 
-        // Compare with indices (broadcast indices to [batch, num_classes])
-        let indices_broadcast = indices.to_dtype(DType::I64)?
+        // Compare with indices (convert to F32 first - boostr's eq() only supports F32)
+        let indices_broadcast = indices.to_dtype(DType::F32)?
             .broadcast_as((batch_size, num_classes))?;
 
         // one_hot[i,j] = 1.0 if j == indices[i] else 0.0
-        // Note: Returns F32, caller should convert to model dtype if needed
-        range_tensor.eq(&indices_broadcast)?.to_dtype(DType::F32)
+        range_tensor.eq(&indices_broadcast)
     }
 
     /// GPU-native routing matrix construction
@@ -730,21 +791,26 @@ impl MoeLayer {
 
         // Initialize zeros: [tokens, num_experts]
         let mut routing = Tensor::zeros((num_tokens, self.num_experts), dtype, device)?;
+        LitGPT::check_nan(&routing, "routing_init_zeros")?;
 
         // For each k position, scatter the weights to the correct expert column
         for ki in 0..k {
             // Get indices and weights for this k position
             let idx = top_k_indices.narrow(1, ki, 1)?;  // [tokens, 1]
             let wgt = top_k_weights.narrow(1, ki, 1)?;  // [tokens, 1]
+            LitGPT::check_nan(&wgt, &format!("routing_wgt_k{}", ki))?;
 
             // Create one-hot for this k's indices: [tokens, num_experts]
             let one_hot = Self::one_hot_from_indices(&idx, self.num_experts, device)?
                 .to_dtype(dtype)?;
+            LitGPT::check_nan(&one_hot, &format!("routing_onehot_k{}", ki))?;
 
             // Multiply one-hot by weight and add to routing matrix
             // one_hot * wgt broadcasts: [tokens, num_experts] * [tokens, 1] -> [tokens, num_experts]
             let weighted_one_hot = one_hot.broadcast_mul(&wgt)?;
+            LitGPT::check_nan(&weighted_one_hot, &format!("routing_weighted_k{}", ki))?;
             routing = routing.add(&weighted_one_hot)?;
+            LitGPT::check_nan(&routing, &format!("routing_after_add_k{}", ki))?;
         }
 
         Ok(routing)
@@ -846,23 +912,23 @@ impl Block {
             // Mamba1 layer (original sequential)
             BlockType::Mamba {
                 block: MambaBlock::new(cfg, vb.pp("mamba"))?,
-                norm: RmsNorm::new(cfg.hidden_size, eps, vb.pp("norm"))?,
+                norm: rms_norm(cfg.hidden_size, eps, vb.pp("norm"))?,
             }
         } else if use_mla {
             // MLA + MoE attention layer
             BlockType::Attention {
                 attn: MultiHeadLatentAttention::new(cfg, vb.pp("self_attn"))?,
                 ffn: MoeLayer::new(cfg, vb.pp("moe"))?,
-                input_layernorm: RmsNorm::new(cfg.hidden_size, eps, vb.pp("input_layernorm"))?,
-                post_attention_layernorm: RmsNorm::new(cfg.hidden_size, eps, vb.pp("post_attention_layernorm"))?,
+                input_layernorm: rms_norm(cfg.hidden_size, eps, vb.pp("input_layernorm"))?,
+                post_attention_layernorm: rms_norm(cfg.hidden_size, eps, vb.pp("post_attention_layernorm"))?,
             }
         } else {
             // Legacy GQA + MLP attention layer (original nano)
             BlockType::LegacyAttention {
                 attn: CausalSelfAttention::new(cfg, vb.pp("self_attn"))?,
                 mlp: Mlp::new(cfg, vb.pp("mlp"))?,
-                input_layernorm: RmsNorm::new(cfg.hidden_size, eps, vb.pp("input_layernorm"))?,
-                post_attention_layernorm: RmsNorm::new(cfg.hidden_size, eps, vb.pp("post_attention_layernorm"))?,
+                input_layernorm: rms_norm(cfg.hidden_size, eps, vb.pp("input_layernorm"))?,
+                post_attention_layernorm: rms_norm(cfg.hidden_size, eps, vb.pp("post_attention_layernorm"))?,
             }
         };
 
@@ -876,7 +942,7 @@ impl Block {
                 let residual = x;
                 let x = norm.forward(x)?;
                 let x = block.forward(&x)?;
-                let x = (x + residual)?;
+                let x = x.broadcast_add(&residual)?;
 
                 Ok(BlockOutput {
                     hidden: x,
@@ -906,14 +972,24 @@ impl Block {
                 // Attention sub-block
                 let residual = x;
                 let x = input_layernorm.forward(x)?;
+                LitGPT::check_nan(&x, "attn_input_norm")?;
+
                 let x = attn.forward(&x)?;
-                let x = (x + residual)?;
+                LitGPT::check_nan(&x, "attn_output")?;
+
+                let x = x.broadcast_add(&residual)?;
+                LitGPT::check_nan(&x, "attn_residual")?;
 
                 // MoE sub-block
                 let residual = &x;
                 let x = post_attention_layernorm.forward(&x)?;
+                LitGPT::check_nan(&x, "moe_input_norm")?;
+
                 let (x, moe_loss) = ffn.forward(&x)?;  // Returns output + load balance loss
-                let x = (x + residual)?;
+                LitGPT::check_nan(&x, "moe_output")?;
+
+                let x = x.broadcast_add(&residual)?;
+                LitGPT::check_nan(&x, "moe_residual")?;
 
                 Ok(BlockOutput {
                     hidden: x,
@@ -925,12 +1001,12 @@ impl Block {
                 let residual = x;
                 let x = input_layernorm.forward(x)?;
                 let x = attn.forward(&x)?;
-                let x = (x + residual)?;
+                let x = x.broadcast_add(&residual)?;
 
                 let residual = &x;
                 let x = post_attention_layernorm.forward(&x)?;
                 let x = mlp.forward(&x)?;
-                let x = (x + residual)?;
+                let x = x.broadcast_add(&residual)?;
 
                 Ok(BlockOutput {
                     hidden: x,
@@ -961,18 +1037,18 @@ pub struct LitGPT {
 
 impl LitGPT {
     pub fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let embed = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
+        let embed = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
 
         let mut layers = Vec::new();
         for i in 0..cfg.num_layers {
-            layers.push(Block::new(cfg, i, vb.pp(format!("layers.{}", i)))?);
+            layers.push(Block::new(cfg, i, vb.pp(&format!("layers.{}", i)))?);
         }
 
-        let norm = RmsNorm::new(cfg.hidden_size, 1e-5, vb.pp("norm"))?;
+        let norm = rms_norm(cfg.hidden_size, 1e-5, vb.pp("norm"))?;
         let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
 
         // Get compute dtype from config (BF16/F16/F32)
-        let compute_dtype = cfg.dtype.to_candle_dtype();
+        let compute_dtype = cfg.dtype.to_dtype();
 
         Ok(Self {
             embed_tokens: embed,
@@ -984,23 +1060,60 @@ impl LitGPT {
     }
 
     pub fn forward(&self, input_ids: &Tensor) -> Result<ModelOutput> {
-        // Use copy() to ensure proper memory layout on CUDA (handles padding)
+        // Use contiguous_tracked() to ensure proper memory layout on CUDA (handles padding)
+        // AND record on tape for gradient flow back to embed_tokens
         // Model uses configured dtype (F32/F16/BF16). RmsNorm and SSM ops convert to
         // F32 internally for numerical stability, then convert back.
-        let mut x = self.embed_tokens.forward(input_ids)?.copy()?;
+        let mut x = self.embed_tokens.forward(input_ids)?.contiguous_tracked()?;
+
+        // Debug: check for NaN after embedding
+        Self::check_nan(&x, "embed_tokens")?;
+
         let mut aux_losses = Vec::new();
 
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             let output = layer.forward(&x)?;
-            x = output.hidden.contiguous()?;  // Force contiguous after each layer
+            x = output.hidden.contiguous_tracked()?;  // Force contiguous after each layer
+
+            // Debug: check for NaN after each layer
+            Self::check_nan(&x, &format!("layer_{}", i))?;
+
             if let Some(loss) = output.aux_loss {
                 aux_losses.push(loss);
             }
         }
 
         let x = self.norm.forward(&x)?;
+        Self::check_nan(&x, "final_norm")?;
+
         let logits = self.lm_head.forward(&x)?;
+        Self::check_nan(&logits, "lm_head")?;
 
         Ok(ModelOutput { logits, aux_losses })
+    }
+
+    /// Check if tensor contains NaN/Inf values (debug helper)
+    /// NOTE: Disabled for performance - enable when debugging NaN issues
+    #[allow(unused_variables)]
+    fn check_nan(_tensor: &Tensor, _name: &str) -> Result<()> {
+        // Debug code disabled for performance - uncomment to enable NaN checking:
+        // if let Ok(vals) = tensor.flatten_all()?.to_vec::<f32>() {
+        //     let nan_count = vals.iter().filter(|x| x.is_nan()).count();
+        //     let inf_count = vals.iter().filter(|x| x.is_infinite()).count();
+        //     let neg_inf_count = vals.iter().filter(|x| **x == f32::NEG_INFINITY).count();
+        //     let pos_inf_count = vals.iter().filter(|x| **x == f32::INFINITY).count();
+        //     // Also check for very large values (potential memory corruption)
+        //     const LARGE_THRESHOLD: f32 = 1e10;
+        //     let large_count = vals.iter().filter(|x| x.is_finite() && x.abs() > LARGE_THRESHOLD).count();
+        //     if nan_count > 0 || inf_count > 0 || large_count > 0 {
+        //         eprintln!("[NaN DEBUG] {} has {} NaN, {} Inf ({} +Inf, {} -Inf), {} LARGE (>1e10) out of {} values",
+        //             name, nan_count, inf_count, pos_inf_count, neg_inf_count, large_count, vals.len());
+        //         // Also print some stats
+        //         let max_val = vals.iter().filter(|x| x.is_finite()).fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        //         let min_val = vals.iter().filter(|x| x.is_finite()).fold(f32::INFINITY, |a, &b| a.min(b));
+        //         eprintln!("[NaN DEBUG] {} finite range: [{:.4}, {:.4}]", name, min_val, max_val);
+        //     }
+        // }
+        Ok(())
     }
 }

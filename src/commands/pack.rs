@@ -47,7 +47,9 @@ struct CheckpointInfo {
 
 impl CheckpointInfo {
     fn display_name(&self) -> String {
-        let prefix = self.parent_dir.as_ref()
+        let prefix = self
+            .parent_dir
+            .as_ref()
             .map(|p| format!("{}/", p))
             .unwrap_or_default();
         format!("{}{} - {:.1} MB", prefix, self.name, self.size_mb)
@@ -85,13 +87,22 @@ fn scan_checkpoints_recursive(dir: &Path, checkpoints: &mut Vec<CheckpointInfo>)
         if path.is_dir() {
             // Recurse into subdirectories
             scan_checkpoints_recursive(&path, checkpoints)?;
-        } else if path.extension().map(|e| e == "safetensors").unwrap_or(false) {
-            let filename = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        } else if path
+            .extension()
+            .map(|e| e == "safetensors")
+            .unwrap_or(false)
+        {
+            let filename = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             let size_bytes = entry.metadata()?.len();
             let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
 
             // Get parent directory name (e.g., "nano" from "./checkpoints/nano/file.safetensors")
-            let parent_dir = path.parent()
+            let parent_dir = path
+                .parent()
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().to_string());
 
@@ -121,7 +132,10 @@ fn scan_checkpoints_recursive(dir: &Path, checkpoints: &mut Vec<CheckpointInfo>)
 }
 
 /// Select a checkpoint interactively or by CLI argument
-fn select_checkpoint<'a>(checkpoints: &'a [CheckpointInfo], selection: Option<&str>) -> Result<&'a CheckpointInfo> {
+fn select_checkpoint<'a>(
+    checkpoints: &'a [CheckpointInfo],
+    selection: Option<&str>,
+) -> Result<&'a CheckpointInfo> {
     if checkpoints.is_empty() {
         return Err(anyhow::anyhow!("No checkpoints found in directory"));
     }
@@ -145,7 +159,8 @@ fn select_checkpoint<'a>(checkpoints: &'a [CheckpointInfo], selection: Option<&s
         }
         Some(step_str) => {
             // Try to parse as step number
-            let step: usize = step_str.parse()
+            let step: usize = step_str
+                .parse()
                 .context("Invalid checkpoint selector. Use 'latest', 'final', or a step number")?;
             checkpoints
                 .iter()
@@ -188,7 +203,10 @@ fn load_training_stats(checkpoint_dir: &Path) -> Option<TrainingStats> {
                         if let Ok(stats) = serde_json::from_str::<serde_json::Value>(last_line) {
                             return Some(TrainingStats {
                                 final_loss: stats.get("loss").and_then(|v| v.as_f64()),
-                                final_step: stats.get("step").and_then(|v| v.as_u64()).map(|s| s as usize),
+                                final_step: stats
+                                    .get("step")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|s| s as usize),
                                 learning_rate: stats.get("learning_rate").and_then(|v| v.as_f64()),
                             });
                         }
@@ -206,7 +224,10 @@ fn load_training_stats(checkpoint_dir: &Path) -> Option<TrainingStats> {
                 if let Ok(stats) = serde_json::from_str::<serde_json::Value>(last_line) {
                     return Some(TrainingStats {
                         final_loss: stats.get("loss").and_then(|v| v.as_f64()),
-                        final_step: stats.get("step").and_then(|v| v.as_u64()).map(|s| s as usize),
+                        final_step: stats
+                            .get("step")
+                            .and_then(|v| v.as_u64())
+                            .map(|s| s as usize),
                         learning_rate: stats.get("learning_rate").and_then(|v| v.as_f64()),
                     });
                 }
@@ -247,7 +268,11 @@ fn generate_model_card(
     if config.num_experts.is_some() {
         tags.push("moe");
     }
-    let tags_str = tags.iter().map(|t| format!("- {}", t)).collect::<Vec<_>>().join("\n");
+    let tags_str = tags
+        .iter()
+        .map(|t| format!("- {}", t))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Training stats
     let training_info = if let Some(stats) = stats {
@@ -279,7 +304,7 @@ pipeline_tag: text-generation
 
 > {arch_desc} model with {params} parameters
 
-Trained with [oxidizr](https://github.com/farhan-syah/oxidizr), a Rust-based LLM training framework.
+Trained with [oxidizr](https://github.com/ml-rust/oxidizr), a Rust-based LLM training framework.
 
 ## Overview
 
@@ -288,7 +313,7 @@ Trained with [oxidizr](https://github.com/farhan-syah/oxidizr), a Rust-based LLM
 **Key Specifications:**
 - **Parameters:** {params}
 - **Context Length:** {max_seq} tokens
-- **Vocabulary:** {vocab_size} tokens ([splintr](https://github.com/farhan-syah/splintr) tokenizer)
+- **Vocabulary:** {vocab_size} tokens ([splintr](https://github.com/ml-rust/splintr) tokenizer)
 {training_info}
 ## Quick Start
 
@@ -359,12 +384,12 @@ blazr generate --model ./model --prompt "Hello!"
 
 ## Important Notes
 
-> **This model requires [blazr](https://github.com/farhan-syah/blazr) for inference.**
+> **This model requires [blazr](https://github.com/ml-rust/blazr) for inference.**
 
 Standard inference tools (llama.cpp, vLLM, Transformers, etc.) do not support this architecture. The model uses:
 
-- **Custom architecture:** Hybrid Mamba2/MLA/MoE layers trained with [oxidizr](https://github.com/farhan-syah/oxidizr)
-- **Custom tokenizer:** [splintr](https://github.com/farhan-syah/splintr) BPE tokenizer with specialized tokens
+- **Custom architecture:** Hybrid Mamba2/MLA/MoE layers trained with [oxidizr](https://github.com/ml-rust/oxidizr)
+- **Custom tokenizer:** [splintr](https://github.com/ml-rust/splintr) BPE tokenizer with specialized tokens
 
 ## Model Card
 
@@ -381,9 +406,9 @@ Standard inference tools (llama.cpp, vLLM, Transformers, etc.) do not support th
 
 ## Links
 
-- **Inference:** [blazr](https://github.com/farhan-syah/blazr)
-- **Training:** [oxidizr](https://github.com/farhan-syah/oxidizr)
-- **Tokenizer:** [splintr](https://github.com/farhan-syah/splintr)
+- **Inference:** [blazr](https://github.com/ml-rust/blazr)
+- **Training:** [oxidizr](https://github.com/ml-rust/oxidizr)
+- **Tokenizer:** [splintr](https://github.com/ml-rust/splintr)
 "#,
         tags = tags_str,
         model_name = model_name,
@@ -487,7 +512,10 @@ fn describe_architecture(config: &BlazrConfig) -> String {
     // MoE
     if let Some(num_experts) = config.num_experts {
         let experts_per_tok = config.experts_per_tok.unwrap_or(2);
-        parts.push(format!("MoE ({} experts, top-{})", num_experts, experts_per_tok));
+        parts.push(format!(
+            "MoE ({} experts, top-{})",
+            num_experts, experts_per_tok
+        ));
     }
 
     if parts.is_empty() {
@@ -503,11 +531,13 @@ fn estimate_params_from_config(config: &BlazrConfig) -> String {
     let embed_params = config.vocab_size * config.hidden_size;
     let intermediate = config.intermediate_size.unwrap_or(config.hidden_size * 4);
 
-    let layer_params = config.num_layers * (
-        // Attention/Mamba + MLP
-        4 * config.hidden_size * config.hidden_size + // Q, K, V, O projections (rough)
-        3 * config.hidden_size * intermediate // gate, up, down
-    );
+    let layer_params = config.num_layers
+        * (
+            // Attention/Mamba + MLP
+            4 * config.hidden_size * config.hidden_size + // Q, K, V, O projections (rough)
+        3 * config.hidden_size * intermediate
+            // gate, up, down
+        );
 
     let lm_head_params = config.hidden_size * config.vocab_size;
     let total = embed_params + layer_params + lm_head_params;
@@ -527,11 +557,14 @@ pub fn run_pack(args: PackArgs) -> Result<()> {
     let _ = dotenvy::dotenv();
 
     // Get HuggingFace username
-    let username = args.username
+    let username = args
+        .username
         .or_else(|| std::env::var("HF_USERNAME").ok())
-        .ok_or_else(|| anyhow::anyhow!(
-            "HuggingFace username not specified. Use --username or set HF_USERNAME in .env"
-        ))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "HuggingFace username not specified. Use --username or set HF_USERNAME in .env"
+            )
+        })?;
 
     println!("📦 Oxidizr Model Packer");
     println!("========================\n");
@@ -548,7 +581,9 @@ pub fn run_pack(args: PackArgs) -> Result<()> {
     println!("Selected: {}\n", checkpoint.display_name());
 
     // Load config.json from checkpoint's parent directory (e.g., ./checkpoints/nano-start/)
-    let checkpoint_parent = checkpoint.path.parent()
+    let checkpoint_parent = checkpoint
+        .path
+        .parent()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine checkpoint parent directory"))?;
     let config_path = checkpoint_parent.join("config.json");
     if !config_path.exists() {
@@ -559,8 +594,8 @@ pub fn run_pack(args: PackArgs) -> Result<()> {
     }
 
     let config_content = fs::read_to_string(&config_path)?;
-    let config: BlazrConfig = serde_json::from_str(&config_content)
-        .context("Failed to parse config.json")?;
+    let config: BlazrConfig =
+        serde_json::from_str(&config_content).context("Failed to parse config.json")?;
 
     // Determine model name
     let model_name = args.name.unwrap_or_else(|| {
@@ -576,9 +611,10 @@ pub fn run_pack(args: PackArgs) -> Result<()> {
     });
 
     // Determine output directory
-    let output_dir = args.output.map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from("hf").join(&username).join(&model_name)
-    });
+    let output_dir = args
+        .output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("hf").join(&username).join(&model_name));
 
     println!("Packing model: {}", model_name);
     println!("Output directory: {}\n", output_dir.display());
@@ -620,7 +656,8 @@ pub fn run_pack(args: PackArgs) -> Result<()> {
 
     // Generate model card README.md
     println!("  Generating README.md (model card)...");
-    let model_card = generate_model_card(&model_name, &username, &config, checkpoint, stats.as_ref());
+    let model_card =
+        generate_model_card(&model_name, &username, &config, checkpoint, stats.as_ref());
     fs::write(output_dir.join("README.md"), model_card)?;
 
     println!("\n✅ Model packed successfully!");
@@ -631,7 +668,10 @@ pub fn run_pack(args: PackArgs) -> Result<()> {
 
     println!("\nNext steps:");
     println!("  1. Review the generated README.md");
-    println!("  2. Push to HuggingFace: oxidizr push --model {}", output_dir.display());
+    println!(
+        "  2. Push to HuggingFace: oxidizr push --model {}",
+        output_dir.display()
+    );
     println!("     (requires --features huggingface)");
 
     Ok(())

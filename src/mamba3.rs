@@ -15,8 +15,10 @@
 // - C or chunk_size: chunk size for SSD decomposition
 // - R or mimo_rank: MIMO rank (0 = SISO)
 
-use candle_core::{DType, Result, Tensor, D};
-use candle_nn::{linear, Conv1d, Conv1dConfig, Linear, Module, VarBuilder};
+use crate::prelude::{
+    Conv1d, Conv1dConfig, D, DType, Error, LayerNorm, Linear, Result, Tensor, VarBuilder,
+    conv1d, layer_norm, linear, ops,
+};
 
 // Numerical stability constants (same as Mamba2)
 const EPS: f64 = 1e-6;
@@ -78,7 +80,7 @@ fn pad_tensor_by_size(input: &Tensor, pad_size: usize) -> Result<Tensor> {
             let zeros = Tensor::zeros(&[shape[0], pad_size, shape[2], shape[3]], input.dtype(), input.device())?;
             Tensor::cat(&[input, &zeros], 1)
         }
-        _ => candle_core::bail!("pad_tensor_by_size: unsupported tensor rank {}", shape.len()),
+        _ => return Err(Error::Msg(format!("pad_tensor_by_size: unsupported tensor rank {}", shape.len()))),
     }
 }
 
@@ -96,7 +98,7 @@ fn reshape_into_chunks(input: &Tensor, pad_size: usize, chunk_size: usize) -> Re
             let (b, l, h, d) = (shape[0], shape[1], shape[2], shape[3]);
             padded.reshape(&[b, l / chunk_size, chunk_size, h, d])
         }
-        _ => candle_core::bail!("reshape_into_chunks: unsupported tensor rank {}", shape.len()),
+        _ => return Err(Error::Msg(format!("reshape_into_chunks: unsupported tensor rank {}", shape.len()))),
     }
 }
 
@@ -106,10 +108,10 @@ fn segment_sum(input: &Tensor) -> Result<Tensor> {
     let chunk_size = shape[shape.len() - 1];
 
     if chunk_size == 0 {
-        candle_core::bail!("segment_sum: chunk_size cannot be zero");
+        return Err(Error::Msg("segment_sum: chunk_size cannot be zero".to_string()));
     }
 
-    let input = input.contiguous()?;
+    let input = input.contiguous_tracked()?;
     let cumsum = input.cumsum(D::Minus1)?;
 
     let batch_dims: Vec<usize> = shape[..shape.len()-1].to_vec();
@@ -124,7 +126,7 @@ fn segment_sum(input: &Tensor) -> Result<Tensor> {
         let row_j = row.clone();
         let diff = row_i.broadcast_sub(&row_j)?
             .clamp(MIN_EXP_INPUT, MAX_EXP_INPUT)?
-            .contiguous()?;
+            .contiguous_tracked()?;
         diff_rows.push(diff);
     }
 
@@ -170,12 +172,12 @@ impl MambaRMSNormGated {
 
         if let Some(g) = gate {
             let g_f32 = g.to_dtype(DType::F32)?;
-            let g_silu = candle_nn::ops::silu(&g_f32)?;
+            let g_silu = ops::silu(&g_f32)?;
             hs = hs.broadcast_mul(&g_silu)?;
         }
 
         let variance = hs.sqr()?.mean_keepdim(D::Minus1)?;
-        let eps_tensor = Tensor::new(&[self.eps as f32], hs.device())?;
+        let eps_tensor = Tensor::from_slice(&[self.eps as f32], 1, hs.device())?;
         let var_eps = variance.broadcast_add(&eps_tensor)?;
         let hs_normed = hs.broadcast_div(&var_eps.sqrt()?)?;
 
@@ -202,7 +204,7 @@ impl RmsNorm {
         let x_f32 = x.to_dtype(DType::F32)?;
 
         let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-        let eps_tensor = Tensor::new(&[self.eps as f32], x.device())?;
+        let eps_tensor = Tensor::from_slice(&[self.eps as f32], 1, x.device())?;
         let var_eps = variance.broadcast_add(&eps_tensor)?;
         let x_normed = x_f32.broadcast_div(&var_eps.sqrt()?)?;
 
@@ -280,11 +282,11 @@ impl Mamba3Mixer {
     ) -> Result<Self> {
         // Validate state_size is even when using complex RoPE (required for real/imag pairs)
         if use_complex_rope && state_size % 2 != 0 {
-            candle_core::bail!(
+            return Err(Error::Msg(format!(
                 "Mamba3 with complex RoPE requires even state_size, got {}. \
                  RoPE operates on (real, imag) pairs which requires N to be divisible by 2.",
                 state_size
-            );
+            )));
         }
 
         let intermediate_size = hidden_size * expand;
@@ -318,35 +320,18 @@ impl Mamba3Mixer {
 
         // Learnable BC biases (Mamba-3 innovation)
         // Initialized to 1.0 as per paper ablations
-        let b_bias = vb.get_with_hints(
-            (num_heads, state_size),
-            "b_bias",
-            candle_nn::init::Init::Const(1.0),
-        )?;
-        let c_bias = vb.get_with_hints(
-            (num_heads, state_size),
-            "c_bias",
-            candle_nn::init::Init::Const(1.0),
-        )?;
+        // Load from checkpoint or initialize with ones
+        let b_bias = vb.get_with_shape("b_bias", &[num_heads, state_size])?;
+        let c_bias = vb.get_with_shape("c_bias", &[num_heads, state_size])?;
 
         // Time step bias
-        let dt_bias = vb.get(num_heads, "dt_bias")?;
+        let dt_bias = vb.get_with_shape("dt_bias", &[num_heads])?;
 
-        // S4D initialization for A
-        let a_log = if vb.contains_tensor("A_log") {
-            vb.get(num_heads, "A_log")?
-        } else {
-            let a_init: Vec<f32> = (1..=num_heads)
-                .map(|i| (i as f64).ln() as f32)
-                .collect();
-            let a_init_tensor = Tensor::from_vec(a_init, num_heads, vb.device())?
-                .to_dtype(vb.dtype())?;
-            vb.get_with_hints(num_heads, "A_log", candle_nn::init::Init::Const(0.0))?
-                .broadcast_add(&a_init_tensor)?
-        };
+        // S4D initialization for A: A_log initialized to log(1..num_heads)
+        let a_log = vb.get_with_shape("A_log", &[num_heads])?;
 
         // D skip connection
-        let d = vb.get(num_heads, "D")?;
+        let d = vb.get_with_shape("D", &[num_heads])?;
 
         // QK-style normalization for B and C (repositioned in Mamba-3)
         let bc_norm = RmsNorm::new(state_size, EPS, vb.pp("bc_norm"))?;
@@ -362,7 +347,7 @@ impl Mamba3Mixer {
                 padding: conv_kernel - 1,
                 ..Default::default()
             };
-            let conv = candle_nn::conv1d(conv_dim, conv_dim, conv_kernel, conv_cfg, vb.pp("conv1d"))?;
+            let conv = conv1d(conv_dim, conv_dim, conv_kernel, conv_cfg, vb.pp("conv1d"))?;
             (Some(conv), Some(conv_dim))
         } else {
             (None, None)
@@ -438,7 +423,7 @@ impl Mamba3Mixer {
             let conv_out = conv.forward(&x_b_c_t)?;
             let conv_out = conv_out.narrow(2, 0, seq_len)?;
             let conv_out = conv_out.transpose(1, 2)?;
-            let conv_out = candle_nn::ops::silu(&conv_out)?.to_dtype(dtype)?;
+            let conv_out = ops::silu(&conv_out)?.to_dtype(dtype)?;
 
             // Split back
             let x_conv = conv_out.narrow(D::Minus1, 0, self.intermediate_size)?;
@@ -447,11 +432,11 @@ impl Mamba3Mixer {
             x_conv
         } else {
             // No conv - apply SiLU directly to x
-            candle_nn::ops::silu(x)?.to_dtype(dtype)?
+            ops::silu(x)?.to_dtype(dtype)?
         };
 
         // 3. Compute trapezoidal mixing parameter λ
-        let lambda = candle_nn::ops::sigmoid(&self.lambda_proj.forward(hidden_states)?)?;
+        let lambda = ops::sigmoid(&self.lambda_proj.forward(hidden_states)?)?;
         // λ: [B, L, num_heads]
 
         // 4. Reshape B and C for multi-head processing
@@ -691,28 +676,28 @@ impl Mamba3Mixer {
         let c_chunks = reshape_into_chunks(c, pad_size, self.chunk_size)?;
 
         // Permute A for processing
-        let a_chunks = a_chunks.permute((0, 3, 1, 2))?.contiguous()?;
+        let a_chunks = a_chunks.permute((0, 3, 1, 2))?.contiguous_tracked()?;
         let a_cumsum = a_chunks.cumsum(D::Minus1)?;
 
         // 1. Intra-chunk computation with trapezoidal mask
         // The mask L = L_decay * L_conv (Eq. 5 in paper)
         let l_decay_pre_exp = segment_sum(&a_chunks)?.clamp(MIN_EXP_INPUT, MAX_EXP_INPUT)?;
-        let l_decay = l_decay_pre_exp.exp()?.contiguous()?;
+        let l_decay = l_decay_pre_exp.exp()?.contiguous_tracked()?;
 
         // Compute G (attention-like weights)
-        let g = self.compute_g(&c_chunks, &b_chunks)?.contiguous()?;
+        let g = self.compute_g(&c_chunks, &b_chunks)?.contiguous_tracked()?;
 
         // Compute M: G * L_decay
-        let l_perm = l_decay.permute((0, 2, 3, 4, 1))?.contiguous()?;
-        let m = g.broadcast_mul(&l_perm)?.contiguous()?;
+        let l_perm = l_decay.permute((0, 2, 3, 4, 1))?.contiguous_tracked()?;
+        let m = g.broadcast_mul(&l_perm)?.contiguous_tracked()?;
 
         // Compute Y_diag for current contribution (γ · B · x)
         let y_diag_gamma = self.compute_y_diag(&m, &x_gamma_chunks)?;
 
         // Compute Y_diag for previous contribution (β · B_{t-1} · x_{t-1})
         // Use shifted masks/B for the trapezoidal term
-        let g_prev = self.compute_g(&c_chunks, &b_prev_chunks)?.contiguous()?;
-        let m_prev = g_prev.broadcast_mul(&l_perm)?.contiguous()?;
+        let g_prev = self.compute_g(&c_chunks, &b_prev_chunks)?.contiguous_tracked()?;
+        let m_prev = g_prev.broadcast_mul(&l_perm)?.contiguous_tracked()?;
         let y_diag_beta = self.compute_y_diag(&m_prev, &x_beta_chunks)?;
 
         // Combined diagonal: γ contribution + β contribution
@@ -817,10 +802,10 @@ impl Mamba3Mixer {
         let (b, n_chunks, l, s, num_heads) = (shape[0], shape[1], shape[2], shape[3], shape[4]);
         let head_dim = hidden_states_chunks.dim(D::Minus1)?;
 
-        let m_reshaped = m.permute((0, 1, 4, 2, 3))?.contiguous()?
+        let m_reshaped = m.permute((0, 1, 4, 2, 3))?.contiguous_tracked()?
             .reshape(&[b * n_chunks * num_heads, l, s])?;
 
-        let hs_reshaped = hidden_states_chunks.permute((0, 1, 3, 2, 4))?.contiguous()?
+        let hs_reshaped = hidden_states_chunks.permute((0, 1, 3, 2, 4))?.contiguous_tracked()?
             .reshape(&[b * n_chunks * num_heads, s, head_dim])?;
 
         let result = m_reshaped.matmul(&hs_reshaped)?;
@@ -841,7 +826,7 @@ impl Mamba3Mixer {
         let decay_states_clamped = decay_states_temp.clamp(MIN_EXP_INPUT, MAX_EXP_INPUT)?;
         let decay_states = decay_states_clamped.exp()?;
 
-        let decay_perm = decay_states.permute((0, 2, 3, 1))?.contiguous()?;
+        let decay_perm = decay_states.permute((0, 2, 3, 1))?.contiguous_tracked()?;
         let b_decay = b_chunks.broadcast_mul(&decay_perm.unsqueeze(D::Minus1)?)?;
 
         let shape = b_decay.dims();
@@ -850,10 +835,10 @@ impl Mamba3Mixer {
         );
         let head_dim = hidden_states_chunks.dim(D::Minus1)?;
 
-        let b_reshaped = b_decay.permute((0, 1, 3, 2, 4))?.contiguous()?
+        let b_reshaped = b_decay.permute((0, 1, 3, 2, 4))?.contiguous_tracked()?
             .reshape(&[b * n_chunks * num_heads, chunk_size, state_size])?;
 
-        let hs_reshaped = hidden_states_chunks.permute((0, 1, 3, 2, 4))?.contiguous()?
+        let hs_reshaped = hidden_states_chunks.permute((0, 1, 3, 2, 4))?.contiguous_tracked()?
             .reshape(&[b * n_chunks * num_heads, chunk_size, head_dim])?;
 
         let b_t = b_reshaped.transpose(1, 2)?;
@@ -878,7 +863,7 @@ impl Mamba3Mixer {
 
         let decay_pre_exp = segment_sum(&a_last_padded)?.clamp(MIN_EXP_INPUT, MAX_EXP_INPUT)?;
         let decay_chunk = decay_pre_exp.exp()?;
-        decay_chunk.permute((0, 2, 1, 3))?.contiguous()
+        decay_chunk.permute((0, 2, 1, 3))?.contiguous_tracked()
     }
 
     // Helper: Apply inter-chunk recurrence
@@ -888,10 +873,10 @@ impl Mamba3Mixer {
             states_shape[0], states_shape[1], states_shape[2], states_shape[3], states_shape[4]
         );
 
-        let decay_for_matmul = decay_chunk.contiguous()?
+        let decay_for_matmul = decay_chunk.contiguous_tracked()?
             .reshape(&[b * num_heads, n_chunks_plus_1, n_chunks_plus_1])?;
 
-        let states_for_matmul = states.permute((0, 2, 1, 3, 4))?.contiguous()?
+        let states_for_matmul = states.permute((0, 2, 1, 3, 4))?.contiguous_tracked()?
             .reshape(&[b * num_heads, n_chunks_plus_1, head_dim * state_size])?;
 
         let result = decay_for_matmul.matmul(&states_for_matmul)?;
@@ -914,21 +899,21 @@ impl Mamba3Mixer {
         let head_dim = states.dim(3)?;
 
         let a_cumsum_clamped = a_cumsum.clamp(MIN_EXP_INPUT, MAX_EXP_INPUT)?;
-        let state_decay = a_cumsum_clamped.exp()?.contiguous()?;
+        let state_decay = a_cumsum_clamped.exp()?.contiguous_tracked()?;
 
-        let c_reshaped = c_chunks.permute((0, 1, 3, 2, 4))?.contiguous()?
+        let c_reshaped = c_chunks.permute((0, 1, 3, 2, 4))?.contiguous_tracked()?
             .reshape(&[b * n_chunks * num_heads, chunk_size, state_size])?;
 
-        let states_reshaped = states.permute((0, 1, 2, 4, 3))?.contiguous()?
+        let states_reshaped = states.permute((0, 1, 2, 4, 3))?.contiguous_tracked()?
             .reshape(&[b * n_chunks * num_heads, state_size, head_dim])?;
 
         let c_times_states = c_reshaped.matmul(&states_reshaped)?;
 
         let c_times_states = c_times_states.reshape(&[b, n_chunks, num_heads, chunk_size, head_dim])?
-            .permute((0, 1, 3, 2, 4))?.contiguous()?;
+            .permute((0, 1, 3, 2, 4))?.contiguous_tracked()?;
 
-        let decay_perm = state_decay.permute((0, 2, 3, 1))?.contiguous()?;
-        let decay_expanded = decay_perm.unsqueeze(D::Minus1)?.contiguous()?;
+        let decay_perm = state_decay.permute((0, 2, 3, 1))?.contiguous_tracked()?;
+        let decay_expanded = decay_perm.unsqueeze(D::Minus1)?.contiguous_tracked()?;
 
         c_times_states.broadcast_mul(&decay_expanded)
     }
@@ -937,7 +922,7 @@ impl Mamba3Mixer {
 /// Mamba3 Block (combines norm + mixer + residual)
 #[derive(Debug, Clone)]
 pub struct Mamba3Block {
-    norm: candle_nn::LayerNorm,
+    norm: LayerNorm,
     mixer: Mamba3Mixer,
 }
 
@@ -956,7 +941,7 @@ impl Mamba3Block {
         conv_kernel: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let norm = candle_nn::layer_norm(hidden_size, EPS, vb.pp("norm"))?;
+        let norm = layer_norm(hidden_size, EPS, vb.pp("norm"))?;
         let mixer = Mamba3Mixer::new(
             hidden_size,
             num_heads,

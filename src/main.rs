@@ -6,6 +6,7 @@ mod mamba;
 mod mamba2;
 mod mamba3;
 mod model;
+mod prelude;
 mod trainer;
 
 use anyhow::Result;

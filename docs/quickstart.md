@@ -11,7 +11,7 @@ Train your first model in 5 minutes.
 
 ```bash
 # Clone the repository
-git clone https://github.com/farhan-syah/oxidizr.git
+git clone https://github.com/ml-rust/oxidizr.git
 cd oxidizr
 
 # Build (CPU)
@@ -59,16 +59,19 @@ cargo run --release -- -f models/nano-start.yaml -d data/nano-start/tokenized/co
 ## Troubleshooting
 
 **Progress bar doesn't appear?**
+
 ```bash
 cargo run --release -- -f models/nano-start.yaml -d data/nano-start/tokenized/combined.bin --headless
 ```
 
 **Out of memory?**
+
 - Reduce `--batch-size` (try 1)
 - Reduce `--seq-len` (try 128)
 - Use gradient accumulation in config
 
 **CUDA errors?**
+
 - Ensure CUDA 12.x/13.x is installed
 - Build with `--features cuda`
 - Check `nvidia-smi` works

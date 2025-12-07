@@ -3,8 +3,7 @@
 //! This module defines the `GradientSynchronizer` trait that all backends must implement,
 //! as well as configuration types for distributed training.
 
-use candle_core::{Result, Tensor, Var};
-use candle_nn::VarMap;
+use crate::prelude::{GradStore, Result, Tensor, VarMap};
 use serde::{Deserialize, Serialize};
 
 /// Synchronization backend selection
@@ -85,8 +84,8 @@ impl DistributedConfig {
     }
 }
 
-/// Synchronized gradient: parameter name and its averaged gradient tensor
-pub type SyncedGradient = (String, Var, Tensor);
+/// Synchronized gradient: parameter name, parameter tensor, and its averaged gradient tensor
+pub type SyncedGradient = (String, Tensor, Tensor);
 
 /// Trait for gradient synchronization across multiple GPUs
 ///
@@ -115,7 +114,7 @@ pub trait GradientSynchronizer: Send + Sync {
     /// Vector of (parameter_name, Var, averaged_gradient) tuples
     fn synchronize_gradients(
         &self,
-        grads: &candle_core::backprop::GradStore,
+        grads: &GradStore,
         varmap: &VarMap,
     ) -> Result<Vec<SyncedGradient>>;
 

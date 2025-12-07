@@ -2,8 +2,10 @@
 // Ported from candle-examples/mamba-minimal with critical fixes for training stability
 // Key: Use sequential scan (not parallel) to avoid numerical divergence in backward pass
 
-use candle_core::{Result, Tensor, DType};
-use candle_nn::{VarBuilder, Linear, linear_no_bias, Conv1d, Conv1dConfig, Module};
+use crate::prelude::{
+    Conv1d, Conv1dConfig, DType, Linear, Result, Tensor, VarBuilder,
+    conv1d, linear, linear_no_bias, ops,
+};
 use crate::config::ModelConfig;
 
 /// Maximum absolute value for hidden state clamping in Mamba SSM
@@ -71,21 +73,22 @@ impl MambaBlock {
         let in_proj = linear_no_bias(d_model, d_inner * 2, vb.pp("in_proj"))?;
 
         // Conv1D for local context
-        let conv1d = candle_nn::conv1d(
+        let conv_config = Conv1dConfig {
+            groups: d_inner,  // Depthwise convolution
+            padding: d_conv - 1,
+            ..Default::default()
+        };
+        let conv1d_layer = conv1d(
             d_inner,
             d_inner,
             d_conv,
-            Conv1dConfig {
-                groups: d_inner,  // Depthwise convolution
-                padding: d_conv - 1,
-                ..Default::default()
-            },
+            conv_config,
             vb.pp("conv1d")
         )?;
 
         // SSM projections
         let x_proj = linear_no_bias(d_inner, d_state + d_state + d_inner, vb.pp("x_proj"))?;
-        let dt_proj = candle_nn::linear(d_inner, d_inner, vb.pp("dt_proj"))?;
+        let dt_proj = linear(d_inner, d_inner, vb.pp("dt_proj"))?;
 
         // State matrix A: initialized as log(1..d_state)
         let a_log = vb.get((d_inner, d_state), "a_log")?;
@@ -98,7 +101,7 @@ impl MambaBlock {
 
         Ok(Self {
             in_proj,
-            conv1d,
+            conv1d: conv1d_layer,
             x_proj,
             dt_proj,
             a_log,
@@ -131,23 +134,23 @@ impl MambaBlock {
         // 1. Input projection and split
         let x_and_res = self.in_proj.forward(x)?;  // [B, Seq, 2*d_inner]
         let d_inner_2 = x_and_res.dim(2)? / 2;
-        let x = x_and_res.narrow(2, 0, d_inner_2)?.contiguous()?;  // [B, Seq, d_inner]
-        let res = x_and_res.narrow(2, d_inner_2, d_inner_2)?.contiguous()?;  // [B, Seq, d_inner]
+        let x = x_and_res.narrow(2, 0, d_inner_2)?.contiguous_tracked()?;  // [B, Seq, d_inner]
+        let res = x_and_res.narrow(2, d_inner_2, d_inner_2)?.contiguous_tracked()?;  // [B, Seq, d_inner]
 
         // 2. Conv1D for local context
-        let x_t = x.transpose(1, 2)?.contiguous()?;  // [B, d_inner, Seq]
+        let x_t = x.transpose(1, 2)?.contiguous_tracked()?;  // [B, d_inner, Seq]
         let x_conv = self.conv1d.forward(&x_t)?;
         let x_conv = x_conv.narrow(2, 0, seq_len)?;  // Remove padding
-        let x_conv = x_conv.transpose(1, 2)?.contiguous()?;  // [B, Seq, d_inner]
+        let x_conv = x_conv.transpose(1, 2)?.contiguous_tracked()?;  // [B, Seq, d_inner]
 
         // 3. Activation
-        let x_conv = candle_nn::ops::silu(&x_conv)?;
+        let x_conv = ops::silu(&x_conv)?;
 
         // 4. SSM: Selective scan
         let y = self.ssm(&x_conv)?;
 
         // 5. Gating with residual branch
-        let y = (y * candle_nn::ops::silu(&res)?)?;
+        let y = (y * ops::silu(&res)?)?;
 
         // 6. Output projection
         self.out_proj.forward(&y)
@@ -157,13 +160,13 @@ impl MambaBlock {
         let (_b_sz, _seq_len, d_inner) = x.dims3()?;
 
         // 1. Project x to get B, C, and delta
-        let x_dbl = self.x_proj.forward(x)?.contiguous()?;  // [B, Seq, d_state + d_state + d_inner]
+        let x_dbl = self.x_proj.forward(x)?.contiguous_tracked()?;  // [B, Seq, d_state + d_state + d_inner]
 
         // Split into delta (time step), B (input proj), C (output proj)
         // CRITICAL: Must call contiguous() after narrow to fix CUDA memory padding
-        let delta = x_dbl.narrow(2, 0, d_inner)?.contiguous()?;  // [B, Seq, d_inner]
-        let b = x_dbl.narrow(2, d_inner, self.d_state)?.contiguous()?;  // [B, Seq, d_state]
-        let c = x_dbl.narrow(2, d_inner + self.d_state, self.d_state)?.contiguous()?;  // [B, Seq, d_state]
+        let delta = x_dbl.narrow(2, 0, d_inner)?.contiguous_tracked()?;  // [B, Seq, d_inner]
+        let b = x_dbl.narrow(2, d_inner, self.d_state)?.contiguous_tracked()?;  // [B, Seq, d_state]
+        let c = x_dbl.narrow(2, d_inner + self.d_state, self.d_state)?.contiguous_tracked()?;  // [B, Seq, d_state]
 
         // 2. Transform delta (time step size)
         let delta = self.dt_proj.forward(&delta)?;  // [B, Seq, d_inner]
@@ -270,7 +273,7 @@ impl MambaBlock {
                 // - Single clamp here: same memory usage as no clamping, prevents NaN
                 //
                 // See HIDDEN_STATE_CLAMP_MAX constant for value rationale and TODO for systematic benchmarking
-                h = h.clamp(-HIDDEN_STATE_CLAMP_MAX as f64, HIDDEN_STATE_CLAMP_MAX as f64)?;
+                h = h.clamp(-HIDDEN_STATE_CLAMP_MAX as f32, HIDDEN_STATE_CLAMP_MAX as f32)?;
 
                 // Output: y[t] = h[t] · c
                 let y_t = h.matmul(&c_t.unsqueeze(1)?)?;  // [d_inner, 1]
