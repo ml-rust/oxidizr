@@ -162,7 +162,7 @@ trainer:
   #   - Too low = slow learning, waste compute
   #   - 0.001 is good for small models
 
-  learning_rate: 0.002
+  learning_rate: 0.001
 
   # ---------------------------------------------------------------------------
   # BATCH SIZE AND ACCUMULATION
@@ -173,7 +173,7 @@ trainer:
   # Effective batch size = batch_size * gradient_accumulation
   # Larger effective batch = more stable gradients but slower iteration
 
-  batch_size: 4
+  batch_size: 6
   gradient_accumulation: 2
 
   # ---------------------------------------------------------------------------
@@ -197,7 +197,7 @@ trainer:
 
   checkpoint_dir: "./checkpoints/nano-start"
   log_interval: 10
-  save_interval: 200
+  save_interval: 50
   max_checkpoints: 3
 
   # ---------------------------------------------------------------------------
@@ -220,17 +220,70 @@ trainer:
   #   - Prevents single outlier gradients from dominating
   #   - Typical values: 1.0 - 10.0 (null = disabled)
 
-  max_grad_norm: 1.0 # Global clipping threshold (standard value for stability)
+  max_grad_norm: 10.0 # Stable with warmup
   target_grad_norm: null # Disabled - use standard max_grad_norm clipping only
   max_grad_value: null # Per-element clipping disabled
 
   # ---------------------------------------------------------------------------
-  # MOE LOAD BALANCING
+  # MOE LOAD BALANCING & ROUTER Z-LOSS
   # ---------------------------------------------------------------------------
   # Without regularization, the router might send all tokens to one expert
-  # load_balance_alpha: Auxiliary loss coefficient to encourage even routing
+  # or the router logits can drift to very large values (causes BF16 instability)
+  #
+  # load_balance_alpha: Auxiliary loss for even expert usage (α)
+  #   - Penalizes uneven expert utilization
+  #   - Typical value: 0.01 (from DeepSeek-V3)
+  #
+  # z_loss_alpha: Router z-loss coefficient (γ) - CRITICAL for BF16
+  #   - L_z = (1/T) * sum(log²(sum(exp(logits))))
+  #   - Penalizes large router logits that cause softmax saturation
+  #   - Prevents NaN in BF16 when router outputs get too confident
+  #   - Typical value: 0.001 (from optimization.md)
+  #
+  # Total loss: L_total = L_MLE + α*L_aux + γ*L_z
 
   load_balance_alpha: 0.01
+  z_loss_alpha: 0.001
+
+  # ---------------------------------------------------------------------------
+  # ADAMW OPTIMIZER HYPERPARAMETERS
+  # ---------------------------------------------------------------------------
+  # These settings follow the "Golden Recipe" from optimization.md for stable
+  # training of Hybrid Mamba2-MoE models in BF16/mixed precision.
+  #
+  # adamw_beta1: Momentum coefficient (standard: 0.9)
+  # adamw_beta2: Variance coefficient (0.95 for MoE stability, not 0.999)
+  #   - Lower β₂ helps with sparse MoE expert updates
+  #   - 0.95 is also used by Llama-3
+  # adamw_eps: Numerical stability (1e-6 for BF16 safety, not 1e-8)
+  #   - Higher ε prevents divide-by-zero when variance is small in BF16
+  # weight_decay: L2 regularization (0.1 is industry standard)
+  #   - Decoupled from learning rate (AdamW not Adam)
+
+  adamw_beta1: 0.9
+  adamw_beta2: 0.95
+  adamw_eps: 0.000001
+  weight_decay: 0.1
+
+  # ---------------------------------------------------------------------------
+  # LEARNING RATE WARMUP (critical for Mamba SSM alignment)
+  # ---------------------------------------------------------------------------
+  # Linear warmup from 0 to learning_rate over the warmup period.
+  # Allows SSM parameters (A, B, C, dt) to align before full-speed training.
+  #
+  # warmup_steps: Explicit number of warmup steps (overrides warmup_ratio)
+  #   - Example: 10 = warm up for first 10 optimizer steps
+  #   - Set to null to use warmup_ratio instead
+  #
+  # warmup_ratio: Fraction of total steps for warmup (default: 0.1 = 10%)
+  #   - Only used if warmup_steps is null
+  #   - Example: 0.1 with 1000 total steps = 100 warmup steps
+  #   - Set to null to disable warmup entirely
+  #
+  # Priority: warmup_steps > warmup_ratio > disabled
+
+  warmup_steps: null
+  warmup_ratio: null
 
   # ---------------------------------------------------------------------------
   # GRPO CONFIG (Advanced - Phase 2)

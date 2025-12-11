@@ -371,7 +371,7 @@ impl Mamba3Mixer {
             chunk_size,
             n_groups,
             time_step_min: 0.001,
-            time_step_max: 0.1,
+            time_step_max: 4.0,  // Critical: must be 2.0-15.0, NOT 0.1 (causes gradient explosion)
             use_complex_rope,
             mimo_rank,
             use_conv,

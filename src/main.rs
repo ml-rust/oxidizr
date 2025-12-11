@@ -101,6 +101,32 @@ fn main() -> Result<()> {
     // Initialize logging
     env_logger::init();
 
+    // Set custom panic hook to suppress backtraces for known recoverable errors (like OOM)
+    // These panics are caught by catch_unwind in trainer.rs and converted to user-friendly errors
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let panic_msg = panic_info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| {
+                panic_info
+                    .payload()
+                    .downcast_ref::<String>()
+                    .cloned()
+            })
+            .unwrap_or_default();
+
+        // Skip backtrace for OOM errors - they're handled by catch_unwind
+        if panic_msg.contains("can't allocate buffer") || panic_msg.contains("out of memory") {
+            // Silent - the error will be caught and reported nicely
+            return;
+        }
+
+        // For other panics, use the default hook
+        default_hook(panic_info);
+    }));
+
     let cli = Cli::parse();
 
     match cli.command {

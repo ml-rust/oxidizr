@@ -131,17 +131,17 @@ impl MambaBlock {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (_b_sz, seq_len, _d_model) = x.dims3()?;
 
-        // 1. Input projection and split
+        // 1. Input projection and split - use _tracked for gradient flow
         let x_and_res = self.in_proj.forward(x)?;  // [B, Seq, 2*d_inner]
         let d_inner_2 = x_and_res.dim(2)? / 2;
-        let x = x_and_res.narrow(2, 0, d_inner_2)?.contiguous_tracked()?;  // [B, Seq, d_inner]
-        let res = x_and_res.narrow(2, d_inner_2, d_inner_2)?.contiguous_tracked()?;  // [B, Seq, d_inner]
+        let x = x_and_res.narrow_tracked(2, 0, d_inner_2)?.contiguous_tracked()?;  // [B, Seq, d_inner]
+        let res = x_and_res.narrow_tracked(2, d_inner_2, d_inner_2)?.contiguous_tracked()?;  // [B, Seq, d_inner]
 
-        // 2. Conv1D for local context
-        let x_t = x.transpose(1, 2)?.contiguous_tracked()?;  // [B, d_inner, Seq]
+        // 2. Conv1D for local context - use _tracked for gradient flow
+        let x_t = x.transpose_tracked(1, 2)?.contiguous_tracked()?;  // [B, d_inner, Seq]
         let x_conv = self.conv1d.forward(&x_t)?;
-        let x_conv = x_conv.narrow(2, 0, seq_len)?;  // Remove padding
-        let x_conv = x_conv.transpose(1, 2)?.contiguous_tracked()?;  // [B, Seq, d_inner]
+        let x_conv = x_conv.narrow_tracked(2, 0, seq_len)?;  // Remove padding
+        let x_conv = x_conv.transpose_tracked(1, 2)?.contiguous_tracked()?;  // [B, Seq, d_inner]
 
         // 3. Activation
         let x_conv = ops::silu(&x_conv)?;
@@ -164,9 +164,10 @@ impl MambaBlock {
 
         // Split into delta (time step), B (input proj), C (output proj)
         // CRITICAL: Must call contiguous() after narrow to fix CUDA memory padding
-        let delta = x_dbl.narrow(2, 0, d_inner)?.contiguous_tracked()?;  // [B, Seq, d_inner]
-        let b = x_dbl.narrow(2, d_inner, self.d_state)?.contiguous_tracked()?;  // [B, Seq, d_state]
-        let c = x_dbl.narrow(2, d_inner + self.d_state, self.d_state)?.contiguous_tracked()?;  // [B, Seq, d_state]
+        // Use narrow_tracked for gradient flow
+        let delta = x_dbl.narrow_tracked(2, 0, d_inner)?.contiguous_tracked()?;  // [B, Seq, d_inner]
+        let b = x_dbl.narrow_tracked(2, d_inner, self.d_state)?.contiguous_tracked()?;  // [B, Seq, d_state]
+        let c = x_dbl.narrow_tracked(2, d_inner + self.d_state, self.d_state)?.contiguous_tracked()?;  // [B, Seq, d_state]
 
         // 2. Transform delta (time step size)
         let delta = self.dt_proj.forward(&delta)?;  // [B, Seq, d_inner]

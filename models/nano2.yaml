@@ -1,0 +1,68 @@
+# Nano Configuration (Flagship)
+# Hybrid Mamba2 + MLA + Fine-Grained MoE (~170M total params)
+# Requires 24GB+ VRAM for training with Llama 3 vocab + seq=512
+
+model:
+  name: nano2
+  hidden_size: 384
+  num_layers: 8
+  num_heads: 6
+
+  # Legacy GQA config (set to null for MLA mode)
+  kv_heads: null
+
+  # MLA (Multi-Head Latent Attention) config
+  kv_latent_dim: 192 # Compress KV to half
+  q_latent_dim: 192 # Compress Q to half
+  d_rope: 16 # Small RoPE dimension for decoupled heads
+
+  # MoE (Mixture of Experts) config
+  num_experts: 4 # 4 experts for nano
+  experts_per_tok: 2 # CRITICAL: Top-2 not Top-1
+  shared_expert_enabled: true
+  intermediate_size: 1536 # 4x hidden per expert
+
+  # Hybrid architecture: 6 Mamba2 + 2 MLA in 3:1 pattern
+  # Layers 0,1,2 = Mamba2, Layer 3 = MLA, Layers 4,5,6 = Mamba2, Layer 7 = MLA
+  mamba_layers: [0, 1, 2, 4, 5, 6]
+
+  # Mamba2 (State Space Duality) config - enables parallel chunk-based training
+  # CONSTRAINT: hidden_size * mamba2_expand == mamba2_num_heads * mamba2_head_dim
+  # Validation: 384 * 2 = 768 == 48 * 16 ✓
+  mamba2_num_heads: 48 # Number of SSM heads
+  mamba2_head_dim: 16 # Dimension per head
+  mamba2_state_size: 64 # SSM state dimension N
+  mamba2_chunk_size: 64 # Chunk size for SSD (seq_len/chunk_size = num chunks)
+  mamba2_n_groups: 1 # Groups for efficient computation
+  mamba2_conv_kernel: 4 # Conv1D kernel size
+  mamba2_expand: 2 # Expansion factor (intermediate = 768)
+
+  vocab_size: 128354 # Llama 3 + splintr agent tokens
+  # REQUIRED: Tokenizer vocabulary name - must match the vocab used to tokenize training data
+  # Options: cl100k_base, o200k_base, llama3, deepseek_v3, custom
+  tokenizer_vocab: llama3
+  max_seq_len: 512
+  rope_theta: 10000.0
+
+trainer:
+  target_device: gpu
+  learning_rate: 0.0003
+  max_steps: 0 # 0 = unlimited, train for full epochs
+  num_epochs: 2
+  batch_size: 4
+  gradient_accumulation: 2 # effective batch = 8
+  checkpoint_dir: "./checkpoints/nano2"
+  log_interval: 10
+  save_interval: 100
+  load_balance_alpha: 0.01 # For MoE load balancing
+
+  # GRPO (Group Relative Policy Optimization) config - Phase 2
+  group_size: 4 # Number of rollouts per prompt
+  beta_kl: 0.04 # KL penalty coefficient
+
+  max_grad_norm: 10.0 # Stable with warmup
+  target_grad_norm: null # Disabled - use standard max_grad_norm clipping only
+  max_grad_value: null # Per-element clipping disabled
+
+  warmup_steps: null
+  warmup_ratio: null

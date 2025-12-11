@@ -1,19 +1,16 @@
-use crate::prelude::{
-    FusedAdamW, cross_entropy, Device, Error, GradStore,
-    Result, Tensor, VarMap
-};
-use boostr::AdamWConfig;
 use crate::config::{BlazrConfig, CheckpointMeta, ModelConfig, TrainerConfig};
 use crate::data::DataLoader;
 use crate::distributed::{
-    GradientSynchronizer, DistributedAdamW, AdamWConfig as DistAdamWConfig,
-    create_synchronizer, compute_grad_norm,
+    compute_grad_norm, create_synchronizer, AdamWConfig as DistAdamWConfig, DistributedAdamW,
+    GradientSynchronizer,
 };
+use crate::prelude::{cross_entropy, Device, Error, FusedAdamW, GradStore, Result, Tensor, VarMap};
+use boostr::AdamWConfig;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
-use std::io::Write;
 
 /// The "LitGPT" style Trainer abstraction.
 /// It owns the loop state, the optimizer, and handles the "boring" stuff.
@@ -21,7 +18,7 @@ pub struct LitTrainer<'a> {
     config: TrainerConfig,
     varmap: &'a mut VarMap,
     optimizer: FusedAdamW,
-    #[allow(dead_code)]  // Kept for potential future use (e.g., device-specific optimizations)
+    #[allow(dead_code)] // Kept for potential future use (e.g., device-specific optimizations)
     device: Device,
     global_step: usize,
     // Training metrics
@@ -43,6 +40,9 @@ pub struct LitTrainer<'a> {
     // Distributed training support
     synchronizer: Option<Box<dyn GradientSynchronizer>>,
     distributed_optimizer: Option<DistributedAdamW>,
+    // Learning rate warmup (critical for Mamba SSM parameter alignment)
+    warmup_steps: usize,     // Effective warmup steps (0 = disabled)
+    base_learning_rate: f64, // Base LR to warmup towards
 }
 
 impl<'a> LitTrainer<'a> {
@@ -59,13 +59,18 @@ impl<'a> LitTrainer<'a> {
         model_config: ModelConfig,
         data_file_path: Option<String>,
     ) -> Result<Self> {
-        // Init FusedAdamW with standard parameters
+        // Init FusedAdamW with configurable SOTA parameters (from optimization.md)
+        // - beta2 = 0.95: Lower β₂ stabilizes MoE sparse expert updates
+        // - eps = 1e-6: Higher ε for BF16 numerical safety
+        // - weight_decay = 0.1: Industry standard (decoupled from LR)
         let optimizer = FusedAdamW::from_varmap_with_config(
             varmap,
             AdamWConfig {
                 lr: config.learning_rate as f32,
-                weight_decay: 0.01,
-                ..Default::default()
+                beta1: config.adamw_beta1 as f32,
+                beta2: config.adamw_beta2 as f32,
+                eps: config.adamw_eps as f32,
+                weight_decay: config.weight_decay as f32,
             },
         );
 
@@ -77,14 +82,25 @@ impl<'a> LitTrainer<'a> {
         // Initialize distributed training components if enabled
         let (synchronizer, distributed_optimizer) = if config.distributed.enabled {
             let sync = create_synchronizer(&config.distributed)?;
-            let dist_opt = DistributedAdamW::new(
-                varmap,
-                DistAdamWConfig::with_lr(config.learning_rate),
-            )?;
+            let dist_opt =
+                DistributedAdamW::new(varmap, DistAdamWConfig::with_lr(config.learning_rate))?;
             (Some(sync), Some(dist_opt))
         } else {
             (None, None)
         };
+
+        // Calculate effective warmup steps (explicit steps OR ratio * total_steps)
+        // Priority: warmup_steps > warmup_ratio > disabled (0)
+        let warmup_steps = if let Some(steps) = config.warmup_steps {
+            steps
+        } else if let Some(ratio) = config.warmup_ratio {
+            (total_steps as f64 * ratio).ceil() as usize
+        } else {
+            0 // No warmup
+        };
+
+        // Store base learning rate for warmup calculation
+        let base_learning_rate = config.learning_rate;
 
         Ok(Self {
             config,
@@ -104,6 +120,8 @@ impl<'a> LitTrainer<'a> {
             data_file_path,
             synchronizer,
             distributed_optimizer,
+            warmup_steps,
+            base_learning_rate,
         })
     }
 
@@ -117,14 +135,28 @@ impl<'a> LitTrainer<'a> {
     pub fn training_step<D: DataLoader>(
         &mut self,
         model: &crate::model::LitGPT,
-        data_loader: &mut D
+        data_loader: &mut D,
     ) -> Result<(f64, f64)> {
+        // Apply learning rate warmup at the START of each step (critical for Mamba SSM alignment)
+        // This ensures consistent LR throughout forward/backward/optimizer
+        if self.warmup_steps > 0 && self.global_step < self.warmup_steps {
+            let warmup_ratio = (self.global_step + 1) as f64 / self.warmup_steps as f64;
+            let warmup_lr = (self.base_learning_rate * warmup_ratio).max(1e-7);
+            self.optimizer.set_lr(warmup_lr as f32);
+        } else if self.warmup_steps > 0 && self.global_step == self.warmup_steps {
+            // Restore full learning rate after warmup completes
+            self.optimizer.set_lr(self.base_learning_rate as f32);
+        }
 
         let mut total_loss_for_logging = 0.0;
         #[allow(unused_assignments)]
         let mut last_grad_norm = 0.0;
         let accum_steps = self.config.gradient_accumulation;
         let load_balance_alpha = self.config.load_balance_alpha;
+
+        // Profiling support - set PROFILE_TRAIN=1 to enable detailed timing
+        let profile = std::env::var("PROFILE_TRAIN").is_ok();
+        let step_start = if profile { Some(Instant::now()) } else { None };
 
         // Note: max_grad_value (per-element clipping) is handled by FusedAdamW's built-in clamping (±1e4)
         // Global gradient clipping and normalization are applied below before optimizer.step()
@@ -136,32 +168,99 @@ impl<'a> LitTrainer<'a> {
 
         // Gradient Accumulation Loop - only forward passes, accumulate losses
         for _micro_batch_idx in 0..accum_steps {
+            let data_start = if profile { Some(Instant::now()) } else { None };
             let (input, target) = data_loader.next_batch()?;
+            if let Some(start) = data_start {
+                eprintln!("[PROFILE] data_load: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+            }
 
             // Register parameters as requires_grad on the tape for this forward pass
             // This ensures gradient computation works correctly after tape.clear()
+            let reg_start = if profile { Some(Instant::now()) } else { None };
             self.varmap.register_requires_grad();
+            if let Some(start) = reg_start {
+                eprintln!("[PROFILE] register_requires_grad: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+            }
 
-            // Forward pass (returns logits + auxiliary losses)
-            let output = model.forward(&input)?;
+            // Forward pass (returns logits + auxiliary losses + z-losses)
+            // Wrap in catch_unwind to provide user-friendly OOM error
+            let fwd_start = if profile { Some(Instant::now()) } else { None };
+            let output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                model.forward(&input)
+            })) {
+                Ok(result) => result?,
+                Err(panic_info) => {
+                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+
+                    if panic_msg.contains("can't allocate buffer")
+                        || panic_msg.contains("out of memory")
+                    {
+                        let size_info = if let Some(start) = panic_msg.find("size:") {
+                            let size_str = &panic_msg[start + 5..];
+                            if let Some(size) = size_str.trim().split_whitespace().next() {
+                                if let Ok(bytes) = size.parse::<u64>() {
+                                    format!(" ({:.1} MB)", bytes as f64 / 1_000_000.0)
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                        return Err(Error::Msg(format!(
+                            "GPU out of memory during forward pass{}\n\n\
+                            The model requires more VRAM than available. Try:\n\
+                            • Reduce batch_size (current: {})\n\
+                            • Reduce max_seq_len in config\n\
+                            • Increase gradient_accumulation to maintain effective batch size\n\
+                            • Use a smaller model configuration\n\
+                            • Free GPU memory from other processes (check with: nvidia-smi)",
+                            size_info, self.batch_size
+                        )));
+                    }
+
+                    std::panic::resume_unwind(panic_info);
+                }
+            };
+            if let Some(start) = fwd_start {
+                eprintln!("[PROFILE] forward: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+            }
             let logits = output.logits;
             let aux_losses = output.aux_losses;
+            let z_losses = output.z_losses;
 
             // Check for NaN in logits (indicates model forward pass issue)
-            if let Ok(logits_vec) = logits.flatten_all()?.to_vec::<f32>() {
-                if logits_vec.iter().any(|x| x.is_nan() || x.is_infinite()) {
-                    eprintln!("\n❌ NaN/Inf in model logits! This indicates:");
-                    eprintln!("   1. Numerical instability in forward pass");
-                    eprintln!("   2. RoPE or attention computation overflow");
-                    eprintln!("   3. Mamba SSM state explosion");
-                    return Err(Error::Msg("NaN in logits".to_string()));
+            // EXPENSIVE: This transfers entire logits tensor to CPU - only do on first step or if DEBUG
+            let nan_check_start = if profile { Some(Instant::now()) } else { None };
+            if self.global_step == 0 || std::env::var("DEBUG_NAN").is_ok() {
+                if let Ok(logits_vec) = logits.flatten_all()?.to_vec::<f32>() {
+                    if logits_vec.iter().any(|x| x.is_nan() || x.is_infinite()) {
+                        eprintln!("\n❌ NaN/Inf in model logits! This indicates:");
+                        eprintln!("   1. Numerical instability in forward pass");
+                        eprintln!("   2. RoPE or attention computation overflow");
+                        eprintln!("   3. Mamba SSM state explosion");
+                        return Err(Error::Msg("NaN in logits".to_string()));
+                    }
                 }
+            }
+            if let Some(start) = nan_check_start {
+                eprintln!("[PROFILE] nan_check: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
             }
 
             // Calculate Loss (Cross Entropy)
             // Flatten batch/seq dims for cross_entropy: [Batch*Seq, Vocab]
             // Note: logits are already F32 from model forward (cast for stable loss computation)
             // Use reshape_tracked to record on tape for gradient flow
+            let loss_start = if profile { Some(Instant::now()) } else { None };
             let (b, s, v) = logits.dims3()?;
             let logits_flat = logits.reshape_tracked((b * s, v))?;
             let target_flat = target.reshape(b * s)?;
@@ -170,21 +269,25 @@ impl<'a> LitTrainer<'a> {
             let ce_loss = ce_loss_per_token.mean_all()?;
             // Note: mean_all() returns a scalar on CPU but may need squeezing on CUDA in some cases
 
-            // Check for NaN in CE loss before combining
-            let ce_loss_val = ce_loss.to_vec0::<f32>()? as f64;
-            if ce_loss_val.is_nan() || ce_loss_val.is_infinite() {
-                eprintln!("\n❌ NaN/Inf detected in CE loss! This usually indicates:");
-                eprintln!("   1. Learning rate too high (try 1e-4 or lower)");
-                eprintln!("   2. Gradient explosion (sequence too long)");
-                eprintln!("   3. Numerical instability in model");
-                eprintln!("   Current CE loss: {}", ce_loss_val);
-                return Err(Error::Msg("NaN loss detected".to_string()));
+            // NaN checking is expensive (GPU->CPU sync) - only do on first step or when DEBUG_NAN is set
+            let check_nan = self.global_step == 0 || std::env::var("DEBUG_NAN").is_ok();
+
+            // Check for NaN in CE loss before combining (only when check_nan is true)
+            if check_nan {
+                let ce_loss_val = ce_loss.to_vec0::<f32>()? as f64;
+                if ce_loss_val.is_nan() || ce_loss_val.is_infinite() {
+                    eprintln!("\n❌ NaN/Inf detected in CE loss! This usually indicates:");
+                    eprintln!("   1. Learning rate too high (try 1e-4 or lower)");
+                    eprintln!("   2. Gradient explosion (sequence too long)");
+                    eprintln!("   3. Numerical instability in model");
+                    eprintln!("   Current CE loss: {}", ce_loss_val);
+                    return Err(Error::Msg("NaN loss detected".to_string()));
+                }
             }
 
             // Add auxiliary losses (e.g., MoE load balancing) - keep as tensors for gradient flow
             // IMPORTANT: Don't use to_vec0 here as it breaks the gradient chain!
             let mut loss = ce_loss.clone();
-            let mut avg_aux_loss = 0.0;  // For logging only
             if !aux_losses.is_empty() {
                 // Sum all aux losses as tensors, then scale by alpha/count
                 let num_aux = aux_losses.len() as f32;
@@ -194,21 +297,36 @@ impl<'a> LitTrainer<'a> {
                     while loss_t.rank() > 0 && loss_t.elem_count() == 1 {
                         loss_t = loss_t.squeeze(0)?;
                     }
-                    // For logging, extract scalar value (doesn't affect gradient)
-                    avg_aux_loss += loss_t.to_vec0::<f32>()? as f64;
                     // Add scaled aux loss to total loss (preserves gradient chain)
                     let scaled_aux = loss_t.scale((load_balance_alpha / num_aux as f64) as f32)?;
                     loss = loss.add(&scaled_aux)?;
                 }
-                avg_aux_loss /= num_aux as f64;
             }
 
-            // Check combined loss
-            let total_loss_val = loss.to_vec0::<f32>()? as f64;
-            if total_loss_val.is_nan() || total_loss_val.is_infinite() {
-                eprintln!("\n❌ NaN/Inf in combined loss! CE: {:.4}, Aux: {:.4}, Alpha: {:.4}",
-                    ce_loss_val, avg_aux_loss, load_balance_alpha);
-                return Err(Error::Msg("NaN loss detected".to_string()));
+            // Add router z-losses (prevents MoE logit explosion in BF16)
+            // L_total = L_MLE + α*L_aux + γ*L_z where γ = z_loss_alpha
+            let z_loss_alpha = self.config.z_loss_alpha;
+            if !z_losses.is_empty() && z_loss_alpha > 0.0 {
+                let num_z = z_losses.len() as f32;
+                for z_loss in &z_losses {
+                    // CRITICAL: CUDA can return [1,1] instead of scalar - squeeze manually
+                    let mut loss_t = z_loss.clone();
+                    while loss_t.rank() > 0 && loss_t.elem_count() == 1 {
+                        loss_t = loss_t.squeeze(0)?;
+                    }
+                    // Add scaled z-loss to total loss (preserves gradient chain)
+                    let scaled_z = loss_t.scale((z_loss_alpha / num_z as f64) as f32)?;
+                    loss = loss.add(&scaled_z)?;
+                }
+            }
+
+            // Check combined loss for NaN (only when check_nan is true)
+            if check_nan {
+                let total_loss_val = loss.to_vec0::<f32>()? as f64;
+                if total_loss_val.is_nan() || total_loss_val.is_infinite() {
+                    eprintln!("\n❌ NaN/Inf in combined loss!");
+                    return Err(Error::Msg("NaN loss detected".to_string()));
+                }
             }
 
             // Scale loss for gradient accumulation
@@ -220,17 +338,113 @@ impl<'a> LitTrainer<'a> {
                 Some(acc) => acc.add(&scaled_loss)?,
             });
 
-            // Track loss for logging (just CE loss, not aux)
-            total_loss_for_logging += ce_loss.to_vec0::<f32>()? as f64;
+            // Track loss tensor for later logging (defer GPU->CPU transfer)
+            // We'll do the transfer after backward when we need to log anyway
+            if let Some(start) = loss_start {
+                eprintln!("[PROFILE] loss_compute: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+
+        // Transfer loss to CPU for logging (single sync point)
+        let loss_sync_start = if profile { Some(Instant::now()) } else { None };
+        if let Some(ref acc_loss) = accumulated_loss {
+            // Transfer the accumulated loss value
+            total_loss_for_logging = acc_loss.to_vec0::<f32>()? as f64 * accum_steps as f64;
+        }
+        if let Some(start) = loss_sync_start {
+            eprintln!("[PROFILE] loss_sync: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
         }
 
         // ===== AFTER ACCUMULATION LOOP: Single backward pass =====
         // All micro-batches have been processed, now do backward on accumulated loss
 
-        let total_loss = accumulated_loss.ok_or_else(|| Error::Msg("No loss accumulated".to_string()))?;
+        let total_loss =
+            accumulated_loss.ok_or_else(|| Error::Msg("No loss accumulated".to_string()))?;
 
         // Single backward pass over all micro-batches
-        let grads = total_loss.backward()?;
+        // Wrap in catch_unwind to provide user-friendly OOM error instead of panic
+        let bwd_start = if profile { Some(Instant::now()) } else { None };
+        let grads = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            total_loss.backward()
+        })) {
+            Ok(result) => result?,
+            Err(panic_info) => {
+                // Extract panic message
+                let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown panic".to_string()
+                };
+
+                // Check if it's an OOM error
+                if panic_msg.contains("can't allocate buffer")
+                    || panic_msg.contains("out of memory")
+                {
+                    // Extract the requested size if present
+                    let size_info = if let Some(start) = panic_msg.find("size:") {
+                        let size_str = &panic_msg[start + 5..];
+                        if let Some(size) = size_str.trim().split_whitespace().next() {
+                            if let Ok(bytes) = size.parse::<u64>() {
+                                format!(" ({:.1} MB)", bytes as f64 / 1_000_000.0)
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    return Err(Error::Msg(format!(
+                        "GPU out of memory during backward pass{}\n\n\
+                        The model requires more VRAM than available. Try:\n\
+                        • Reduce batch_size (current: {})\n\
+                        • Reduce max_seq_len in config\n\
+                        • Increase gradient_accumulation to maintain effective batch size\n\
+                        • Use a smaller model configuration\n\
+                        • Free GPU memory from other processes (check with: nvidia-smi)",
+                        size_info, self.batch_size
+                    )));
+                }
+
+                // Re-panic for other errors
+                std::panic::resume_unwind(panic_info);
+            }
+        };
+        if let Some(start) = bwd_start {
+            eprintln!("[PROFILE] backward: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        // Check parameter/gradient matching at step 1
+        if self.global_step == 0 {
+            let total_params = self.varmap.all_vars_named().count();
+            let grads_count = grads.len();
+            let mut params_with_grads = 0;
+            let mut params_without_grads = Vec::new();
+            for (name, tensor) in self.varmap.all_vars_named() {
+                if grads.get(tensor.id()).is_some() {
+                    params_with_grads += 1;
+                } else {
+                    params_without_grads.push(name.clone());
+                }
+            }
+            eprintln!(
+                "[GRAD CHECK] Total params: {}, Grads returned: {}, Params with grads: {}",
+                total_params, grads_count, params_with_grads
+            );
+            if !params_without_grads.is_empty() {
+                eprintln!(
+                    "[GRAD CHECK] Params WITHOUT gradients ({}):",
+                    params_without_grads.len()
+                );
+                for name in &params_without_grads {
+                    eprintln!("  - {}", name);
+                }
+            }
+        }
 
         // Apply gradients - either single-GPU or distributed path
         if let (Some(ref sync), Some(ref mut dist_opt)) =
@@ -248,12 +462,35 @@ impl<'a> LitTrainer<'a> {
             dist_opt.step(&synced_grads, self.varmap)?;
         } else {
             // SINGLE-GPU PATH
-            // 1. Compute gradient norm
-            let grad_norm = self.compute_grad_norm_from_grads(&grads)?;
+            // 1. Compute gradient norm using boostr's optimized GPU-accumulating function
+            let grad_norm_start = if profile { Some(Instant::now()) } else { None };
+            let grad_norm = crate::prelude::compute_grad_norm(&grads)? as f64;
+            if let Some(start) = grad_norm_start {
+                eprintln!("[PROFILE] grad_norm_compute: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            // DEBUG: Print raw gradient norm BEFORE any clipping
+            if std::env::var("DEBUG_RAW_GRAD").is_ok() {
+                eprintln!(
+                    "[RAW GRAD NORM] step={} raw_grad_norm={:.6}",
+                    self.global_step + 1,
+                    grad_norm
+                );
+            }
+
+            // DEBUG: Print top gradient contributors when DEBUG_MLA_MOE or DEBUG_GRAD is set
+            // Disabled by default as it causes 121 GPU-CPU syncs (expensive)
+            if std::env::var("DEBUG_MLA_MOE").is_ok() || std::env::var("DEBUG_GRAD").is_ok() {
+                self.print_gradient_breakdown(&grads);
+            }
 
             // 2. Skip step if gradient norm is invalid (inf/NaN)
             if grad_norm.is_infinite() || grad_norm.is_nan() {
-                eprintln!("[GradClip] Skipping step {} - gradient norm: {}", self.global_step + 1, grad_norm);
+                eprintln!(
+                    "[GradClip] Skipping step {} - gradient norm: {}",
+                    self.global_step + 1,
+                    grad_norm
+                );
                 // Identify which parameters have problematic gradients
                 self.diagnose_bad_gradients(&grads);
                 last_grad_norm = grad_norm;
@@ -291,8 +528,12 @@ impl<'a> LitTrainer<'a> {
                     grads
                 };
 
-                // 5. Apply gradients via optimizer
+                // 5. Apply gradients via optimizer (LR already set at start of step)
+                let opt_start = if profile { Some(Instant::now()) } else { None };
                 self.optimizer.step(&grads, self.varmap);
+                if let Some(start) = opt_start {
+                    eprintln!("[PROFILE] optimizer.step: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+                }
 
                 // Report final grad norm (after clipping)
                 // With norm clipping, report the actual norm (capped at target if it was clipped)
@@ -307,14 +548,30 @@ impl<'a> LitTrainer<'a> {
         // Store gradient norm for monitoring/logging (no longer used for pre-scaling)
         self.prev_grad_norm = Some(last_grad_norm);
 
+        if let Some(start) = step_start {
+            eprintln!("[PROFILE] total_step: {:.3}ms\n", start.elapsed().as_secs_f64() * 1000.0);
+        }
+
         self.global_step += 1;
         Ok((total_loss_for_logging / accum_steps as f64, last_grad_norm))
+    }
+
+    /// Get the current effective learning rate (accounting for warmup)
+    /// Call AFTER global_step has been incremented (i.e., after training_step)
+    fn current_learning_rate(&self) -> f64 {
+        if self.warmup_steps > 0 && self.global_step <= self.warmup_steps {
+            // During warmup: LR = base_lr * step / warmup_steps
+            self.base_learning_rate * (self.global_step as f64 / self.warmup_steps as f64)
+        } else {
+            // After warmup: full base learning rate
+            self.base_learning_rate
+        }
     }
 
     pub fn fit<D: DataLoader>(
         &mut self,
         model: &crate::model::LitGPT,
-        data_loader: &mut D
+        data_loader: &mut D,
     ) -> Result<()> {
         // Save blazr-compatible config.json if it doesn't exist
         // This enables the checkpoint to be used directly with blazr inference server
@@ -355,7 +612,7 @@ impl<'a> LitTrainer<'a> {
     fn fit_headless<D: DataLoader>(
         &mut self,
         model: &crate::model::LitGPT,
-        data_loader: &mut D
+        data_loader: &mut D,
     ) -> Result<()> {
         let tokens_per_step = self.batch_size * self.seq_len * self.config.gradient_accumulation;
         let steps_per_epoch = (self.dataset_size + tokens_per_step - 1) / tokens_per_step;
@@ -368,6 +625,14 @@ impl<'a> LitTrainer<'a> {
             self.config.max_steps.min(self.total_steps)
         };
 
+        // Log warmup info if enabled
+        if self.warmup_steps > 0 {
+            println!(
+                "{{\"warmup\": {{\"steps\": {}, \"base_lr\": {:.6e}}}}}",
+                self.warmup_steps, self.base_learning_rate
+            );
+        }
+
         // Resume support: start from start_step
         for step in self.start_step..effective_steps {
             let step_result = self.training_step(model, data_loader);
@@ -375,21 +640,31 @@ impl<'a> LitTrainer<'a> {
                 Ok(result) => result,
                 Err(e) => {
                     let err_msg = format!("{}", e);
-                    eprintln!("{{\"error\": \"Training error at step {}\", \"message\": \"{}\"}}", step + 1, err_msg.replace('"', "'"));
+                    eprintln!(
+                        "{{\"error\": \"Training error at step {}\", \"message\": \"{}\"}}",
+                        step + 1,
+                        err_msg.replace('"', "'")
+                    );
                     std::process::exit(1);
                 }
             };
             let current_epoch = (step + 1) as f64 / steps_per_epoch as f64;
 
             // Log at intervals
-            if step % self.config.log_interval == 0 || step == 0 {
+            if step % self.config.log_interval == 0 || step == self.start_step {
                 let elapsed = training_start.elapsed().as_secs_f64();
-                let samples_processed = (step + 1) * self.batch_size * self.config.gradient_accumulation;
+                // Count only steps done in THIS session (not resumed steps)
+                let steps_this_session = step - self.start_step + 1;
+                let samples_processed =
+                    steps_this_session * self.batch_size * self.config.gradient_accumulation;
                 let samples_s = samples_processed as f64 / elapsed;
 
                 // Get VRAM usage via nvidia-smi
                 let vram = std::process::Command::new("nvidia-smi")
-                    .args(&["--query-compute-apps=used_memory", "--format=csv,noheader,nounits"])
+                    .args(&[
+                        "--query-compute-apps=used_memory",
+                        "--format=csv,noheader,nounits",
+                    ])
                     .output()
                     .ok()
                     .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -397,13 +672,16 @@ impl<'a> LitTrainer<'a> {
                     .unwrap_or_else(|| "0".to_string());
 
                 println!("{{\"step\": {}, \"loss\": {:.4}, \"grad_norm\": {:.4}, \"learning_rate\": {:.6e}, \"epoch\": {:.2}, \"samples/s\": {:.2}, \"vram\": \"{}\"}}",
-                    step + 1, loss, grad_norm, self.config.learning_rate, current_epoch, samples_s, vram);
+                    step + 1, loss, grad_norm, self.current_learning_rate(), current_epoch, samples_s, vram);
             }
         }
 
         // Always save final checkpoint
         let prefix = self.model_config.checkpoint_prefix();
-        println!("Saving final checkpoint to {}/{}_final.safetensors", self.config.checkpoint_dir, prefix);
+        println!(
+            "Saving final checkpoint to {}/{}_final.safetensors",
+            self.config.checkpoint_dir, prefix
+        );
         self.save_checkpoint_named("final")?;
 
         println!("{{\"status\": \"complete\"}}");
@@ -415,7 +693,7 @@ impl<'a> LitTrainer<'a> {
     fn fit_normal<D: DataLoader>(
         &mut self,
         model: &crate::model::LitGPT,
-        data_loader: &mut D
+        data_loader: &mut D,
     ) -> Result<()> {
         let tokens_per_step = self.batch_size * self.seq_len * self.config.gradient_accumulation;
         let steps_per_epoch = (self.dataset_size + tokens_per_step - 1) / tokens_per_step;
@@ -431,11 +709,10 @@ impl<'a> LitTrainer<'a> {
         let mp = MultiProgress::new();
 
         // Progress bar style - ETA calculated manually using rolling average
-        let sty = ProgressStyle::with_template(
-            "{bar:40.cyan/dim} {pos:>7}/{len:7} [{elapsed}<{msg}"
-        )
-        .unwrap()
-        .progress_chars("━━─");
+        let sty =
+            ProgressStyle::with_template("{bar:40.cyan/dim} {pos:>7}/{len:7} [{elapsed}<{msg}")
+                .unwrap()
+                .progress_chars("━━─");
 
         let pb = mp.add(ProgressBar::new(effective_steps as u64));
         pb.set_style(sty);
@@ -443,7 +720,17 @@ impl<'a> LitTrainer<'a> {
         // Resume support - this goes to scrollable area
         if self.start_step > 0 {
             pb.set_position(self.start_step as u64);
-            mp.println(format!("📍 Resuming from step {}", self.start_step)).ok();
+            mp.println(format!("📍 Resuming from step {}", self.start_step))
+                .ok();
+        }
+
+        // Log warmup info if enabled
+        if self.warmup_steps > 0 {
+            mp.println(format!(
+                "🔥 Warmup: {} steps, base LR: {:.6e}",
+                self.warmup_steps, self.base_learning_rate
+            ))
+            .ok();
         }
 
         let mut last_loss = 0.0;
@@ -464,15 +751,25 @@ impl<'a> LitTrainer<'a> {
                     // Clear progress bar and show error
                     pb.finish_and_clear();
                     let err_msg = format!("{}", e);
-                    mp.println(format!("\n❌ Training error at step {}:", step + 1)).ok();
+                    mp.println(format!("\n❌ Training error at step {}:", step + 1))
+                        .ok();
 
                     // Check for common CUDA errors
-                    if err_msg.contains("out of memory") || err_msg.contains("CUDA") || err_msg.contains("cuda") {
+                    if err_msg.contains("out of memory")
+                        || err_msg.contains("CUDA")
+                        || err_msg.contains("cuda")
+                    {
                         mp.println(format!("   🔥 CUDA Error: {}", err_msg)).ok();
-                        mp.println("   💡 Try: reduce batch_size, seq_len, or use gradient accumulation".to_string()).ok();
+                        mp.println(
+                            "   💡 Try: reduce batch_size, seq_len, or use gradient accumulation"
+                                .to_string(),
+                        )
+                        .ok();
                     } else if err_msg.contains("NaN") || err_msg.contains("nan") {
-                        mp.println(format!("   🔥 Numerical Error: {}", err_msg)).ok();
-                        mp.println("   💡 Try: lower learning rate or check data".to_string()).ok();
+                        mp.println(format!("   🔥 Numerical Error: {}", err_msg))
+                            .ok();
+                        mp.println("   💡 Try: lower learning rate or check data".to_string())
+                            .ok();
                     } else {
                         mp.println(format!("   🔥 Error: {}", err_msg)).ok();
                     }
@@ -499,7 +796,11 @@ impl<'a> LitTrainer<'a> {
             // Each step processes batch_size * gradient_accumulation samples
             let avg_step_time: f64 = step_times.iter().sum::<f64>() / step_times.len() as f64;
             let samples_per_step = (self.batch_size * self.config.gradient_accumulation) as f64;
-            let samples_s = if avg_step_time > 0.0 { samples_per_step / avg_step_time } else { 0.0 };
+            let samples_s = if avg_step_time > 0.0 {
+                samples_per_step / avg_step_time
+            } else {
+                0.0
+            };
 
             // Silent log to file at intervals (no terminal output for steps)
             if step % self.config.log_interval == 0 || step == 0 {
@@ -507,7 +808,7 @@ impl<'a> LitTrainer<'a> {
                     "step": step + 1,
                     "loss": loss,
                     "grad_norm": grad_norm,
-                    "learning_rate": self.config.learning_rate,
+                    "learning_rate": self.current_learning_rate(),
                     "epoch": current_epoch,
                 });
                 if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -532,8 +833,10 @@ impl<'a> LitTrainer<'a> {
             ));
 
             // Checkpoint messages go to scrollable area above
-            if step > 0 && step % self.config.save_interval == 0 {
-                mp.println(format!("💾 Checkpoint saved: step {}", step)).ok();
+            // Only save if we've done at least one new step (not immediately after resume)
+            if step > self.start_step && step % self.config.save_interval == 0 {
+                mp.println(format!("💾 Checkpoint saved: step {}", step))
+                    .ok();
                 self.save_checkpoint(step)?;
             }
         }
@@ -545,20 +848,28 @@ impl<'a> LitTrainer<'a> {
 
         // Final messages
         let prefix = self.model_config.checkpoint_prefix();
-        mp.println(format!("\n💾 Saving final checkpoint to {}/{}_final.safetensors", self.config.checkpoint_dir, prefix)).ok();
+        mp.println(format!(
+            "\n💾 Saving final checkpoint to {}/{}_final.safetensors",
+            self.config.checkpoint_dir, prefix
+        ))
+        .ok();
         self.save_checkpoint_named("final")?;
 
         mp.println(format!(
             "✅ Training complete | final loss: {:.4} | grad: {:.4}",
             last_loss, last_grad_norm
-        )).ok();
+        ))
+        .ok();
 
         Ok(())
     }
 
     fn save_checkpoint(&self, step: usize) -> Result<()> {
         let prefix = self.model_config.checkpoint_prefix();
-        let checkpoint_path = format!("{}/{}_step_{}.safetensors", self.config.checkpoint_dir, prefix, step);
+        let checkpoint_path = format!(
+            "{}/{}_step_{}.safetensors",
+            self.config.checkpoint_dir, prefix, step
+        );
         if !Path::new(&self.config.checkpoint_dir).exists() {
             std::fs::create_dir_all(&self.config.checkpoint_dir).map_err(Error::wrap)?;
         }
@@ -566,12 +877,9 @@ impl<'a> LitTrainer<'a> {
 
         // Save metadata for auto-resume validation
         if let Some(ref data_path) = self.data_file_path {
-            if let Ok(meta) = CheckpointMeta::new(
-                step,
-                &self.model_config,
-                data_path,
-                &checkpoint_path,
-            ) {
+            if let Ok(meta) =
+                CheckpointMeta::new(step, &self.model_config, data_path, &checkpoint_path)
+            {
                 if let Err(e) = meta.save(&self.config.checkpoint_dir) {
                     eprintln!("Warning: Failed to save checkpoint metadata: {}", e);
                 }
@@ -620,14 +928,19 @@ impl<'a> LitTrainer<'a> {
         checkpoints.sort_by_key(|(step, _)| *step);
 
         // Remove oldest checkpoints if we exceed the limit
-        let to_remove = checkpoints.len().saturating_sub(self.config.max_checkpoints);
+        let to_remove = checkpoints
+            .len()
+            .saturating_sub(self.config.max_checkpoints);
         for (step, path) in checkpoints.into_iter().take(to_remove) {
             // Remove checkpoint file
             if let Err(e) = std::fs::remove_file(&path) {
                 eprintln!("Warning: Failed to remove old checkpoint {:?}: {}", path, e);
             }
             // Remove associated metadata file
-            let meta_path = format!("{}/checkpoint_step_{}.meta.json", self.config.checkpoint_dir, step);
+            let meta_path = format!(
+                "{}/checkpoint_step_{}.meta.json",
+                self.config.checkpoint_dir, step
+            );
             let _ = std::fs::remove_file(&meta_path); // Ignore errors for metadata
         }
 
@@ -636,7 +949,10 @@ impl<'a> LitTrainer<'a> {
 
     fn save_checkpoint_named(&self, name: &str) -> Result<()> {
         let prefix = self.model_config.checkpoint_prefix();
-        let path = format!("{}/{}_{}.safetensors", self.config.checkpoint_dir, prefix, name);
+        let path = format!(
+            "{}/{}_{}.safetensors",
+            self.config.checkpoint_dir, prefix, name
+        );
         if !Path::new(&self.config.checkpoint_dir).exists() {
             std::fs::create_dir_all(&self.config.checkpoint_dir).map_err(Error::wrap)?;
         }
@@ -652,17 +968,78 @@ impl<'a> LitTrainer<'a> {
     /// # Returns
     /// Global L2 gradient norm across all parameters
     fn compute_grad_norm_from_grads(&self, grads: &GradStore) -> Result<f64> {
-        let mut total_norm_sq = 0.0f64;
+        // Accumulate all squared norms on GPU first, then do a single CPU transfer
+        // This avoids 121 GPU-CPU syncs (one per parameter)
+        let mut accumulated: Option<Tensor> = None;
 
-        // Iterate over all gradients directly using the values iterator
         for grad in grads.values() {
-            let grad_norm_sq = grad.powf(2.0)?
-                .sum_all()?
-                .to_vec0::<f32>()? as f64;
-            total_norm_sq += grad_norm_sq;
+            let grad_norm_sq = grad.powf(2.0)?.sum_all()?;
+            accumulated = Some(match accumulated {
+                None => grad_norm_sq,
+                Some(acc) => acc.add(&grad_norm_sq)?,
+            });
         }
 
+        // Single GPU->CPU transfer at the end
+        let total_norm_sq = match accumulated {
+            Some(tensor) => tensor.to_vec0::<f32>()? as f64,
+            None => 0.0,
+        };
+
         Ok(total_norm_sq.sqrt())
+    }
+
+    /// Print gradient breakdown by parameter (for debugging)
+    /// Shows which parameters contribute most to the global gradient norm
+    fn print_gradient_breakdown(&self, grads: &GradStore) {
+        let mut param_norms: Vec<(String, f64, usize)> = Vec::new();
+        let mut total_norm_sq = 0.0f64;
+
+        for (name, tensor) in self.varmap.all_vars_named() {
+            if let Some(grad) = grads.get(tensor.id()) {
+                if let Ok(norm_sq) = grad
+                    .powf(2.0)
+                    .and_then(|g| g.sum_all())
+                    .and_then(|g| g.to_vec0::<f32>())
+                {
+                    let norm = (norm_sq as f64).sqrt();
+                    let num_params = tensor.elem_count();
+                    param_norms.push((name.clone(), norm, num_params));
+                    total_norm_sq += norm_sq as f64;
+                }
+            }
+        }
+
+        let total_norm = total_norm_sq.sqrt();
+
+        // Sort by norm (largest first)
+        param_norms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // If DEBUG_GRAD is set, print ALL gradients sorted by name for easy comparison
+        if std::env::var("DEBUG_GRAD").is_ok() {
+            eprintln!("\n[GRAD BREAKDOWN - FULL] Total norm: {:.6}", total_norm);
+            eprintln!("{}", "=".repeat(80));
+
+            // Sort by name for easy comparison with PyTorch
+            let mut by_name = param_norms.clone();
+            by_name.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for (name, norm, num_params) in by_name.iter() {
+                eprintln!("{:<60}: {:.6e}  (params={})", name, norm, num_params);
+            }
+            eprintln!("{}", "=".repeat(80));
+            eprintln!("TOTAL GRADIENT NORM: {:.6}\n", total_norm);
+        } else {
+            eprintln!("[GRAD BREAKDOWN] Total norm: {:.4e}", total_norm);
+            eprintln!("  Top 10 gradient contributors:");
+            for (name, norm, num_params) in param_norms.iter().take(10) {
+                let pct = (norm * norm / total_norm_sq * 100.0) as f32;
+                eprintln!(
+                    "    {}: norm={:.4e}, params={}, contrib={:.1}%",
+                    name, norm, num_params, pct
+                );
+            }
+        }
     }
 
     /// Diagnose which parameters have inf/NaN gradients
@@ -672,7 +1049,11 @@ impl<'a> LitTrainer<'a> {
 
         for (name, tensor) in self.varmap.all_vars_named() {
             if let Some(grad) = grads.get(tensor.id()) {
-                if let Ok(norm_sq) = grad.powf(2.0).and_then(|g| g.sum_all()).and_then(|g| g.to_vec0::<f32>()) {
+                if let Ok(norm_sq) = grad
+                    .powf(2.0)
+                    .and_then(|g| g.sum_all())
+                    .and_then(|g| g.to_vec0::<f32>())
+                {
                     let norm = (norm_sq as f64).sqrt();
                     if norm.is_infinite() || norm.is_nan() || norm > 1e6 {
                         bad_params.push((name.clone(), norm));
@@ -684,7 +1065,10 @@ impl<'a> LitTrainer<'a> {
         // Sort by norm (largest first) and show top offenders
         bad_params.sort_by(|a, b| {
             // NaN/Inf first, then by magnitude
-            match (a.1.is_nan() || a.1.is_infinite(), b.1.is_nan() || b.1.is_infinite()) {
+            match (
+                a.1.is_nan() || a.1.is_infinite(),
+                b.1.is_nan() || b.1.is_infinite(),
+            ) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
                 _ => b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal),
@@ -748,11 +1132,18 @@ impl<'a> LitTrainer<'a> {
 
         // If gradient norm is inf/nan, skip this optimizer step
         if total_norm.is_infinite() || total_norm.is_nan() {
-            eprintln!("[GradClip] WARN: Gradient norm is {}, skipping step", total_norm);
+            eprintln!(
+                "[GradClip] WARN: Gradient norm is {}, skipping step",
+                total_norm
+            );
             // Identify which parameters have problematic gradients
             for (name, tensor) in self.varmap.all_vars_named() {
                 if let Some(grad) = grads.get(tensor.id()) {
-                    if let Ok(norm_sq) = grad.powf(2.0).and_then(|g| g.sum_all()).and_then(|g| g.to_vec0::<f32>()) {
+                    if let Ok(norm_sq) = grad
+                        .powf(2.0)
+                        .and_then(|g| g.sum_all())
+                        .and_then(|g| g.to_vec0::<f32>())
+                    {
                         let norm = (norm_sq as f64).sqrt();
                         if norm.is_infinite() || norm.is_nan() || norm > 1e6 {
                             eprintln!("  └─ {}: grad_norm={:.2e}", name, norm);

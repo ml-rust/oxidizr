@@ -1,0 +1,63 @@
+# Nano model with ONLY Mamba2 (no attention) - for testing SSD kernels
+# All 4 layers are Mamba2
+
+model:
+  name: nano-mamba-only
+
+  hidden_size: 128
+  num_layers: 4
+  num_heads: 4
+
+  # No MLA - disable attention
+  kv_heads: null
+  kv_latent_dim: null
+  q_latent_dim: null
+  d_rope: null
+
+  # No MoE - use simple MLP for FFN
+  num_experts: null
+  experts_per_tok: null
+  shared_expert_enabled: null
+  intermediate_size: 512
+
+  # ALL layers are Mamba2
+  mamba_layers: [0, 1, 2, 3]
+
+  # Mamba2 config
+  mamba2_num_heads: 16
+  mamba2_head_dim: 16
+  mamba2_state_size: 32
+  mamba2_chunk_size: 32
+  mamba2_n_groups: 1
+  mamba2_conv_kernel: 4
+  mamba2_expand: 2
+
+  vocab_size: 100315
+  tokenizer_vocab: cl100k_base
+  max_seq_len: 64
+  rope_theta: 10000.0
+
+trainer:
+  target_device: gpu
+  learning_rate: 0.002
+  batch_size: 8
+  gradient_accumulation: 2
+  max_steps: 0
+  num_epochs: 20
+  checkpoint_dir: "./checkpoints/nano-start-mamba"
+  log_interval: 10
+  save_interval: 50
+  max_checkpoints: 3
+  max_grad_norm: 10.0
+  target_grad_norm: 10.0
+  max_grad_value: null
+  load_balance_alpha: 0.0
+  z_loss_alpha: 0.0
+  adamw_beta1: 0.9
+  adamw_beta2: 0.95
+  adamw_eps: 0.000001
+  weight_decay: 0.1
+  warmup_steps: null
+  warmup_ratio: null
+  group_size: 4
+  beta_kl: 0.04

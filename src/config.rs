@@ -12,6 +12,19 @@ fn default_max_grad_norm() -> f64 { 1.0 }
 fn default_target_grad_norm() -> Option<f64> { None }  // None = no normalization
 fn default_max_grad_value() -> Option<f64> { None }    // None = no per-element clipping
 
+// AdamW optimizer hyperparameters (from optimization.md "Golden Recipe")
+fn default_adamw_beta1() -> f64 { 0.9 }   // Standard momentum coefficient
+fn default_adamw_beta2() -> f64 { 0.95 }  // Lower β₂ stabilizes MoE sparse updates
+fn default_adamw_eps() -> f64 { 1e-6 }    // Higher ε for BF16 numerical safety
+fn default_weight_decay() -> f64 { 0.1 }  // Industry standard L2 regularization
+
+// Router z-loss coefficient (prevents MoE logit drift/explosion in BF16)
+fn default_z_loss_alpha() -> f64 { 1e-3 } // SOTA: 1e-3 to 1e-4 range
+
+// Learning rate warmup (critical for Mamba SSM parameter alignment)
+fn default_warmup_steps() -> Option<usize> { None }  // None = disabled
+fn default_warmup_ratio() -> Option<f64> { Some(0.1) }  // 10% of total steps if warmup_steps not set
+
 // Re-export distributed config types
 pub use crate::distributed::sync::DistributedConfig;
 
@@ -204,6 +217,51 @@ pub struct TrainerConfig {
                                         // Clips individual gradient values to [-max, +max]
                                         // Good values: 1.0 - 10.0
 
+    // -------------------------------------------------------------------------
+    // AdamW Optimizer Hyperparameters (from optimization.md "Golden Recipe")
+    // -------------------------------------------------------------------------
+    // These settings are critical for stable training of Hybrid Mamba2-MoE models.
+    // The defaults follow SOTA recommendations for BF16/mixed-precision training.
+
+    #[serde(default = "default_adamw_beta1")]
+    pub adamw_beta1: f64,  // Momentum coefficient (default: 0.9)
+
+    #[serde(default = "default_adamw_beta2")]
+    pub adamw_beta2: f64,  // Variance coefficient (default: 0.95)
+                           // Lower β₂ stabilizes sparse MoE expert updates
+
+    #[serde(default = "default_adamw_eps")]
+    pub adamw_eps: f64,    // Numerical stability (default: 1e-6)
+                           // Higher ε prevents NaN in BF16 when variance is small
+
+    #[serde(default = "default_weight_decay")]
+    pub weight_decay: f64, // L2 regularization (default: 0.1)
+                           // Decoupled from LR, applied to weights only
+
+    // -------------------------------------------------------------------------
+    // Router Z-Loss (prevents MoE routing collapse)
+    // -------------------------------------------------------------------------
+    // Z-loss penalizes large router logits that cause softmax saturation.
+    // Essential for BF16 training stability.
+
+    #[serde(default = "default_z_loss_alpha")]
+    pub z_loss_alpha: f64, // Router z-loss coefficient (default: 1e-3)
+                           // L_total = L_MLE + α*L_aux + γ*L_z where γ = z_loss_alpha
+
+    // -------------------------------------------------------------------------
+    // Learning Rate Warmup (critical for Mamba SSM alignment)
+    // -------------------------------------------------------------------------
+    // Linear warmup from 0 to learning_rate over warmup period.
+    // Allows SSM parameters (A, B, C, dt) to align before full-speed training.
+    // Either warmup_steps OR warmup_ratio should be set (not both).
+
+    #[serde(default = "default_warmup_steps")]
+    pub warmup_steps: Option<usize>,  // Explicit number of warmup steps (None = use ratio)
+
+    #[serde(default = "default_warmup_ratio")]
+    pub warmup_ratio: Option<f64>,    // Fraction of total steps for warmup (default: 0.1 = 10%)
+                                      // Only used if warmup_steps is None
+
     /// Target device: "gpu" (default) or "cpu"
     #[serde(default)]
     pub target_device: TargetDevice,
@@ -336,6 +394,15 @@ impl LitConfig {
                 max_grad_norm: 1.0,      // Gradient clipping threshold
                 target_grad_norm: None,  // No normalization
                 max_grad_value: None,    // No per-element clipping
+                // AdamW hyperparameters (SOTA defaults from optimization.md)
+                adamw_beta1: 0.9,
+                adamw_beta2: 0.95,       // Lower β₂ for MoE stability
+                adamw_eps: 1e-6,         // Higher ε for BF16 safety
+                weight_decay: 0.1,       // Industry standard
+                z_loss_alpha: 0.0,       // No MoE, no z-loss needed
+                // Learning rate warmup
+                warmup_steps: None,      // Use ratio instead
+                warmup_ratio: Some(0.1), // 10% warmup
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
                 group_size: 4,           // GRPO: 4 rollouts per prompt
@@ -406,6 +473,15 @@ impl LitConfig {
                 max_grad_norm: 1.0,       // Gradient clipping threshold
                 target_grad_norm: None,   // No normalization
                 max_grad_value: None,     // No per-element clipping
+                // AdamW hyperparameters (SOTA defaults from optimization.md)
+                adamw_beta1: 0.9,
+                adamw_beta2: 0.95,        // Lower β₂ for MoE stability
+                adamw_eps: 1e-6,          // Higher ε for BF16 safety
+                weight_decay: 0.1,        // Industry standard
+                z_loss_alpha: 1e-3,       // Router z-loss for MoE stability
+                // Learning rate warmup
+                warmup_steps: None,       // Use ratio instead
+                warmup_ratio: Some(0.1),  // 10% warmup
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
                 group_size: 4,            // GRPO: 4 rollouts per prompt

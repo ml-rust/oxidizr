@@ -57,20 +57,17 @@ pub use boostr::{conv1d, embedding, layer_norm, linear, linear_no_bias, rms_norm
 // Loss functions
 pub use boostr::cross_entropy;
 
+// MoE auxiliary losses (router z-loss prevents softmax saturation)
+#[cfg(feature = "cuda")]
+pub use boostr::router_z_loss;
+
 // Fused AdamW optimizer (recommended - uses GPU kernels with gradient clamping)
 #[cfg(feature = "cuda")]
 pub use boostr::FusedAdamW;
 
-// AdamW config for fused optimizer
-pub use boostr::AdamWConfig;
-
-// Legacy optimizer types (kept for distributed training)
-#[allow(unused_imports)]
-pub use boostr::ParamsAdamW;
+// Efficient gradient norm computation (accumulates on GPU, single CPU transfer)
 #[cfg(feature = "cuda")]
-#[allow(dead_code)]
-pub type AdamW = boostr::AdamW<CudaRuntime>;
-
+pub use boostr::compute_grad_norm;
 
 // Global tape for automatic gradient tracking
 #[cfg(feature = "cuda")]
@@ -100,5 +97,22 @@ pub mod ops {
     /// Apply sigmoid activation
     pub fn sigmoid(x: &Tensor) -> Result<Tensor> {
         x.sigmoid()
+    }
+
+    /// Fused scaled causal softmax for attention
+    ///
+    /// Computes softmax(scale * x) with causal masking in one fused operation.
+    /// Designed for attention score tensors of shape [batch, heads, seq_q, seq_k].
+    ///
+    /// Benefits:
+    /// - Numerically stable (never creates -inf values)
+    /// - Efficient (fuses scale, mask, and softmax in one pass)
+    /// - Gradient-stable backward pass
+    ///
+    /// # Arguments
+    /// * `x` - Attention scores [batch, heads, seq_q, seq_k] (Q @ K^T, NOT scaled)
+    /// * `scale` - Typically 1/sqrt(head_dim)
+    pub fn scaled_causal_softmax(x: &Tensor, scale: f32) -> Result<Tensor> {
+        x.scaled_causal_softmax(scale)
     }
 }

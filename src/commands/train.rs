@@ -374,11 +374,12 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
         );
     }
 
-    // For training, we use VarBuilder with Kaiming initialization
-    // This creates tensors with proper random initialization during model construction
+    // For training, we use VarBuilder with PyTorch's default Linear initialization
+    // PyTorch uses Uniform(-1/sqrt(fan_in), 1/sqrt(fan_in)) which produces smaller
+    // initial values than Kaiming, helping with gradient stability in Mamba layers.
     // Use configured dtype (F32/F16/BF16) for model weights
     // RmsNorm and SSM computations use F32 internally for numerical stability
-    let vb = VarBuilder::kaiming(config.model.dtype.to_dtype(), &device);
+    let vb = VarBuilder::pytorch_linear(config.model.dtype.to_dtype(), &device);
     let model = LitGPT::new(&config.model, vb.clone())?;
 
     // Get the VarMap from VarBuilder (contains all initialized weights)

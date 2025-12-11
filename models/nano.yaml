@@ -59,3 +59,8 @@ trainer:
   # GRPO (Group Relative Policy Optimization) config - Phase 2
   group_size: 4 # Number of rollouts per prompt
   beta_kl: 0.04 # KL penalty coefficient
+
+  warmup_steps: null
+  warmup_ratio: null
+  max_grad_norm: 10.0
+  target_grad_norm: null
