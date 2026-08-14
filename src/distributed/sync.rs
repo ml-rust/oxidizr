@@ -3,8 +3,12 @@
 //! This module defines the `GradientSynchronizer` trait that all backends must implement,
 //! as well as configuration types for distributed training.
 
-use crate::prelude::{GradStore, Result, Tensor, VarMap};
+use crate::prelude::{DType, Result, Tensor};
+use boostr::autograd::GradStore;
+use boostr::runtime::Runtime;
+use boostr::tensor::TensorId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Synchronization backend selection
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -28,7 +32,10 @@ impl std::str::FromStr for SyncBackend {
             "single" | "none" => Ok(SyncBackend::Single),
             "cpu" | "cpu_staging" | "cpustaging" => Ok(SyncBackend::CpuStaging),
             "nccl" => Ok(SyncBackend::Nccl),
-            _ => Err(format!("Unknown sync backend: {}. Valid options: single, cpu, nccl", s)),
+            _ => Err(format!(
+                "Unknown sync backend: {}. Valid options: single, cpu, nccl",
+                s
+            )),
         }
     }
 }
@@ -84,8 +91,9 @@ impl DistributedConfig {
     }
 }
 
-/// Synchronized gradient: parameter name, parameter tensor, and its averaged gradient tensor
-pub type SyncedGradient = (String, Tensor, Tensor);
+/// Synchronized gradient entry keyed by the stable parameter `TensorId`.
+#[allow(dead_code)]
+pub type SyncedGradient<R> = (TensorId, Tensor<R>);
 
 /// Trait for gradient synchronization across multiple GPUs
 ///
@@ -97,26 +105,29 @@ pub type SyncedGradient = (String, Tensor, Tensor);
 /// This trait requires `Send + Sync` because it may be used across threads
 /// in the training loop.
 #[allow(dead_code)]
-pub trait GradientSynchronizer: Send + Sync {
-    /// Synchronize gradients across all GPUs
+pub trait GradientSynchronizer<R>: Send + Sync
+where
+    R: Runtime<DType = DType>,
+{
+    /// Synchronize gradients across all GPUs.
     ///
-    /// Takes the gradient store from the backward pass and the VarMap containing
-    /// all model parameters. Returns a list of (param_name, var, averaged_gradient)
-    /// tuples that can be used to update the model.
+    /// Takes the gradient store from the backward pass and the optimizer-owned
+    /// parameter map. Implementations must return gradients keyed by the same
+    /// stable `TensorId`s from `params`; changing keys would orphan AdamW state.
     ///
     /// # Arguments
     ///
-    /// * `grads` - GradStore from `loss.backward()`
-    /// * `varmap` - VarMap containing all model parameters
+    /// * `grads` - GradStore from `backward()`
+    /// * `params` - Optimizer-owned parameter map keyed by stable TensorId
     ///
     /// # Returns
     ///
-    /// Vector of (parameter_name, Var, averaged_gradient) tuples
+    /// A `GradStore` containing averaged gradients under the original TensorId keys.
     fn synchronize_gradients(
         &self,
-        grads: &GradStore,
-        varmap: &VarMap,
-    ) -> Result<Vec<SyncedGradient>>;
+        grads: &GradStore<R>,
+        params: &HashMap<TensorId, Tensor<R>>,
+    ) -> Result<GradStore<R>>;
 
     /// Get the local rank (GPU index within this process)
     fn local_rank(&self) -> usize;

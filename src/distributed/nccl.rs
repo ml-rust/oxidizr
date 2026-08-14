@@ -58,9 +58,10 @@ impl NcclSynchronizer {
     pub fn new(gpu_ids: &[usize]) -> Result<Self> {
         let world_size = gpu_ids.len();
         if world_size < 2 {
-            return Err(Error::Msg(
-                "NcclSynchronizer requires at least 2 GPUs. Use CpuStagingSynchronizer for single GPU.".to_string()
-            ));
+            return Err(Error::DistributedError {
+                reason: "NcclSynchronizer requires at least 2 GPUs. Use CpuStagingSynchronizer for single GPU."
+                    .to_string(),
+            });
         }
 
         // Create Candle devices
@@ -70,8 +71,9 @@ impl NcclSynchronizer {
             .collect::<Result<Vec<_>>>()?;
 
         // Create boostr NCCL context
-        let nccl = NcclContext::new(gpu_ids)
-            .map_err(|e| Error::Msg(format!("Failed to create NCCL context: {}", e)))?;
+        let nccl = NcclContext::new(gpu_ids).map_err(|e| Error::DistributedError {
+            reason: format!("Failed to create NCCL context: {}", e),
+        })?;
 
         log::info!(
             "NCCL synchronizer initialized with {} GPUs: {:?} (via boostr)",
@@ -124,10 +126,9 @@ impl NcclSynchronizer {
                 let result = Tensor::from_vec(reduced, tensor.shape(), tensor.device())?;
                 result.to_dtype(DType::BF16)
             }
-            _ => Err(Error::Msg(format!(
-                "NCCL all-reduce not supported for dtype {:?}",
-                dtype
-            ))),
+            _ => Err(Error::DistributedError {
+                reason: format!("NCCL all-reduce not supported for dtype {:?}", dtype),
+            }),
         }
     }
 
@@ -135,7 +136,9 @@ impl NcclSynchronizer {
     fn all_reduce_f32(&self, data: &[f32]) -> Result<Vec<f32>> {
         self.nccl
             .all_reduce_cpu_staged_f32(data, AllReduceOp::Avg)
-            .map_err(|e| Error::Msg(format!("NCCL all_reduce failed: {}", e)))
+            .map_err(|e| Error::DistributedError {
+                reason: format!("NCCL all_reduce failed: {}", e),
+            })
     }
 }
 
@@ -168,8 +171,8 @@ impl GradientSynchronizer for NcclSynchronizer {
     }
 
     fn barrier(&self) -> Result<()> {
-        self.nccl
-            .barrier()
-            .map_err(|e| Error::Msg(format!("Barrier failed: {}", e)))
+        self.nccl.barrier().map_err(|e| Error::DistributedError {
+            reason: format!("Barrier failed: {}", e),
+        })
     }
 }

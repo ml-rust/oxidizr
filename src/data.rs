@@ -1,9 +1,10 @@
-use crate::prelude::{Device, Error, Result, Tensor};
+use crate::prelude::{DType, Error, Result, Tensor};
+use boostr::runtime::Runtime;
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::mpsc::{self, SyncSender, Receiver};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -17,9 +18,12 @@ use std::thread::{self, JoinHandle};
 /// - `LitDataLoader`: Basic synchronous loader
 /// - `PrefetchDataLoader`: Async prefetching for CPU-GPU overlap
 #[allow(dead_code)]
-pub trait DataLoader {
+pub trait DataLoader<R>
+where
+    R: Runtime<DType = DType>,
+{
     /// Fetch the next batch of (inputs, targets)
-    fn next_batch(&mut self) -> Result<(Tensor, Tensor)>;
+    fn next_batch(&mut self) -> Result<(Tensor<R>, Tensor<R>)>;
 
     /// Total number of tokens in the dataset
     fn dataset_size(&self) -> usize;
@@ -42,13 +46,16 @@ pub trait DataLoader {
 /// # Data Sharding
 /// For multi-GPU training, use `with_sharding()` to ensure each GPU processes
 /// a different portion of the dataset.
-pub struct LitDataLoader {
+pub struct LitDataLoader<R>
+where
+    R: Runtime<DType = DType>,
+{
     /// Data source - either in-memory or memory-mapped
     data_source: DataSource,
     batch_size: usize,
     seq_len: usize,
     cursor: usize,
-    device: Device,
+    device: R::Device,
     // Sharding support for multi-GPU training
     shard_start: usize,
     shard_end: usize,
@@ -60,15 +67,18 @@ enum DataSource {
     /// Memory-mapped file (for large datasets)
     /// Safety: The Mmap is kept alive for the lifetime of the DataSource
     MemoryMapped {
-        _mmap: Mmap,  // Keep alive
-        tokens: &'static [u32],  // Safe because _mmap outlives this reference
+        _mmap: Mmap,            // Keep alive
+        tokens: &'static [u32], // Safe because _mmap outlives this reference
         len: usize,
     },
 }
 
-impl LitDataLoader {
+impl<R> LitDataLoader<R>
+where
+    R: Runtime<DType = DType>,
+{
     /// Create a new data loader from in-memory tokens (for testing or small datasets)
-    pub fn new(tokens: Vec<u32>, batch_size: usize, seq_len: usize, device: Device) -> Self {
+    pub fn new(tokens: Vec<u32>, batch_size: usize, seq_len: usize, device: R::Device) -> Self {
         let len = tokens.len();
         let data_source = DataSource::InMemory(tokens);
         Self {
@@ -88,7 +98,7 @@ impl LitDataLoader {
     /// * `path` - Path to .bin file containing raw u32 tokens
     /// * `batch_size` - Micro-batch size
     /// * `seq_len` - Sequence length
-    /// * `device` - Target device (CPU or CUDA)
+    /// * `device` - Target runtime device
     ///
     /// # File Format
     /// The .bin file should contain a contiguous array of u32 tokens in native endianness.
@@ -104,21 +114,24 @@ impl LitDataLoader {
         path: P,
         batch_size: usize,
         seq_len: usize,
-        device: Device,
+        device: R::Device,
     ) -> Result<Self> {
-        let file = File::open(path.as_ref())
-            .map_err(|e| Error::Msg(format!("Failed to open data file: {}", e)))?;
+        let path_ref = path.as_ref();
+        let file = File::open(path_ref).map_err(|e| Error::DataError {
+            reason: format!("failed to open data file {}: {e}", path_ref.display()),
+        })?;
 
         let mmap = unsafe {
-            Mmap::map(&file)
-                .map_err(|e| Error::Msg(format!("Failed to mmap file: {}", e)))?
+            Mmap::map(&file).map_err(|e| Error::DataError {
+                reason: format!("failed to mmap data file {}: {e}", path_ref.display()),
+            })?
         };
 
         // Validate alignment and size
         if mmap.len() % std::mem::size_of::<u32>() != 0 {
-            return Err(Error::Msg(
-                "File size is not a multiple of u32 size".to_string()
-            ));
+            return Err(Error::DataError {
+                reason: "file size is not a multiple of u32 size".to_string(),
+            });
         }
 
         let len = mmap.len() / std::mem::size_of::<u32>();
@@ -127,12 +140,8 @@ impl LitDataLoader {
         // - mmap is kept alive in the struct
         // - alignment is verified above
         // - we're casting to &'static which is safe because _mmap outlives this reference
-        let tokens: &'static [u32] = unsafe {
-            std::slice::from_raw_parts(
-                mmap.as_ptr() as *const u32,
-                len
-            )
-        };
+        let tokens: &'static [u32] =
+            unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const u32, len) };
 
         let data_source = DataSource::MemoryMapped {
             _mmap: mmap,
@@ -208,7 +217,7 @@ impl LitDataLoader {
     ///
     /// When sharding is enabled, the cursor wraps within the shard boundaries
     /// rather than the full dataset.
-    pub fn next_batch(&mut self) -> Result<(Tensor, Tensor)> {
+    pub fn next_batch(&mut self) -> Result<(Tensor<R>, Tensor<R>)> {
         let n_tokens_needed = self.batch_size * (self.seq_len + 1);
 
         // Check shard boundaries (for multi-GPU training)
@@ -222,12 +231,22 @@ impl LitDataLoader {
 
         let slice = self.get_tokens(current_cursor, n_tokens_needed);
 
-        // Convert to tensor
-        let raw_tensor = Tensor::from_slice(slice, (self.batch_size, self.seq_len + 1), &self.device)?;
+        // Token ids are stored as u32 on disk, but numr's indexing ops
+        // (embedding lookup, cross-entropy targets) take I64 indices. Convert
+        // once here at the data boundary rather than at each use site.
+        let ids: Vec<i64> = slice.iter().map(|&t| t as i64).collect();
 
-        // Split into inputs (0..end-1) and targets (1..end)
-        let inputs = raw_tensor.narrow(1, 0, self.seq_len)?;
-        let targets = raw_tensor.narrow(1, 1, self.seq_len)?;
+        // Convert to tensor
+        let raw_tensor =
+            Tensor::<R>::try_from_slice(&ids, &[self.batch_size, self.seq_len + 1], &self.device)?;
+
+        // Split into inputs (0..end-1) and targets (1..end).
+        // `narrow` returns a strided VIEW; downstream code reshapes these
+        // (cross-entropy flattens to [B*S]), which requires a contiguous
+        // layout. Materialize here so the loader never hands out a view that
+        // breaks a later reshape.
+        let inputs = raw_tensor.narrow(1, 0, self.seq_len)?.contiguous()?;
+        let targets = raw_tensor.narrow(1, 1, self.seq_len)?.contiguous()?;
 
         Ok((inputs, targets))
     }
@@ -242,8 +261,11 @@ impl LitDataLoader {
     }
 }
 
-impl DataLoader for LitDataLoader {
-    fn next_batch(&mut self) -> Result<(Tensor, Tensor)> {
+impl<R> DataLoader<R> for LitDataLoader<R>
+where
+    R: Runtime<DType = DType>,
+{
+    fn next_batch(&mut self) -> Result<(Tensor<R>, Tensor<R>)> {
         LitDataLoader::next_batch(self)
     }
 
@@ -270,7 +292,7 @@ pub fn create_dummy_data(vocab_size: usize, total_tokens: usize) -> Vec<u32> {
 /// let tokens = create_dummy_data(128354, 10_000_000); // 10M tokens, Llama 3 + splintr vocab
 /// write_tokens_to_file(&tokens, "data/train.bin").expect("Failed to write");
 /// ```
-#[allow(dead_code)]  // Public API for users to create binary token files
+#[allow(dead_code)] // Public API for users to create binary token files
 pub fn write_tokens_to_file<P: AsRef<Path>>(tokens: &[u32], path: P) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -278,10 +300,7 @@ pub fn write_tokens_to_file<P: AsRef<Path>>(tokens: &[u32], path: P) -> std::io:
 
     // Write tokens as raw bytes (native endianness)
     let bytes = unsafe {
-        std::slice::from_raw_parts(
-            tokens.as_ptr() as *const u8,
-            tokens.len() * std::mem::size_of::<u32>()
-        )
+        std::slice::from_raw_parts(tokens.as_ptr() as *const u8, std::mem::size_of_val(tokens))
     };
 
     file.write_all(bytes)?;
@@ -341,7 +360,10 @@ struct PrefetchedBatch {
 /// prefetch_loader.shutdown(); // Clean up background thread
 /// ```
 #[allow(dead_code)]
-pub struct PrefetchDataLoader {
+pub struct PrefetchDataLoader<R>
+where
+    R: Runtime<DType = DType>,
+{
     /// Receiver for prefetched batches
     receiver: Receiver<PrefetchedBatch>,
     /// Handle to background prefetch thread
@@ -349,7 +371,7 @@ pub struct PrefetchDataLoader {
     /// Signal to stop prefetching
     stop_signal: Arc<AtomicBool>,
     /// Target device for tensors
-    device: Device,
+    device: R::Device,
     /// Batch dimensions (for tensor creation)
     batch_size: usize,
     seq_len: usize,
@@ -357,7 +379,10 @@ pub struct PrefetchDataLoader {
     dataset_size: usize,
 }
 
-impl PrefetchDataLoader {
+impl<R> PrefetchDataLoader<R>
+where
+    R: Runtime<DType = DType>,
+{
     /// Create a new prefetching data loader
     ///
     /// # Arguments
@@ -369,11 +394,11 @@ impl PrefetchDataLoader {
     ///
     /// Higher prefetch_count uses more CPU memory but provides better overlap.
     /// Typically 2-3 is sufficient for most workloads.
-    pub fn new(base_loader: LitDataLoader, prefetch_count: usize) -> Result<Self> {
+    pub fn new(base_loader: LitDataLoader<R>, prefetch_count: usize) -> Result<Self> {
         let device = base_loader.device.clone();
         let batch_size = base_loader.batch_size;
         let seq_len = base_loader.seq_len;
-        let dataset_size = base_loader.dataset_size();  // Store before moving
+        let dataset_size = base_loader.dataset_size(); // Store before moving
 
         // Channel for passing prefetched batches (bounded to limit memory)
         let (sender, receiver) = mpsc::sync_channel(prefetch_count);
@@ -399,7 +424,7 @@ impl PrefetchDataLoader {
 
     /// Background worker that continuously prefetches batches
     fn prefetch_worker(
-        mut loader: LitDataLoader,
+        mut loader: LitDataLoader<R>,
         sender: SyncSender<PrefetchedBatch>,
         stop_signal: Arc<AtomicBool>,
     ) {
@@ -443,7 +468,7 @@ impl PrefetchDataLoader {
 
             // Send to main thread (blocks if channel is full - backpressure)
             if sender.send(batch).is_err() {
-                break;  // Channel closed, exit worker
+                break; // Channel closed, exit worker
             }
         }
     }
@@ -453,20 +478,26 @@ impl PrefetchDataLoader {
     /// This is the main method called in the training loop.
     /// It receives a prefetched batch from the background thread and
     /// transfers it to the target device (GPU).
-    pub fn next_batch(&mut self) -> Result<(Tensor, Tensor)> {
+    pub fn next_batch(&mut self) -> Result<(Tensor<R>, Tensor<R>)> {
         // Receive prefetched batch (blocks if none available)
-        let batch = self.receiver.recv()
-            .map_err(|_| Error::Msg("Prefetch thread stopped".to_string()))?;
+        let batch = self.receiver.recv().map_err(|_| Error::DataError {
+            reason: "prefetch thread stopped".to_string(),
+        })?;
 
-        // Transfer to GPU (this is the only blocking GPU operation)
-        let inputs = Tensor::from_slice(
-            &batch.inputs,
-            (batch.batch_size, batch.seq_len),
+        // Token ids are stored as u32, but numr's indexing ops (embedding
+        // lookup, cross-entropy targets) take I64 indices.
+        let input_ids: Vec<i64> = batch.inputs.iter().map(|&t| t as i64).collect();
+        let target_ids: Vec<i64> = batch.targets.iter().map(|&t| t as i64).collect();
+
+        // Transfer to the runtime device (this is the only blocking device upload)
+        let inputs = Tensor::<R>::try_from_slice(
+            &input_ids,
+            &[batch.batch_size, batch.seq_len],
             &self.device,
         )?;
-        let targets = Tensor::from_slice(
-            &batch.targets,
-            (batch.batch_size, batch.seq_len),
+        let targets = Tensor::<R>::try_from_slice(
+            &target_ids,
+            &[batch.batch_size, batch.seq_len],
             &self.device,
         )?;
 
@@ -506,8 +537,11 @@ impl PrefetchDataLoader {
     }
 }
 
-impl DataLoader for PrefetchDataLoader {
-    fn next_batch(&mut self) -> Result<(Tensor, Tensor)> {
+impl<R> DataLoader<R> for PrefetchDataLoader<R>
+where
+    R: Runtime<DType = DType>,
+{
+    fn next_batch(&mut self) -> Result<(Tensor<R>, Tensor<R>)> {
         PrefetchDataLoader::next_batch(self)
     }
 
@@ -516,7 +550,10 @@ impl DataLoader for PrefetchDataLoader {
     }
 }
 
-impl Drop for PrefetchDataLoader {
+impl<R> Drop for PrefetchDataLoader<R>
+where
+    R: Runtime<DType = DType>,
+{
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -536,13 +573,17 @@ impl Drop for PrefetchDataLoader {
 /// )?;
 /// ```
 #[allow(dead_code)]
-pub fn create_prefetch_loader<P: AsRef<Path>>(
+pub fn create_prefetch_loader<R, P>(
     path: P,
     batch_size: usize,
     seq_len: usize,
-    device: Device,
+    device: R::Device,
     prefetch_count: usize,
-) -> Result<PrefetchDataLoader> {
-    let base_loader = LitDataLoader::from_file(path, batch_size, seq_len, device)?;
+) -> Result<PrefetchDataLoader<R>>
+where
+    R: Runtime<DType = DType>,
+    P: AsRef<Path>,
+{
+    let base_loader = LitDataLoader::<R>::from_file(path, batch_size, seq_len, device)?;
     PrefetchDataLoader::new(base_loader, prefetch_count)
 }

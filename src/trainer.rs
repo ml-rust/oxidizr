@@ -1,25 +1,31 @@
 use crate::config::{BlazrConfig, CheckpointMeta, ModelConfig, TrainerConfig};
 use crate::data::DataLoader;
 use crate::distributed::{
-    compute_grad_norm, create_synchronizer, AdamWConfig as DistAdamWConfig, DistributedAdamW,
-    GradientSynchronizer,
+    create_synchronizer, AdamWConfig as DistAdamWConfig, DistributedAdamW, GradientSynchronizer,
 };
-use crate::prelude::{cross_entropy, Device, Error, FusedAdamW, GradStore, Result, Tensor, VarMap};
-use boostr::AdamWConfig;
+use crate::prelude::{cross_entropy, DType, Error, FusedAdamW, Result, Tensor};
+use boostr::autograd::{backward, var_add, var_mul_scalar, var_reshape, GradStore, Var};
+use boostr::ops::{FusedOptimizerOps, TensorOps};
+use boostr::optimizer::AdamWConfig;
+use boostr::runtime::{Runtime, RuntimeClient};
+use boostr::tensor::TensorId;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
 /// The "LitGPT" style Trainer abstraction.
 /// It owns the loop state, the optimizer, and handles the "boring" stuff.
-pub struct LitTrainer<'a> {
+pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     config: TrainerConfig,
-    varmap: &'a mut VarMap,
-    optimizer: FusedAdamW,
+    params: &'a mut HashMap<TensorId, Tensor<R>>,
+    parameter_ids: Vec<TensorId>,
+    parameter_names: Vec<(String, TensorId)>,
+    optimizer: FusedAdamW<R>,
+    client: R::Client,
     #[allow(dead_code)] // Kept for potential future use (e.g., device-specific optimizations)
-    device: Device,
+    device: R::Device,
     global_step: usize,
     // Training metrics
     dataset_size: usize,
@@ -38,18 +44,36 @@ pub struct LitTrainer<'a> {
     model_config: ModelConfig,
     data_file_path: Option<String>,
     // Distributed training support
-    synchronizer: Option<Box<dyn GradientSynchronizer>>,
-    distributed_optimizer: Option<DistributedAdamW>,
+    synchronizer: Option<Box<dyn GradientSynchronizer<R>>>,
+    distributed_optimizer: Option<DistributedAdamW<R>>,
     // Learning rate warmup (critical for Mamba SSM parameter alignment)
     warmup_steps: usize,     // Effective warmup steps (0 = disabled)
     base_learning_rate: f64, // Base LR to warmup towards
 }
 
-impl<'a> LitTrainer<'a> {
+impl<'a, R> LitTrainer<'a, R>
+where
+    R: Runtime<DType = DType> + crate::distributed::RuntimeDeviceFromOrdinal,
+    R::Client: RuntimeClient<R>
+        + TensorOps<R>
+        + FusedOptimizerOps<R>
+        + boostr::ScalarOps<R>
+        + boostr::CompareOps<R>
+        + boostr::ConvOps<R>
+        + boostr::FlashAttentionOps<R>
+        + boostr::IndexingOps<R>
+        + boostr::NormalizationOps<R>
+        + boostr::QuantMatmulOps<R>
+        + boostr::RoPEOps<R>
+        + boostr::TypeConversionOps<R>,
+{
     pub fn new(
         config: TrainerConfig,
-        varmap: &'a mut VarMap,
-        device: Device,
+        params: &'a mut HashMap<TensorId, Tensor<R>>,
+        parameter_ids: Vec<TensorId>,
+        parameter_names: Vec<(String, TensorId)>,
+        client: R::Client,
+        device: R::Device,
         dataset_size: usize,
         batch_size: usize,
         seq_len: usize,
@@ -63,16 +87,13 @@ impl<'a> LitTrainer<'a> {
         // - beta2 = 0.95: Lower β₂ stabilizes MoE sparse expert updates
         // - eps = 1e-6: Higher ε for BF16 numerical safety
         // - weight_decay = 0.1: Industry standard (decoupled from LR)
-        let optimizer = FusedAdamW::from_varmap_with_config(
-            varmap,
-            AdamWConfig {
-                lr: config.learning_rate as f32,
-                beta1: config.adamw_beta1 as f32,
-                beta2: config.adamw_beta2 as f32,
-                eps: config.adamw_eps as f32,
-                weight_decay: config.weight_decay as f32,
-            },
-        );
+        let optimizer = FusedAdamW::new(AdamWConfig {
+            lr: config.learning_rate,
+            beta1: config.adamw_beta1,
+            beta2: config.adamw_beta2,
+            eps: config.adamw_eps,
+            weight_decay: config.weight_decay,
+        });
 
         // Calculate total steps from dataset
         let effective_batch_size = batch_size * seq_len * config.gradient_accumulation;
@@ -83,7 +104,7 @@ impl<'a> LitTrainer<'a> {
         let (synchronizer, distributed_optimizer) = if config.distributed.enabled {
             let sync = create_synchronizer(&config.distributed)?;
             let dist_opt =
-                DistributedAdamW::new(varmap, DistAdamWConfig::with_lr(config.learning_rate))?;
+                DistributedAdamW::new(params, DistAdamWConfig::with_lr(config.learning_rate))?;
             (Some(sync), Some(dist_opt))
         } else {
             (None, None)
@@ -104,8 +125,11 @@ impl<'a> LitTrainer<'a> {
 
         Ok(Self {
             config,
-            varmap,
+            params,
+            parameter_ids,
+            parameter_names,
             optimizer,
+            client,
             device,
             global_step: start_step,
             dataset_size,
@@ -129,23 +153,30 @@ impl<'a> LitTrainer<'a> {
     /// Returns (loss, grad_norm)
     ///
     /// # Gradient Clipping Strategy
-    /// Since Candle 0.9.x doesn't support in-place gradient modification,
-    /// we use loss pre-scaling based on the previous step's gradient norm.
-    /// This effectively clips gradients while preserving AdamW's momentum state.
-    pub fn training_step<D: DataLoader>(
+    /// Gradients are clipped in place by `boostr::optimizer::clip_grad_norm`, first
+    /// to `config.max_grad_norm` and then, optionally, to the tighter
+    /// `config.target_grad_norm`. Steps whose gradient norm is inf/NaN are skipped
+    /// entirely rather than clipped. The earlier loss-pre-scaling heuristic (a
+    /// workaround for Candle's lack of in-place gradient modification) is gone.
+    pub fn training_step<D: DataLoader<R>>(
         &mut self,
-        model: &crate::model::LitGPT,
+        model: &crate::model::LitGPT<R>,
         data_loader: &mut D,
     ) -> Result<(f64, f64)> {
+        // Rebuild this step's trainable Vars from the optimizer-owned tensor map.
+        // The model migration must implement this using Var::with_id(..., id, true)
+        // for every entry, preserving the TensorId keys that AdamW uses for state.
+        let step_model = model.rebuild_with_parameters(self.params)?;
+        self.assert_stable_parameter_ids(&step_model)?;
         // Apply learning rate warmup at the START of each step (critical for Mamba SSM alignment)
         // This ensures consistent LR throughout forward/backward/optimizer
         if self.warmup_steps > 0 && self.global_step < self.warmup_steps {
             let warmup_ratio = (self.global_step + 1) as f64 / self.warmup_steps as f64;
             let warmup_lr = (self.base_learning_rate * warmup_ratio).max(1e-7);
-            self.optimizer.set_lr(warmup_lr as f32);
+            self.optimizer.set_lr(warmup_lr);
         } else if self.warmup_steps > 0 && self.global_step == self.warmup_steps {
             // Restore full learning rate after warmup completes
-            self.optimizer.set_lr(self.base_learning_rate as f32);
+            self.optimizer.set_lr(self.base_learning_rate);
         }
 
         let mut total_loss_for_logging = 0.0;
@@ -162,31 +193,26 @@ impl<'a> LitTrainer<'a> {
         // Global gradient clipping and normalization are applied below before optimizer.step()
         let _max_grad_value = self.config.max_grad_value;
 
-        // Accumulated loss tensor across micro-batches
-        // We accumulate losses as tensors (keeping computation graph), then call backward once
-        let mut accumulated_loss: Option<Tensor> = None;
+        // Accumulated loss Var across micro-batches.
+        // We keep the autograd graph intact, then call backward once on the total loss.
+        let mut accumulated_loss: Option<Var<R>> = None;
 
         // Gradient Accumulation Loop - only forward passes, accumulate losses
         for _micro_batch_idx in 0..accum_steps {
             let data_start = if profile { Some(Instant::now()) } else { None };
             let (input, target) = data_loader.next_batch()?;
             if let Some(start) = data_start {
-                eprintln!("[PROFILE] data_load: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
-            }
-
-            // Register parameters as requires_grad on the tape for this forward pass
-            // This ensures gradient computation works correctly after tape.clear()
-            let reg_start = if profile { Some(Instant::now()) } else { None };
-            self.varmap.register_requires_grad();
-            if let Some(start) = reg_start {
-                eprintln!("[PROFILE] register_requires_grad: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "[PROFILE] data_load: {:.3}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
             // Forward pass (returns logits + auxiliary losses + z-losses)
             // Wrap in catch_unwind to provide user-friendly OOM error
             let fwd_start = if profile { Some(Instant::now()) } else { None };
             let output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                model.forward(&input)
+                step_model.forward(&self.client, &input)
             })) {
                 Ok(result) => result?,
                 Err(panic_info) => {
@@ -216,23 +242,28 @@ impl<'a> LitTrainer<'a> {
                             String::new()
                         };
 
-                        return Err(Error::Msg(format!(
-                            "GPU out of memory during forward pass{}\n\n\
-                            The model requires more VRAM than available. Try:\n\
-                            • Reduce batch_size (current: {})\n\
-                            • Reduce max_seq_len in config\n\
-                            • Increase gradient_accumulation to maintain effective batch size\n\
-                            • Use a smaller model configuration\n\
-                            • Free GPU memory from other processes (check with: nvidia-smi)",
-                            size_info, self.batch_size
-                        )));
+                        return Err(Error::TrainingError {
+                            reason: format!(
+                                "GPU out of memory during forward pass{}\n\n\
+                                The model requires more VRAM than available. Try:\n\
+                                • Reduce batch_size (current: {})\n\
+                                • Reduce max_seq_len in config\n\
+                                • Increase gradient_accumulation to maintain effective batch size\n\
+                                • Use a smaller model configuration\n\
+                                • Free GPU memory from other processes (check with: nvidia-smi)",
+                                size_info, self.batch_size
+                            ),
+                        });
                     }
 
                     std::panic::resume_unwind(panic_info);
                 }
             };
             if let Some(start) = fwd_start {
-                eprintln!("[PROFILE] forward: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "[PROFILE] forward: {:.3}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
             }
             let logits = output.logits;
             let aux_losses = output.aux_losses;
@@ -242,64 +273,61 @@ impl<'a> LitTrainer<'a> {
             // EXPENSIVE: This transfers entire logits tensor to CPU - only do on first step or if DEBUG
             let nan_check_start = if profile { Some(Instant::now()) } else { None };
             if self.global_step == 0 || std::env::var("DEBUG_NAN").is_ok() {
-                if let Ok(logits_vec) = logits.flatten_all()?.to_vec::<f32>() {
-                    if logits_vec.iter().any(|x| x.is_nan() || x.is_infinite()) {
-                        eprintln!("\n❌ NaN/Inf in model logits! This indicates:");
-                        eprintln!("   1. Numerical instability in forward pass");
-                        eprintln!("   2. RoPE or attention computation overflow");
-                        eprintln!("   3. Mamba SSM state explosion");
-                        return Err(Error::Msg("NaN in logits".to_string()));
-                    }
+                let logits_tensor = logits.tensor().contiguous()?;
+                let logits_vec: Vec<f32> = logits_tensor.to_vec();
+                if logits_vec.iter().any(|x| x.is_nan() || x.is_infinite()) {
+                    eprintln!("\n❌ NaN/Inf in model logits! This indicates:");
+                    eprintln!("   1. Numerical instability in forward pass");
+                    eprintln!("   2. RoPE or attention computation overflow");
+                    eprintln!("   3. Mamba SSM state explosion");
+                    return Err(Error::TrainingError {
+                        reason: "NaN in logits".to_string(),
+                    });
                 }
             }
             if let Some(start) = nan_check_start {
-                eprintln!("[PROFILE] nan_check: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "[PROFILE] nan_check: {:.3}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
             // Calculate Loss (Cross Entropy)
             // Flatten batch/seq dims for cross_entropy: [Batch*Seq, Vocab]
-            // Note: logits are already F32 from model forward (cast for stable loss computation)
-            // Use reshape_tracked to record on tape for gradient flow
             let loss_start = if profile { Some(Instant::now()) } else { None };
-            let (b, s, v) = logits.dims3()?;
-            let logits_flat = logits.reshape_tracked((b * s, v))?;
-            let target_flat = target.reshape(b * s)?;
+            let (b, s, v) = logits.tensor().dims3()?;
+            let logits_flat = var_reshape(&logits, &[b * s, v])?;
+            let target_flat = target.reshape(&[b * s])?;
 
-            let ce_loss_per_token = cross_entropy(&logits_flat, &target_flat)?;
-            let ce_loss = ce_loss_per_token.mean_all()?;
-            // Note: mean_all() returns a scalar on CPU but may need squeezing on CUDA in some cases
+            let ce_loss = cross_entropy(&self.client, &logits_flat, &target_flat)?;
 
             // NaN checking is expensive (GPU->CPU sync) - only do on first step or when DEBUG_NAN is set
             let check_nan = self.global_step == 0 || std::env::var("DEBUG_NAN").is_ok();
 
             // Check for NaN in CE loss before combining (only when check_nan is true)
             if check_nan {
-                let ce_loss_val = ce_loss.to_vec0::<f32>()? as f64;
+                let ce_loss_val = ce_loss.tensor().item::<f32>()? as f64;
                 if ce_loss_val.is_nan() || ce_loss_val.is_infinite() {
                     eprintln!("\n❌ NaN/Inf detected in CE loss! This usually indicates:");
                     eprintln!("   1. Learning rate too high (try 1e-4 or lower)");
                     eprintln!("   2. Gradient explosion (sequence too long)");
                     eprintln!("   3. Numerical instability in model");
                     eprintln!("   Current CE loss: {}", ce_loss_val);
-                    return Err(Error::Msg("NaN loss detected".to_string()));
+                    return Err(Error::TrainingError {
+                        reason: "NaN loss detected".to_string(),
+                    });
                 }
             }
 
-            // Add auxiliary losses (e.g., MoE load balancing) - keep as tensors for gradient flow
-            // IMPORTANT: Don't use to_vec0 here as it breaks the gradient chain!
-            let mut loss = ce_loss.clone();
+            // Add auxiliary losses (e.g., MoE load balancing) as Vars so the graph is preserved.
+            let mut loss = ce_loss;
             if !aux_losses.is_empty() {
-                // Sum all aux losses as tensors, then scale by alpha/count
-                let num_aux = aux_losses.len() as f32;
+                let num_aux = aux_losses.len() as f64;
                 for aux_loss in &aux_losses {
-                    // CRITICAL: CUDA can return [1,1] instead of scalar - squeeze manually
-                    let mut loss_t = aux_loss.clone();
-                    while loss_t.rank() > 0 && loss_t.elem_count() == 1 {
-                        loss_t = loss_t.squeeze(0)?;
-                    }
-                    // Add scaled aux loss to total loss (preserves gradient chain)
-                    let scaled_aux = loss_t.scale((load_balance_alpha / num_aux as f64) as f32)?;
-                    loss = loss.add(&scaled_aux)?;
+                    let loss_t = scalar_loss_var(aux_loss)?;
+                    let scaled_aux =
+                        var_mul_scalar(&loss_t, load_balance_alpha / num_aux, &self.client)?;
+                    loss = var_add(&loss, &scaled_aux, &self.client)?;
                 }
             }
 
@@ -307,41 +335,41 @@ impl<'a> LitTrainer<'a> {
             // L_total = L_MLE + α*L_aux + γ*L_z where γ = z_loss_alpha
             let z_loss_alpha = self.config.z_loss_alpha;
             if !z_losses.is_empty() && z_loss_alpha > 0.0 {
-                let num_z = z_losses.len() as f32;
+                let num_z = z_losses.len() as f64;
                 for z_loss in &z_losses {
-                    // CRITICAL: CUDA can return [1,1] instead of scalar - squeeze manually
-                    let mut loss_t = z_loss.clone();
-                    while loss_t.rank() > 0 && loss_t.elem_count() == 1 {
-                        loss_t = loss_t.squeeze(0)?;
-                    }
-                    // Add scaled z-loss to total loss (preserves gradient chain)
-                    let scaled_z = loss_t.scale((z_loss_alpha / num_z as f64) as f32)?;
-                    loss = loss.add(&scaled_z)?;
+                    let loss_t = scalar_loss_var(z_loss)?;
+                    let scaled_z = var_mul_scalar(&loss_t, z_loss_alpha / num_z, &self.client)?;
+                    loss = var_add(&loss, &scaled_z, &self.client)?;
                 }
             }
 
             // Check combined loss for NaN (only when check_nan is true)
             if check_nan {
-                let total_loss_val = loss.to_vec0::<f32>()? as f64;
+                let total_loss_val = loss.tensor().item::<f32>()? as f64;
                 if total_loss_val.is_nan() || total_loss_val.is_infinite() {
                     eprintln!("\n❌ NaN/Inf in combined loss!");
-                    return Err(Error::Msg("NaN loss detected".to_string()));
+                    return Err(Error::TrainingError {
+                        reason: "NaN loss detected".to_string(),
+                    });
                 }
             }
 
             // Scale loss for gradient accumulation
-            let scaled_loss = loss.clone().mul_scalar((1.0 / accum_steps as f64) as f32)?;
+            let scaled_loss = var_mul_scalar(&loss, 1.0 / accum_steps as f64, &self.client)?;
 
             // Accumulate scaled loss (keeps computation graph for single backward)
             accumulated_loss = Some(match accumulated_loss {
                 None => scaled_loss,
-                Some(acc) => acc.add(&scaled_loss)?,
+                Some(acc) => var_add(&acc, &scaled_loss, &self.client)?,
             });
 
             // Track loss tensor for later logging (defer GPU->CPU transfer)
             // We'll do the transfer after backward when we need to log anyway
             if let Some(start) = loss_start {
-                eprintln!("[PROFILE] loss_compute: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "[PROFILE] loss_compute: {:.3}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
             }
         }
 
@@ -349,23 +377,27 @@ impl<'a> LitTrainer<'a> {
         let loss_sync_start = if profile { Some(Instant::now()) } else { None };
         if let Some(ref acc_loss) = accumulated_loss {
             // Transfer the accumulated loss value
-            total_loss_for_logging = acc_loss.to_vec0::<f32>()? as f64 * accum_steps as f64;
+            total_loss_for_logging = acc_loss.tensor().item::<f32>()? as f64 * accum_steps as f64;
         }
         if let Some(start) = loss_sync_start {
-            eprintln!("[PROFILE] loss_sync: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[PROFILE] loss_sync: {:.3}ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         // ===== AFTER ACCUMULATION LOOP: Single backward pass =====
         // All micro-batches have been processed, now do backward on accumulated loss
 
-        let total_loss =
-            accumulated_loss.ok_or_else(|| Error::Msg("No loss accumulated".to_string()))?;
+        let total_loss = accumulated_loss.ok_or_else(|| Error::TrainingError {
+            reason: "No loss accumulated".to_string(),
+        })?;
 
         // Single backward pass over all micro-batches
         // Wrap in catch_unwind to provide user-friendly OOM error instead of panic
         let bwd_start = if profile { Some(Instant::now()) } else { None };
         let grads = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            total_loss.backward()
+            backward(&total_loss, &self.client)
         })) {
             Ok(result) => result?,
             Err(panic_info) => {
@@ -398,16 +430,18 @@ impl<'a> LitTrainer<'a> {
                         String::new()
                     };
 
-                    return Err(Error::Msg(format!(
-                        "GPU out of memory during backward pass{}\n\n\
-                        The model requires more VRAM than available. Try:\n\
-                        • Reduce batch_size (current: {})\n\
-                        • Reduce max_seq_len in config\n\
-                        • Increase gradient_accumulation to maintain effective batch size\n\
-                        • Use a smaller model configuration\n\
-                        • Free GPU memory from other processes (check with: nvidia-smi)",
-                        size_info, self.batch_size
-                    )));
+                    return Err(Error::TrainingError {
+                        reason: format!(
+                            "GPU out of memory during backward pass{}\n\n\
+                            The model requires more VRAM than available. Try:\n\
+                            • Reduce batch_size (current: {})\n\
+                            • Reduce max_seq_len in config\n\
+                            • Increase gradient_accumulation to maintain effective batch size\n\
+                            • Use a smaller model configuration\n\
+                            • Free GPU memory from other processes (check with: nvidia-smi)",
+                            size_info, self.batch_size
+                        ),
+                    });
                 }
 
                 // Re-panic for other errors
@@ -415,20 +449,24 @@ impl<'a> LitTrainer<'a> {
             }
         };
         if let Some(start) = bwd_start {
-            eprintln!("[PROFILE] backward: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[PROFILE] backward: {:.3}ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
-        // Check parameter/gradient matching at step 1
+        // Check parameter/gradient matching at step 1.
+        // Gradients must be keyed by the same stable TensorIds used in self.params.
         if self.global_step == 0 {
-            let total_params = self.varmap.all_vars_named().count();
+            let total_params = self.parameter_ids.len();
             let grads_count = grads.len();
             let mut params_with_grads = 0;
             let mut params_without_grads = Vec::new();
-            for (name, tensor) in self.varmap.all_vars_named() {
-                if grads.get(tensor.id()).is_some() {
+            for id in &self.parameter_ids {
+                if grads.get(*id).is_some() {
                     params_with_grads += 1;
                 } else {
-                    params_without_grads.push(name.clone());
+                    params_without_grads.push(self.parameter_name(*id).to_string());
                 }
             }
             eprintln!(
@@ -450,23 +488,33 @@ impl<'a> LitTrainer<'a> {
         if let (Some(ref sync), Some(ref mut dist_opt)) =
             (&self.synchronizer, &mut self.distributed_optimizer)
         {
-            // DISTRIBUTED PATH: Synchronize gradients across GPUs
-            // 1. Synchronize gradients (all-reduce across GPUs)
-            let synced_grads = sync.synchronize_gradients(&grads, self.varmap)?;
+            // DISTRIBUTED PATH: Synchronize gradients across GPUs.
+            // The distributed module migration must keep gradients keyed by the same TensorIds.
+            let mut synced_grads = sync.synchronize_gradients(&grads, self.params)?;
 
-            // 2. Compute gradient norm from synchronized gradients
-            let grad_norm = compute_grad_norm(&synced_grads)?;
+            let grad_norm = crate::prelude::compute_grad_norm(
+                &self.client,
+                &mut synced_grads,
+                self.config.max_grad_norm,
+            )?;
             last_grad_norm = grad_norm;
 
-            // 3. Apply gradients via distributed optimizer
-            dist_opt.step(&synced_grads, self.varmap)?;
+            dist_opt.step(&self.client, self.params, &synced_grads)?;
         } else {
             // SINGLE-GPU PATH
-            // 1. Compute gradient norm using boostr's optimized GPU-accumulating function
+            let mut grads = grads;
+
+            // 1. Clip by global norm using boostr AdamW's gradient utility.
+            // The function returns the original norm as its value.
             let grad_norm_start = if profile { Some(Instant::now()) } else { None };
-            let grad_norm = crate::prelude::compute_grad_norm(&grads)? as f64;
+            let max_grad_norm = self.config.max_grad_norm;
+            let grad_norm =
+                crate::prelude::compute_grad_norm(&self.client, &mut grads, max_grad_norm)?;
             if let Some(start) = grad_norm_start {
-                eprintln!("[PROFILE] grad_norm_compute: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "[PROFILE] grad_norm_compute: {:.3}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
             // DEBUG: Print raw gradient norm BEFORE any clipping
@@ -479,7 +527,6 @@ impl<'a> LitTrainer<'a> {
             }
 
             // DEBUG: Print top gradient contributors when DEBUG_MLA_MOE or DEBUG_GRAD is set
-            // Disabled by default as it causes 121 GPU-CPU syncs (expensive)
             if std::env::var("DEBUG_MLA_MOE").is_ok() || std::env::var("DEBUG_GRAD").is_ok() {
                 self.print_gradient_breakdown(&grads);
             }
@@ -491,52 +538,27 @@ impl<'a> LitTrainer<'a> {
                     self.global_step + 1,
                     grad_norm
                 );
-                // Identify which parameters have problematic gradients
                 self.diagnose_bad_gradients(&grads);
                 last_grad_norm = grad_norm;
             } else {
-                // 3. Global gradient clipping: scale gradients if norm > max_grad_norm
-                let max_grad_norm = self.config.max_grad_norm;
-                let grads = if grad_norm > max_grad_norm {
-                    let scale = (max_grad_norm / (grad_norm + 1e-6)) as f32;
-                    let mut scaled = GradStore::new();
-                    for (id, grad) in grads.iter() {
-                        scaled.insert(*id, grad.scale(scale)?);
+                // 3. Optional tighter target norm clipping delegates to the same boostr utility.
+                let effective_after_max = grad_norm.min(max_grad_norm);
+                if let Some(target) = self.config.target_grad_norm {
+                    if effective_after_max > target && effective_after_max > 1e-8 {
+                        crate::prelude::compute_grad_norm(&self.client, &mut grads, target)?;
                     }
-                    scaled
-                } else {
-                    grads
-                };
-
-                // 4. Optional: Clip to target_grad_norm (only scale DOWN if norm exceeds target)
-                // This is proper "norm clipping" - preserves gradient direction while preventing explosion
-                // Unlike normalization, this does NOT scale up small gradients
-                let grads = if let Some(target) = self.config.target_grad_norm {
-                    let current_norm = grad_norm.min(max_grad_norm);
-                    // Only clip if norm exceeds target (never scale up)
-                    if current_norm > target && current_norm > 1e-8 {
-                        let scale = (target / current_norm) as f32;
-                        let mut clipped = GradStore::new();
-                        for (id, grad) in grads.iter() {
-                            clipped.insert(*id, grad.scale(scale)?);
-                        }
-                        clipped
-                    } else {
-                        grads
-                    }
-                } else {
-                    grads
-                };
-
-                // 5. Apply gradients via optimizer (LR already set at start of step)
-                let opt_start = if profile { Some(Instant::now()) } else { None };
-                self.optimizer.step(&grads, self.varmap);
-                if let Some(start) = opt_start {
-                    eprintln!("[PROFILE] optimizer.step: {:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
                 }
 
-                // Report final grad norm (after clipping)
-                // With norm clipping, report the actual norm (capped at target if it was clipped)
+                // 4. Apply gradients via optimizer (LR already set at start of step)
+                let opt_start = if profile { Some(Instant::now()) } else { None };
+                self.optimizer.step(&self.client, self.params, &grads)?;
+                if let Some(start) = opt_start {
+                    eprintln!(
+                        "[PROFILE] optimizer.step: {:.3}ms",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+
                 last_grad_norm = if let Some(target) = self.config.target_grad_norm {
                     grad_norm.min(target).min(max_grad_norm)
                 } else {
@@ -549,7 +571,10 @@ impl<'a> LitTrainer<'a> {
         self.prev_grad_norm = Some(last_grad_norm);
 
         if let Some(start) = step_start {
-            eprintln!("[PROFILE] total_step: {:.3}ms\n", start.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[PROFILE] total_step: {:.3}ms\n",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         self.global_step += 1;
@@ -568,9 +593,9 @@ impl<'a> LitTrainer<'a> {
         }
     }
 
-    pub fn fit<D: DataLoader>(
+    pub fn fit<D: DataLoader<R>>(
         &mut self,
-        model: &crate::model::LitGPT,
+        model: &crate::model::LitGPT<R>,
         data_loader: &mut D,
     ) -> Result<()> {
         // Save blazr-compatible config.json if it doesn't exist
@@ -609,9 +634,9 @@ impl<'a> LitTrainer<'a> {
         }
     }
 
-    fn fit_headless<D: DataLoader>(
+    fn fit_headless<D: DataLoader<R>>(
         &mut self,
-        model: &crate::model::LitGPT,
+        model: &crate::model::LitGPT<R>,
         data_loader: &mut D,
     ) -> Result<()> {
         let tokens_per_step = self.batch_size * self.seq_len * self.config.gradient_accumulation;
@@ -690,9 +715,9 @@ impl<'a> LitTrainer<'a> {
         std::process::exit(0);
     }
 
-    fn fit_normal<D: DataLoader>(
+    fn fit_normal<D: DataLoader<R>>(
         &mut self,
-        model: &crate::model::LitGPT,
+        model: &crate::model::LitGPT<R>,
         data_loader: &mut D,
     ) -> Result<()> {
         let tokens_per_step = self.batch_size * self.seq_len * self.config.gradient_accumulation;
@@ -864,6 +889,30 @@ impl<'a> LitTrainer<'a> {
         Ok(())
     }
 
+    fn assert_stable_parameter_ids(&self, model: &crate::model::LitGPT<R>) -> Result<()> {
+        let current_ids: Vec<TensorId> = model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        if current_ids != self.parameter_ids {
+            return Err(Error::TrainingError {
+                reason: "model rebuild changed trainable TensorIds; AdamW state would be orphaned"
+                    .to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn parameter_name(&self, id: TensorId) -> &str {
+        self.parameter_names
+            .iter()
+            .find_map(|(name, param_id)| (*param_id == id).then_some(name.as_str()))
+            .unwrap_or("<unnamed>")
+    }
+
     fn save_checkpoint(&self, step: usize) -> Result<()> {
         let prefix = self.model_config.checkpoint_prefix();
         let checkpoint_path = format!(
@@ -871,9 +920,14 @@ impl<'a> LitTrainer<'a> {
             self.config.checkpoint_dir, prefix, step
         );
         if !Path::new(&self.config.checkpoint_dir).exists() {
-            std::fs::create_dir_all(&self.config.checkpoint_dir).map_err(Error::wrap)?;
+            std::fs::create_dir_all(&self.config.checkpoint_dir)?;
         }
-        self.varmap.save(&checkpoint_path)?;
+
+        crate::model::save_checkpoint_from_params(
+            &checkpoint_path,
+            self.params,
+            &self.parameter_names,
+        )?;
 
         // Save metadata for auto-resume validation
         if let Some(ref data_path) = self.data_file_path {
@@ -909,9 +963,7 @@ impl<'a> LitTrainer<'a> {
             for entry in entries.filter_map(|e| e.ok()) {
                 let path = entry.path();
                 if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    // Match *_step_N.safetensors (e.g., nano_512_117m_bf16_step_100.safetensors)
                     if filename.contains("_step_") && filename.ends_with(".safetensors") {
-                        // Extract step number after "_step_"
                         if let Some(step_part) = filename.split("_step_").last() {
                             if let Some(step_str) = step_part.strip_suffix(".safetensors") {
                                 if let Ok(step) = step_str.parse::<usize>() {
@@ -924,24 +976,20 @@ impl<'a> LitTrainer<'a> {
             }
         }
 
-        // Sort by step number (ascending)
         checkpoints.sort_by_key(|(step, _)| *step);
 
-        // Remove oldest checkpoints if we exceed the limit
         let to_remove = checkpoints
             .len()
             .saturating_sub(self.config.max_checkpoints);
         for (step, path) in checkpoints.into_iter().take(to_remove) {
-            // Remove checkpoint file
             if let Err(e) = std::fs::remove_file(&path) {
                 eprintln!("Warning: Failed to remove old checkpoint {:?}: {}", path, e);
             }
-            // Remove associated metadata file
             let meta_path = format!(
                 "{}/checkpoint_step_{}.meta.json",
                 self.config.checkpoint_dir, step
             );
-            let _ = std::fs::remove_file(&meta_path); // Ignore errors for metadata
+            let _ = std::fs::remove_file(&meta_path);
         }
 
         Ok(())
@@ -954,73 +1002,59 @@ impl<'a> LitTrainer<'a> {
             self.config.checkpoint_dir, prefix, name
         );
         if !Path::new(&self.config.checkpoint_dir).exists() {
-            std::fs::create_dir_all(&self.config.checkpoint_dir).map_err(Error::wrap)?;
+            std::fs::create_dir_all(&self.config.checkpoint_dir)?;
         }
-        self.varmap.save(&path)?;
+        crate::model::save_checkpoint_from_params(&path, self.params, &self.parameter_names)?;
         Ok(())
     }
 
-    /// Compute gradient norm from GradStore
-    ///
-    /// # Arguments
-    /// * `grads` - GradStore from backward pass
-    ///
-    /// # Returns
-    /// Global L2 gradient norm across all parameters
-    fn compute_grad_norm_from_grads(&self, grads: &GradStore) -> Result<f64> {
-        // Accumulate all squared norms on GPU first, then do a single CPU transfer
-        // This avoids 121 GPU-CPU syncs (one per parameter)
-        let mut accumulated: Option<Tensor> = None;
-
-        for grad in grads.values() {
-            let grad_norm_sq = grad.powf(2.0)?.sum_all()?;
-            accumulated = Some(match accumulated {
-                None => grad_norm_sq,
-                Some(acc) => acc.add(&grad_norm_sq)?,
-            });
+    fn clone_grad_store(&self, grads: &GradStore<R>) -> GradStore<R> {
+        let mut cloned = GradStore::new();
+        for id in grads.keys().copied() {
+            if let Some(grad) = grads.get(id) {
+                cloned.insert(id, grad.clone());
+            }
         }
-
-        // Single GPU->CPU transfer at the end
-        let total_norm_sq = match accumulated {
-            Some(tensor) => tensor.to_vec0::<f32>()? as f64,
-            None => 0.0,
-        };
-
-        Ok(total_norm_sq.sqrt())
+        cloned
     }
 
-    /// Print gradient breakdown by parameter (for debugging)
-    /// Shows which parameters contribute most to the global gradient norm
-    fn print_gradient_breakdown(&self, grads: &GradStore) {
-        let mut param_norms: Vec<(String, f64, usize)> = Vec::new();
-        let mut total_norm_sq = 0.0f64;
+    /// Compute gradient norm by delegating to boostr::optimizer::clip_grad_norm.
+    fn compute_grad_norm_from_grads(&self, grads: &GradStore<R>) -> Result<f64> {
+        let mut cloned = self.clone_grad_store(grads);
+        crate::prelude::compute_grad_norm(&self.client, &mut cloned, f64::MAX)
+    }
 
-        for (name, tensor) in self.varmap.all_vars_named() {
-            if let Some(grad) = grads.get(tensor.id()) {
-                if let Ok(norm_sq) = grad
-                    .powf(2.0)
-                    .and_then(|g| g.sum_all())
-                    .and_then(|g| g.to_vec0::<f32>())
-                {
-                    let norm = (norm_sq as f64).sqrt();
-                    let num_params = tensor.elem_count();
-                    param_norms.push((name.clone(), norm, num_params));
-                    total_norm_sq += norm_sq as f64;
+    fn grad_norm_for_tensor(&self, id: TensorId, grad: &Tensor<R>) -> Result<f64> {
+        let mut one = GradStore::new();
+        one.insert(id, grad.clone());
+        crate::prelude::compute_grad_norm(&self.client, &mut one, f64::MAX)
+    }
+
+    /// Print gradient breakdown by parameter (for debugging).
+    fn print_gradient_breakdown(&self, grads: &GradStore<R>) {
+        let mut param_norms: Vec<(String, f64, usize)> = Vec::new();
+        let total_norm = self.compute_grad_norm_from_grads(grads).unwrap_or(0.0);
+        let total_norm_sq = total_norm * total_norm;
+
+        for id in &self.parameter_ids {
+            if let Some(grad) = grads.get(*id) {
+                if let Ok(norm) = self.grad_norm_for_tensor(*id, grad) {
+                    let num_params = self
+                        .params
+                        .get(id)
+                        .map(|tensor| tensor.elem_count())
+                        .unwrap_or(0);
+                    param_norms.push((self.parameter_name(*id).to_string(), norm, num_params));
                 }
             }
         }
 
-        let total_norm = total_norm_sq.sqrt();
-
-        // Sort by norm (largest first)
         param_norms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // If DEBUG_GRAD is set, print ALL gradients sorted by name for easy comparison
         if std::env::var("DEBUG_GRAD").is_ok() {
             eprintln!("\n[GRAD BREAKDOWN - FULL] Total norm: {:.6}", total_norm);
             eprintln!("{}", "=".repeat(80));
 
-            // Sort by name for easy comparison with PyTorch
             let mut by_name = param_norms.clone();
             by_name.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1033,7 +1067,11 @@ impl<'a> LitTrainer<'a> {
             eprintln!("[GRAD BREAKDOWN] Total norm: {:.4e}", total_norm);
             eprintln!("  Top 10 gradient contributors:");
             for (name, norm, num_params) in param_norms.iter().take(10) {
-                let pct = (norm * norm / total_norm_sq * 100.0) as f32;
+                let pct = if total_norm_sq > 0.0 {
+                    (norm * norm / total_norm_sq * 100.0) as f32
+                } else {
+                    0.0
+                };
                 eprintln!(
                     "    {}: norm={:.4e}, params={}, contrib={:.1}%",
                     name, norm, num_params, pct
@@ -1042,29 +1080,21 @@ impl<'a> LitTrainer<'a> {
         }
     }
 
-    /// Diagnose which parameters have inf/NaN gradients
-    /// Prints the parameter name and gradient norm for problematic parameters
-    fn diagnose_bad_gradients(&self, grads: &GradStore) {
+    /// Diagnose which parameters have inf/NaN gradients.
+    fn diagnose_bad_gradients(&self, grads: &GradStore<R>) {
         let mut bad_params: Vec<(String, f64)> = Vec::new();
 
-        for (name, tensor) in self.varmap.all_vars_named() {
-            if let Some(grad) = grads.get(tensor.id()) {
-                if let Ok(norm_sq) = grad
-                    .powf(2.0)
-                    .and_then(|g| g.sum_all())
-                    .and_then(|g| g.to_vec0::<f32>())
-                {
-                    let norm = (norm_sq as f64).sqrt();
+        for id in &self.parameter_ids {
+            if let Some(grad) = grads.get(*id) {
+                if let Ok(norm) = self.grad_norm_for_tensor(*id, grad) {
                     if norm.is_infinite() || norm.is_nan() || norm > 1e6 {
-                        bad_params.push((name.clone(), norm));
+                        bad_params.push((self.parameter_name(*id).to_string(), norm));
                     }
                 }
             }
         }
 
-        // Sort by norm (largest first) and show top offenders
         bad_params.sort_by(|a, b| {
-            // NaN/Inf first, then by magnitude
             match (
                 a.1.is_nan() || a.1.is_infinite(),
                 b.1.is_nan() || b.1.is_infinite(),
@@ -1082,116 +1112,25 @@ impl<'a> LitTrainer<'a> {
             }
         }
     }
+}
 
-    /// Gradient clipping via norm-based scaling
-    ///
-    /// # Implementation Note
-    /// We implement true gradient clipping by:
-    /// 1. Computing the global L2 norm from all gradients
-    /// 2. If norm > max_norm, scale all gradients by (max_norm / norm)
-    /// 3. Return the clipped gradients
-    ///
-    /// This prevents gradient explosion on the current step, unlike loss pre-scaling
-    /// which has a one-step lag.
-    ///
-    /// # Arguments
-    /// * `grads` - GradStore from backward pass
-    /// * `max_norm` - Maximum allowed gradient norm (typically 1.0)
-    /// Process gradients with full gradient control pipeline:
-    /// 1. Per-element clipping (max_grad_value) - clips individual values to [-max, +max]
-    /// 2. Global norm clipping (max_grad_norm) - scales entire gradient if ||grad|| > max
-    /// 3. Gradient normalization (target_grad_norm) - normalizes to target norm
-    ///
-    /// # Returns
-    /// Tuple of (processed_GradStore, original_grad_norm, should_skip_step)
-    ///
-    /// Note: Currently unused for single-GPU training (FusedAdamW has built-in clamping),
-    /// but kept for distributed training path.
-    #[allow(dead_code)]
-    fn process_gradients(
-        &self,
-        grads: GradStore,
-        max_grad_norm: f64,
-        target_grad_norm: Option<f64>,
-        max_grad_value: Option<f64>,
-    ) -> Result<(GradStore, f64, bool)> {
-        // Step 1: Per-element clipping (if enabled)
-        let grads = if let Some(max_val) = max_grad_value {
-            let mut clipped = GradStore::new();
-            for (id, grad) in grads.iter() {
-                let clamped = grad.clamp(-(max_val as f32), max_val as f32)?;
-                clipped.insert(*id, clamped);
-            }
-            clipped
-        } else {
-            grads
-        };
+fn scalar_loss_var<R>(loss: &Var<R>) -> Result<Var<R>>
+where
+    R: Runtime<DType = DType>,
+{
+    if loss.tensor().elem_count() != 1 {
+        return Err(Error::TrainingError {
+            reason: format!(
+                "expected scalar auxiliary loss, got shape {:?}",
+                loss.tensor().shape()
+            ),
+        });
+    }
 
-        // Compute gradient norm after per-element clipping
-        let total_norm = self.compute_grad_norm_from_grads(&grads)?;
-
-        // If gradient norm is inf/nan, skip this optimizer step
-        if total_norm.is_infinite() || total_norm.is_nan() {
-            eprintln!(
-                "[GradClip] WARN: Gradient norm is {}, skipping step",
-                total_norm
-            );
-            // Identify which parameters have problematic gradients
-            for (name, tensor) in self.varmap.all_vars_named() {
-                if let Some(grad) = grads.get(tensor.id()) {
-                    if let Ok(norm_sq) = grad
-                        .powf(2.0)
-                        .and_then(|g| g.sum_all())
-                        .and_then(|g| g.to_vec0::<f32>())
-                    {
-                        let norm = (norm_sq as f64).sqrt();
-                        if norm.is_infinite() || norm.is_nan() || norm > 1e6 {
-                            eprintln!("  └─ {}: grad_norm={:.2e}", name, norm);
-                        }
-                    }
-                }
-            }
-            return Ok((grads, total_norm, true));
-        }
-
-        // Step 2: Global norm clipping - clips if ||grad|| > max_grad_norm
-        let (grads, clipped) = if total_norm > max_grad_norm {
-            let scale = (max_grad_norm / (total_norm + 1e-6)) as f32;
-            let mut scaled = GradStore::new();
-            for (id, grad) in grads.iter() {
-                scaled.insert(*id, grad.scale(scale)?);
-            }
-            (scaled, true)
-        } else {
-            (grads, false)
-        };
-
-        // Step 3: Gradient norm clipping (if enabled) - clips to target_grad_norm
-        // After max_grad_norm clipping, the effective norm is min(total_norm, max_grad_norm)
-        // We only scale DOWN if norm exceeds target (proper norm clipping, not normalization)
-        let grads = if let Some(target) = target_grad_norm {
-            // Compute current norm after clipping
-            let current_norm = if clipped { max_grad_norm } else { total_norm };
-            // Only clip if norm exceeds target (never scale up small gradients)
-            if current_norm > target && current_norm > 1e-8 {
-                let scale = (target / current_norm) as f32;
-                let mut clipped_grads = GradStore::new();
-                for (id, grad) in grads.iter() {
-                    clipped_grads.insert(*id, grad.scale(scale)?);
-                }
-                clipped_grads
-            } else {
-                grads
-            }
-        } else {
-            grads
-        };
-
-        // Compute the FINAL gradient norm after all processing (clipping + normalization)
-        // This is what's actually applied to the optimizer
-        let final_norm = self.compute_grad_norm_from_grads(&grads)?;
-
-        Ok((grads, final_norm, false))
+    if loss.tensor().rank() == 0 {
+        Ok(loss.clone())
+    } else {
+        var_reshape(loss, &[]).map_err(Error::from)
     }
 }
 

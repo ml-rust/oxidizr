@@ -2,9 +2,6 @@ mod commands;
 mod config;
 mod data;
 mod distributed;
-mod mamba;
-mod mamba2;
-mod mamba3;
 mod model;
 mod prelude;
 mod trainer;
@@ -109,12 +106,7 @@ fn main() -> Result<()> {
             .payload()
             .downcast_ref::<&str>()
             .map(|s| s.to_string())
-            .or_else(|| {
-                panic_info
-                    .payload()
-                    .downcast_ref::<String>()
-                    .cloned()
-            })
+            .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_default();
 
         // Skip backtrace for OOM errors - they're handled by catch_unwind
@@ -130,21 +122,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Train(args)) => {
-            commands::run_train(args)
-        }
-        Some(Commands::Pack(args)) => {
-            commands::run_pack(args)
-        }
+        Some(Commands::Train(args)) => commands::run_train(args),
+        Some(Commands::Pack(args)) => commands::run_pack(args),
         #[cfg(feature = "huggingface")]
-        Some(Commands::Push(args)) => {
-            commands::run_push(args)
-        }
+        Some(Commands::Push(args)) => commands::run_push(args),
         None => {
             // Legacy mode: if -f is provided without subcommand, run train
             if cli.config_file.is_some() {
                 let args = TrainArgs {
-                    config_file: cli.config_file.unwrap_or_else(|| "models/nano.yaml".to_string()),
+                    config_file: cli
+                        .config_file
+                        .unwrap_or_else(|| "models/nano.yaml".to_string()),
                     data_file: cli.data_file,
                     target_device: cli.target_device,
                     seq_length: cli.seq_length,

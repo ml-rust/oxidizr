@@ -2,11 +2,18 @@
 //!
 //! This module contains the training logic, extracted from the original main.rs.
 
+use crate::prelude::{DType, Tensor, VarBuilder, VarMap};
 use anyhow::Result;
-use crate::prelude::{Device, VarBuilder};
+use boostr::autograd::Var;
+use boostr::ops::{FusedOptimizerOps, TensorOps};
+use boostr::runtime::{Runtime, RuntimeClient};
+use boostr::tensor::TensorId;
 use clap::Args;
+use std::collections::HashMap;
 
-use crate::config::{find_latest_checkpoint, CheckpointMeta, DTypePrecision, LitConfig, ModelConfig};
+use crate::config::{
+    find_latest_checkpoint, CheckpointMeta, DTypePrecision, LitConfig, ModelConfig,
+};
 use crate::data::{create_dummy_data, LitDataLoader, PrefetchDataLoader};
 use crate::model::LitGPT;
 use crate::trainer::LitTrainer;
@@ -135,7 +142,7 @@ fn clear_checkpoint_directory(checkpoint_dir: &str) -> Result<usize> {
 }
 
 /// Get CUDA memory info in a human-readable format
-fn get_cuda_memory_info(_device: &Device) -> Result<String> {
+fn get_cuda_memory_info<R: Runtime>(_device: &R::Device) -> Result<String> {
     // Just query all GPUs - simpler and more reliable
     let output = std::process::Command::new("nvidia-smi")
         .args(&[
@@ -218,8 +225,53 @@ pub fn estimate_params(cfg: &ModelConfig) -> String {
     }
 }
 
+fn parameter_tensor_map<R>(params: Vec<(TensorId, &Var<R>)>) -> HashMap<TensorId, Tensor<R>>
+where
+    R: Runtime<DType = DType>,
+{
+    params
+        .into_iter()
+        .map(|(id, var)| (id, var.tensor().clone()))
+        .collect()
+}
+
 /// Run the training command
 pub fn run_train(args: TrainArgs) -> Result<()> {
+    let config = LitConfig::from_yaml(&args.config_file)?;
+    let use_cpu = args
+        .target_device
+        .as_deref()
+        .map(|dev| dev.eq_ignore_ascii_case("cpu"))
+        .unwrap_or(config.trainer.target_device == crate::config::TargetDevice::Cpu);
+
+    #[cfg(feature = "cuda")]
+    {
+        if !use_cpu {
+            return run_train_with_runtime::<boostr::CudaRuntime>(args, config);
+        }
+    }
+
+    run_train_with_runtime::<boostr::CpuRuntime>(args, config)
+}
+
+fn run_train_with_runtime<R>(args: TrainArgs, mut config: LitConfig) -> Result<()>
+where
+    R: Runtime<DType = DType> + crate::distributed::RuntimeDeviceFromOrdinal,
+    R::Client: RuntimeClient<R>
+        + TensorOps<R>
+        + FusedOptimizerOps<R>
+        + boostr::RandomOps<R>
+        + boostr::ScalarOps<R>
+        + boostr::BinaryOps<R>
+        + boostr::CompareOps<R>
+        + boostr::ConvOps<R>
+        + boostr::FlashAttentionOps<R>
+        + boostr::IndexingOps<R>
+        + boostr::NormalizationOps<R>
+        + boostr::QuantMatmulOps<R>
+        + boostr::RoPEOps<R>
+        + boostr::TypeConversionOps<R>,
+{
     // Use run directory from env var (set by wrapper script) or create new one
     let run_dir = match std::env::var("OXIDIZED_RUN_DIR") {
         Ok(dir) => {
@@ -243,11 +295,10 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
         println!("Run directory: {}\n", run_dir);
     }
 
-    // 1. Load Configuration from YAML file
+    // 1. Configuration was loaded before runtime dispatch.
     if !headless {
         println!("Loading configuration from: {}", args.config_file);
     }
-    let mut config = LitConfig::from_yaml(&args.config_file)?;
 
     // Apply CLI overrides
     if let Some(seq_len) = args.seq_length {
@@ -296,7 +347,8 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
         if !headless {
             println!(
                 "CLI override: distributed training enabled with {} GPUs: {:?}",
-                gpu_ids.len(), gpu_ids
+                gpu_ids.len(),
+                gpu_ids
             );
             println!(
                 "CLI override: sync_backend = {:?}",
@@ -331,8 +383,10 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
             config.model.dtype = dtype;
         }
     } else {
-        eprintln!("Warning: Unknown dtype '{}', using config default ({})",
-                  args.dtype, config.model.dtype);
+        eprintln!(
+            "Warning: Unknown dtype '{}', using config default ({})",
+            args.dtype, config.model.dtype
+        );
     }
 
     // Show dtype info (BF16/F16 use less memory, F32 is default)
@@ -347,23 +401,11 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
         println!("Configuration loaded successfully!\n");
     }
 
-    // 2. Setup Device (priority: CLI override > YAML config > default GPU)
-    let use_cpu = if let Some(ref dev) = args.target_device {
-        dev.to_lowercase() == "cpu"
-    } else {
-        config.trainer.target_device == crate::config::TargetDevice::Cpu
-    };
-
-    let device = if use_cpu {
-        if !headless {
-            println!("Using CPU device");
-        }
-        Device::cpu()
-    } else {
-        Device::cuda_if_available()?
-    };
+    // 2. Setup runtime client/device selected by run_train() dispatch.
+    let device = R::default_device();
+    let client = R::default_client(&device);
     if !headless {
-        println!("Using device: {:?}", device);
+        println!("Using runtime: {}", R::name());
     }
 
     // 3. Initialize Model
@@ -374,23 +416,21 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
         );
     }
 
-    // For training, we use VarBuilder with PyTorch's default Linear initialization
-    // PyTorch uses Uniform(-1/sqrt(fan_in), 1/sqrt(fan_in)) which produces smaller
-    // initial values than Kaiming, helping with gradient stability in Mamba layers.
-    // Use configured dtype (F32/F16/BF16) for model weights
-    // RmsNorm and SSM computations use F32 internally for numerical stability
-    let vb = VarBuilder::pytorch_linear(config.model.dtype.to_dtype(), &device);
-    let model = LitGPT::new(&config.model, vb.clone())?;
-
-    // Get the VarMap from VarBuilder (contains all initialized weights)
-    let varmap_arc = vb.var_map();
+    // Model migration owns initialization through boostr VarBuilder/Init and must
+    // expose trainable parameters with stable TensorIds.
+    let mut varmap = VarMap::<R>::new();
+    let mut vb = VarBuilder::new(&mut varmap, &device);
+    let mut model = LitGPT::<R>::new(&config.model, &mut vb, &client)?;
 
     // Load checkpoint if resuming
     let start_step = if let Some(ref resume_arg) = args.resume {
         if resume_arg == "auto" {
             // Auto-resume: find latest checkpoint and validate
             if !headless {
-                println!("Auto-resume: searching for latest checkpoint in {}", config.trainer.checkpoint_dir);
+                println!(
+                    "Auto-resume: searching for latest checkpoint in {}",
+                    config.trainer.checkpoint_dir
+                );
             }
 
             match find_latest_checkpoint(&config.trainer.checkpoint_dir)? {
@@ -407,10 +447,15 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
                         if !validation.is_valid() {
                             // Show mismatch details
                             println!("\n⚠️  Checkpoint mismatch detected!");
-                            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                            println!(
+                                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                            );
                             if !validation.model_matches {
                                 println!("❌ Model config mismatch:");
-                                println!("   Checkpoint hash: {}", validation.checkpoint_model_hash);
+                                println!(
+                                    "   Checkpoint hash: {}",
+                                    validation.checkpoint_model_hash
+                                );
                                 println!("   Current hash:    {}", validation.current_model_hash);
                             }
                             if !validation.data_matches {
@@ -418,9 +463,13 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
                                 println!("   Checkpoint hash: {}", validation.checkpoint_data_hash);
                                 println!("   Current hash:    {}", validation.current_data_hash);
                             }
-                            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                            println!(
+                                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                            );
                             println!("\nThe current configuration does not match the existing checkpoint.");
-                            println!("Starting fresh training will REMOVE all existing checkpoints in:");
+                            println!(
+                                "Starting fresh training will REMOVE all existing checkpoints in:"
+                            );
                             println!("  {}", config.trainer.checkpoint_dir);
                             println!();
 
@@ -433,7 +482,9 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
                             }
 
                             // Ask user for confirmation
-                            if prompt_confirmation("Do you want to clear old checkpoints and start fresh?") {
+                            if prompt_confirmation(
+                                "Do you want to clear old checkpoints and start fresh?",
+                            ) {
                                 // Clear old checkpoints
                                 match clear_checkpoint_directory(&config.trainer.checkpoint_dir) {
                                     Ok(count) => {
@@ -442,7 +493,9 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
                                     }
                                     Err(e) => {
                                         eprintln!("Error clearing checkpoints: {}", e);
-                                        return Err(anyhow::anyhow!("Failed to clear checkpoint directory"));
+                                        return Err(anyhow::anyhow!(
+                                            "Failed to clear checkpoint directory"
+                                        ));
                                     }
                                 }
                                 0 // Start from step 0
@@ -464,7 +517,7 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
                                 );
                             }
 
-                            varmap_arc.write().unwrap().load(&checkpoint_path)?;
+                            crate::model::load_checkpoint_into_model(&mut model, &checkpoint_path)?;
                             if !headless {
                                 println!("Resuming from step {}", step);
                             }
@@ -474,7 +527,7 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
                         if !headless {
                             println!("⚠️  No data file specified, skipping validation");
                         }
-                        varmap_arc.write().unwrap().load(&checkpoint_path)?;
+                        crate::model::load_checkpoint_into_model(&mut model, &checkpoint_path)?;
                         if !headless {
                             println!("Resuming from step {}", step);
                         }
@@ -493,7 +546,7 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
             if !headless {
                 println!("Loading checkpoint from: {}", resume_arg);
             }
-            varmap_arc.write().unwrap().load(resume_arg)?;
+            crate::model::load_checkpoint_into_model(&mut model, resume_arg)?;
             if !headless {
                 println!("Checkpoint loaded successfully!");
             }
@@ -504,7 +557,8 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
                 .and_then(|s| s.to_str())
                 .and_then(|s| {
                     if s.contains("_step_") {
-                        s.split("_step_").last()
+                        s.split("_step_")
+                            .last()
                             .and_then(|n| n.parse::<usize>().ok())
                     } else {
                         None
@@ -543,14 +597,14 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
                 data_path
             );
         }
-        LitDataLoader::from_file(data_path, batch_size, seq_len, device.clone())?
+        LitDataLoader::<R>::from_file(data_path, batch_size, seq_len, device.clone())?
     } else {
         if !headless {
             println!("Creating dummy training data...");
         }
         let total_tokens = 1_000_000; // 1M tokens for demo
         let dummy_tokens = create_dummy_data(config.model.vocab_size, total_tokens);
-        LitDataLoader::new(dummy_tokens, batch_size, seq_len, device.clone())
+        LitDataLoader::<R>::new(dummy_tokens, batch_size, seq_len, device.clone())
     };
 
     // Get dataset size before potentially wrapping in prefetch
@@ -579,28 +633,31 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
     // Effective batch size is the number of samples per optimizer step
     let effective_batch_size = batch_size * config_trainer.gradient_accumulation;
 
-    // Extract VarMap from the Arc<RwLock> for use with the trainer
-    // At this point we're done with VarBuilder, so we can clone out the VarMap
-    let mut varmap = varmap_arc.read().unwrap().clone();
+    // Stable TensorId parameter registration.
+    // There is no global tape: the optimizer owns a HashMap keyed by the model's
+    // logical TensorIds, and every step rebuilds Vars with those same IDs.
+    let trainable = model.trainable_parameters();
+    let parameter_ids: Vec<TensorId> = trainable.iter().map(|(id, _)| *id).collect();
+    let mut params = parameter_tensor_map::<R>(trainable);
+    let parameter_names: Vec<(String, TensorId)> = model
+        .named_trainable_parameters()
+        .into_iter()
+        .map(|(name, id, _)| (name, id))
+        .collect();
 
-    // Calculate total parameters and mark them as requiring gradients
-    let (total_params, trainable_params) = {
-        use crate::prelude::global_tape;
-
-        let mut total = 0usize;
-        for tensor in varmap.all_vars() {
-            total += tensor.elem_count();
-            // Mark this tensor as requiring gradients and record it in the tape
-            global_tape::set_requires_grad(tensor.id(), true);
-            global_tape::record_tensor(tensor.id(), tensor.clone());
-        }
-        (total, total) // For now, all params are trainable
-    };
+    let trainable_params = params
+        .values()
+        .map(|tensor| tensor.elem_count())
+        .sum::<usize>();
+    let total_params = trainable_params;
 
     let steps_json_path = format!("{}/steps.json", run_dir);
-    let mut trainer = LitTrainer::new(
+    let mut trainer = LitTrainer::<R>::new(
         config_trainer.clone(),
-        &mut varmap,
+        &mut params,
+        parameter_ids,
+        parameter_names,
+        client.clone(),
         device.clone(),
         dataset_size,
         batch_size,
@@ -618,7 +675,7 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
 
     // Show available GPU memory (only in normal mode)
     if !headless {
-        if let Ok(mem_info) = get_cuda_memory_info(&device) {
+        if let Ok(mem_info) = get_cuda_memory_info::<R>(&device) {
             println!("GPU Memory: {}\n", mem_info);
         }
     }
@@ -638,7 +695,11 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
             .map(|v| v.len())
             .unwrap_or(0);
         let num_attention = config.model.num_layers - num_mamba;
-        let mamba_type = if config.model.mamba2_num_heads.is_some() { "Mamba2" } else { "Mamba" };
+        let mamba_type = if config.model.mamba2_num_heads.is_some() {
+            "Mamba2"
+        } else {
+            "Mamba"
+        };
         println!(
             "  Model: {} parameters ({} {} + {} MLA+MoE layers)",
             param_str, num_mamba, mamba_type, num_attention
@@ -696,7 +757,7 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
     // 6. Run Training Loop with better OOM error handling
     // Use prefetch loader if enabled, otherwise use base loader
     let training_result = if args.prefetch > 0 {
-        let mut prefetch_loader = PrefetchDataLoader::new(base_loader, args.prefetch)?;
+        let mut prefetch_loader = PrefetchDataLoader::<R>::new(base_loader, args.prefetch)?;
         trainer.fit(&model, &mut prefetch_loader)
     } else {
         let mut data_loader = base_loader;
@@ -730,7 +791,7 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
             }
         },
         "dataset_size": dataset_size,
-        "device": format!("{:?}", device),
+        "device": R::name(),
         "status": if training_result.is_ok() { "completed" } else { "failed" },
         "error": if let Err(ref e) = training_result {
             Some(format!("{:?}", e))
@@ -761,7 +822,7 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
             if err_str.contains("out of memory") || err_str.contains("OUT_OF_MEMORY") {
                 if !headless {
                     println!("\n❌ CUDA OUT OF MEMORY ERROR ❌");
-                    if let Ok(mem_info) = get_cuda_memory_info(&device) {
+                    if let Ok(mem_info) = get_cuda_memory_info::<R>(&device) {
                         println!("GPU Memory at failure: {}", mem_info);
                     }
                     println!("\nCurrent configuration:");

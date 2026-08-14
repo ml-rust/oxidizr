@@ -5,14 +5,14 @@
 //! - `pack` - Package a trained model for distribution
 //! - `push` - Push a packaged model to HuggingFace (feature-gated)
 
-pub mod train;
 pub mod pack;
+pub mod train;
 
 #[cfg(feature = "huggingface")]
 pub mod push;
 
-pub use train::{TrainArgs, run_train};
-pub use pack::{PackArgs, run_pack};
+pub use pack::{run_pack, PackArgs};
+pub use train::{run_train, TrainArgs};
 
 #[cfg(feature = "huggingface")]
-pub use push::{PushArgs, run_push};
+pub use push::{run_push, PushArgs};

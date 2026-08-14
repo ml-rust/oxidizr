@@ -6,24 +6,48 @@ use std::io::Read;
 use std::path::Path;
 
 // Default value functions for serde
-fn default_max_checkpoints() -> usize { 10 }
-fn default_model_name() -> String { "model".to_string() }
-fn default_max_grad_norm() -> f64 { 1.0 }
-fn default_target_grad_norm() -> Option<f64> { None }  // None = no normalization
-fn default_max_grad_value() -> Option<f64> { None }    // None = no per-element clipping
+fn default_max_checkpoints() -> usize {
+    10
+}
+fn default_model_name() -> String {
+    "model".to_string()
+}
+fn default_max_grad_norm() -> f64 {
+    1.0
+}
+fn default_target_grad_norm() -> Option<f64> {
+    None
+} // None = no normalization
+fn default_max_grad_value() -> Option<f64> {
+    None
+} // None = no per-element clipping
 
 // AdamW optimizer hyperparameters (from optimization.md "Golden Recipe")
-fn default_adamw_beta1() -> f64 { 0.9 }   // Standard momentum coefficient
-fn default_adamw_beta2() -> f64 { 0.95 }  // Lower β₂ stabilizes MoE sparse updates
-fn default_adamw_eps() -> f64 { 1e-6 }    // Higher ε for BF16 numerical safety
-fn default_weight_decay() -> f64 { 0.1 }  // Industry standard L2 regularization
+fn default_adamw_beta1() -> f64 {
+    0.9
+} // Standard momentum coefficient
+fn default_adamw_beta2() -> f64 {
+    0.95
+} // Lower β₂ stabilizes MoE sparse updates
+fn default_adamw_eps() -> f64 {
+    1e-6
+} // Higher ε for BF16 numerical safety
+fn default_weight_decay() -> f64 {
+    0.1
+} // Industry standard L2 regularization
 
 // Router z-loss coefficient (prevents MoE logit drift/explosion in BF16)
-fn default_z_loss_alpha() -> f64 { 1e-3 } // SOTA: 1e-3 to 1e-4 range
+fn default_z_loss_alpha() -> f64 {
+    1e-3
+} // SOTA: 1e-3 to 1e-4 range
 
 // Learning rate warmup (critical for Mamba SSM parameter alignment)
-fn default_warmup_steps() -> Option<usize> { None }  // None = disabled
-fn default_warmup_ratio() -> Option<f64> { Some(0.1) }  // 10% of total steps if warmup_steps not set
+fn default_warmup_steps() -> Option<usize> {
+    None
+} // None = disabled
+fn default_warmup_ratio() -> Option<f64> {
+    Some(0.1)
+} // 10% of total steps if warmup_steps not set
 
 // Re-export distributed config types
 pub use crate::distributed::sync::DistributedConfig;
@@ -63,19 +87,19 @@ pub struct ModelConfig {
     pub mamba_layers: Option<Vec<usize>>, // Which layers are Mamba (rest are Attention)
 
     // Mamba2 (State Space Duality) config
-    pub mamba2_num_heads: Option<usize>,     // Number of SSM heads (e.g., 24 for nano)
-    pub mamba2_head_dim: Option<usize>,      // Dimension per head (e.g., 64)
-    pub mamba2_state_size: Option<usize>,    // SSM state dimension N (e.g., 64)
-    pub mamba2_chunk_size: Option<usize>,    // Chunk size for SSD decomposition (e.g., 64)
-    pub mamba2_n_groups: Option<usize>,      // Groups for efficient computation (e.g., 1)
-    pub mamba2_conv_kernel: Option<usize>,   // Conv1D kernel size (e.g., 4)
-    pub mamba2_expand: Option<usize>,        // Expansion factor (e.g., 2)
+    pub mamba2_num_heads: Option<usize>, // Number of SSM heads (e.g., 24 for nano)
+    pub mamba2_head_dim: Option<usize>,  // Dimension per head (e.g., 64)
+    pub mamba2_state_size: Option<usize>, // SSM state dimension N (e.g., 64)
+    pub mamba2_chunk_size: Option<usize>, // Chunk size for SSD decomposition (e.g., 64)
+    pub mamba2_n_groups: Option<usize>,  // Groups for efficient computation (e.g., 1)
+    pub mamba2_conv_kernel: Option<usize>, // Conv1D kernel size (e.g., 4)
+    pub mamba2_expand: Option<usize>,    // Expansion factor (e.g., 2)
 
     // Mamba3 config (extends Mamba2 with trapezoidal discretization, complex RoPE, MIMO)
-    pub mamba3_enabled: Option<bool>,        // Enable Mamba-3 (uses mamba2_* params as base)
-    pub mamba3_complex_rope: Option<bool>,   // Enable complex-valued RoPE for state tracking
-    pub mamba3_mimo_rank: Option<usize>,     // MIMO rank (0 = SISO, >0 = MIMO)
-    pub mamba3_use_conv: Option<bool>,       // Optional conv (default: false, trapezoidal replaces it)
+    pub mamba3_enabled: Option<bool>, // Enable Mamba-3 (uses mamba2_* params as base)
+    pub mamba3_complex_rope: Option<bool>, // Enable complex-valued RoPE for state tracking
+    pub mamba3_mimo_rank: Option<usize>, // MIMO rank (0 = SISO, >0 = MIMO)
+    pub mamba3_use_conv: Option<bool>, // Optional conv (default: false, trapezoidal replaces it)
 
     pub vocab_size: usize,
     /// Tokenizer vocabulary name (cl100k_base, o200k_base, llama3, deepseek_v3, custom)
@@ -145,7 +169,8 @@ impl ModelConfig {
     /// Example: nano_512_117m_bf16
     pub fn checkpoint_prefix(&self) -> String {
         let params = self.estimate_params_short();
-        format!("{}_{}_{}_{}",
+        format!(
+            "{}_{}_{}_{}",
             self.name.to_lowercase(),
             self.max_seq_len,
             params,
@@ -167,7 +192,7 @@ impl ModelConfig {
         let attn = self.hidden_size * self.hidden_size +  // Q
                    self.hidden_size * kv_size +           // K
                    self.hidden_size * kv_size +           // V
-                   self.hidden_size * self.hidden_size;   // O
+                   self.hidden_size * self.hidden_size; // O
 
         // MLP per layer
         let mlp = self.hidden_size * intermediate_size * 3;
@@ -199,54 +224,48 @@ pub struct TrainerConfig {
     pub log_interval: usize,
     pub save_interval: usize,
     #[serde(default = "default_max_checkpoints")]
-    pub max_checkpoints: usize,  // Max checkpoints to keep (0 = unlimited)
+    pub max_checkpoints: usize, // Max checkpoints to keep (0 = unlimited)
     pub load_balance_alpha: f64, // For MoE auxiliary loss
 
     // Gradient control parameters (from "Keep the Gradients Flowing" research)
     #[serde(default = "default_max_grad_norm")]
-    pub max_grad_norm: f64,      // Global gradient clipping threshold (default: 1.0)
-                                 // If ||grad|| > max_grad_norm, scale down to max_grad_norm
-
+    pub max_grad_norm: f64, // Global gradient clipping threshold (default: 1.0)
+    // If ||grad|| > max_grad_norm, scale down to max_grad_norm
     #[serde(default = "default_target_grad_norm")]
-    pub target_grad_norm: Option<f64>,  // Target gradient normalization (None = disabled)
-                                        // If set, normalize gradients to this target norm
-                                        // Good values: 1.0 - 5.0
-
+    pub target_grad_norm: Option<f64>, // Target gradient normalization (None = disabled)
+    // If set, normalize gradients to this target norm
+    // Good values: 1.0 - 5.0
     #[serde(default = "default_max_grad_value")]
-    pub max_grad_value: Option<f64>,    // Per-element gradient clipping (None = disabled)
-                                        // Clips individual gradient values to [-max, +max]
-                                        // Good values: 1.0 - 10.0
+    pub max_grad_value: Option<f64>, // Per-element gradient clipping (None = disabled)
+    // Clips individual gradient values to [-max, +max]
+    // Good values: 1.0 - 10.0
 
     // -------------------------------------------------------------------------
     // AdamW Optimizer Hyperparameters (from optimization.md "Golden Recipe")
     // -------------------------------------------------------------------------
     // These settings are critical for stable training of Hybrid Mamba2-MoE models.
     // The defaults follow SOTA recommendations for BF16/mixed-precision training.
-
     #[serde(default = "default_adamw_beta1")]
-    pub adamw_beta1: f64,  // Momentum coefficient (default: 0.9)
+    pub adamw_beta1: f64, // Momentum coefficient (default: 0.9)
 
     #[serde(default = "default_adamw_beta2")]
-    pub adamw_beta2: f64,  // Variance coefficient (default: 0.95)
-                           // Lower β₂ stabilizes sparse MoE expert updates
-
+    pub adamw_beta2: f64, // Variance coefficient (default: 0.95)
+    // Lower β₂ stabilizes sparse MoE expert updates
     #[serde(default = "default_adamw_eps")]
-    pub adamw_eps: f64,    // Numerical stability (default: 1e-6)
-                           // Higher ε prevents NaN in BF16 when variance is small
-
+    pub adamw_eps: f64, // Numerical stability (default: 1e-6)
+    // Higher ε prevents NaN in BF16 when variance is small
     #[serde(default = "default_weight_decay")]
     pub weight_decay: f64, // L2 regularization (default: 0.1)
-                           // Decoupled from LR, applied to weights only
+    // Decoupled from LR, applied to weights only
 
     // -------------------------------------------------------------------------
     // Router Z-Loss (prevents MoE routing collapse)
     // -------------------------------------------------------------------------
     // Z-loss penalizes large router logits that cause softmax saturation.
     // Essential for BF16 training stability.
-
     #[serde(default = "default_z_loss_alpha")]
     pub z_loss_alpha: f64, // Router z-loss coefficient (default: 1e-3)
-                           // L_total = L_MLE + α*L_aux + γ*L_z where γ = z_loss_alpha
+    // L_total = L_MLE + α*L_aux + γ*L_z where γ = z_loss_alpha
 
     // -------------------------------------------------------------------------
     // Learning Rate Warmup (critical for Mamba SSM alignment)
@@ -254,14 +273,12 @@ pub struct TrainerConfig {
     // Linear warmup from 0 to learning_rate over warmup period.
     // Allows SSM parameters (A, B, C, dt) to align before full-speed training.
     // Either warmup_steps OR warmup_ratio should be set (not both).
-
     #[serde(default = "default_warmup_steps")]
-    pub warmup_steps: Option<usize>,  // Explicit number of warmup steps (None = use ratio)
+    pub warmup_steps: Option<usize>, // Explicit number of warmup steps (None = use ratio)
 
     #[serde(default = "default_warmup_ratio")]
-    pub warmup_ratio: Option<f64>,    // Fraction of total steps for warmup (default: 0.1 = 10%)
-                                      // Only used if warmup_steps is None
-
+    pub warmup_ratio: Option<f64>, // Fraction of total steps for warmup (default: 0.1 = 10%)
+    // Only used if warmup_steps is None
     /// Target device: "gpu" (default) or "cpu"
     #[serde(default)]
     pub target_device: TargetDevice,
@@ -325,12 +342,20 @@ impl LitConfig {
         }
 
         // Warn if using Mamba-1 (sequential SSM) instead of Mamba-2 (parallel SSD)
-        let has_mamba_layers = self.model.mamba_layers.as_ref().map_or(false, |v| !v.is_empty());
+        let has_mamba_layers = self
+            .model
+            .mamba_layers
+            .as_ref()
+            .map_or(false, |v| !v.is_empty());
         let has_mamba2_config = self.model.mamba2_num_heads.is_some();
         if has_mamba_layers && !has_mamba2_config {
-            eprintln!("⚠️  WARNING: Using Mamba-1 (sequential SSM) which is 5-10x slower than Mamba-2.");
+            eprintln!(
+                "⚠️  WARNING: Using Mamba-1 (sequential SSM) which is 5-10x slower than Mamba-2."
+            );
             eprintln!("   Mamba-1 uses a sequential for-loop over sequence length, bottlenecking GPU utilization.");
-            eprintln!("   To enable Mamba-2 (State Space Duality), add these fields to your config:");
+            eprintln!(
+                "   To enable Mamba-2 (State Space Duality), add these fields to your config:"
+            );
             eprintln!("     mamba2_num_heads: 48");
             eprintln!("     mamba2_head_dim: 16");
             eprintln!("     mamba2_state_size: 64");
@@ -389,24 +414,24 @@ impl LitConfig {
                 checkpoint_dir: "./checkpoints".to_string(),
                 log_interval: 10,
                 save_interval: 500,
-                max_checkpoints: 10,      // Keep last 10 checkpoints
+                max_checkpoints: 10,     // Keep last 10 checkpoints
                 load_balance_alpha: 0.0, // No MoE
                 max_grad_norm: 1.0,      // Gradient clipping threshold
                 target_grad_norm: None,  // No normalization
                 max_grad_value: None,    // No per-element clipping
                 // AdamW hyperparameters (SOTA defaults from optimization.md)
                 adamw_beta1: 0.9,
-                adamw_beta2: 0.95,       // Lower β₂ for MoE stability
-                adamw_eps: 1e-6,         // Higher ε for BF16 safety
-                weight_decay: 0.1,       // Industry standard
-                z_loss_alpha: 0.0,       // No MoE, no z-loss needed
+                adamw_beta2: 0.95, // Lower β₂ for MoE stability
+                adamw_eps: 1e-6,   // Higher ε for BF16 safety
+                weight_decay: 0.1, // Industry standard
+                z_loss_alpha: 0.0, // No MoE, no z-loss needed
                 // Learning rate warmup
                 warmup_steps: None,      // Use ratio instead
                 warmup_ratio: Some(0.1), // 10% warmup
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
-                group_size: 4,           // GRPO: 4 rollouts per prompt
-                beta_kl: 0.04,           // GRPO: KL penalty coefficient
+                group_size: 4, // GRPO: 4 rollouts per prompt
+                beta_kl: 0.04, // GRPO: KL penalty coefficient
             },
         }
     }
@@ -475,17 +500,17 @@ impl LitConfig {
                 max_grad_value: None,     // No per-element clipping
                 // AdamW hyperparameters (SOTA defaults from optimization.md)
                 adamw_beta1: 0.9,
-                adamw_beta2: 0.95,        // Lower β₂ for MoE stability
-                adamw_eps: 1e-6,          // Higher ε for BF16 safety
-                weight_decay: 0.1,        // Industry standard
-                z_loss_alpha: 1e-3,       // Router z-loss for MoE stability
+                adamw_beta2: 0.95,  // Lower β₂ for MoE stability
+                adamw_eps: 1e-6,    // Higher ε for BF16 safety
+                weight_decay: 0.1,  // Industry standard
+                z_loss_alpha: 1e-3, // Router z-loss for MoE stability
                 // Learning rate warmup
-                warmup_steps: None,       // Use ratio instead
-                warmup_ratio: Some(0.1),  // 10% warmup
+                warmup_steps: None,      // Use ratio instead
+                warmup_ratio: Some(0.1), // 10% warmup
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
-                group_size: 4,            // GRPO: 4 rollouts per prompt
-                beta_kl: 0.04,            // GRPO: KL penalty coefficient
+                group_size: 4, // GRPO: 4 rollouts per prompt
+                beta_kl: 0.04, // GRPO: KL penalty coefficient
             },
         }
     }
@@ -762,7 +787,9 @@ impl BlazrConfig {
 
 /// Find the latest checkpoint in a directory
 /// Format: {name}_{seq}_{params}_{dtype}_step_{N}.safetensors
-pub fn find_latest_checkpoint(checkpoint_dir: &str) -> anyhow::Result<Option<(String, String, usize)>> {
+pub fn find_latest_checkpoint(
+    checkpoint_dir: &str,
+) -> anyhow::Result<Option<(String, String, usize)>> {
     let dir = Path::new(checkpoint_dir);
     if !dir.exists() {
         return Ok(None);
@@ -784,7 +811,10 @@ pub fn find_latest_checkpoint(checkpoint_dir: &str) -> anyhow::Result<Option<(St
                         if let Ok(step) = step_str.parse::<usize>() {
                             if step > latest_step {
                                 // Check if corresponding meta file exists
-                                let meta_path = format!("{}/checkpoint_step_{}.meta.json", checkpoint_dir, step);
+                                let meta_path = format!(
+                                    "{}/checkpoint_step_{}.meta.json",
+                                    checkpoint_dir, step
+                                );
                                 if Path::new(&meta_path).exists() {
                                     latest_step = step;
                                     latest_checkpoint = Some(path.to_string_lossy().to_string());

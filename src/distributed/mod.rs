@@ -22,17 +22,17 @@
 //! optimizer.step(&synced_grads)?;
 //! ```
 
-pub mod sync;
 pub mod cpu_staging;
 pub mod optimizer;
+pub mod sync;
 
 #[cfg(feature = "nccl")]
 pub mod nccl;
 
 // Re-exports for convenience
-pub use sync::{GradientSynchronizer, DistributedConfig, SyncBackend};
-pub use cpu_staging::CpuStagingSynchronizer;
-pub use optimizer::{DistributedAdamW, AdamWConfig, compute_grad_norm};
+pub use cpu_staging::{CpuStagingSynchronizer, RuntimeDeviceFromOrdinal};
+pub use optimizer::{compute_grad_norm, AdamWConfig, DistributedAdamW};
+pub use sync::{DistributedConfig, GradientSynchronizer, SyncBackend};
 
 #[cfg(feature = "nccl")]
 pub use nccl::NcclSynchronizer;
@@ -40,9 +40,12 @@ pub use nccl::NcclSynchronizer;
 use crate::prelude::{Error, Result};
 
 /// Create a synchronizer based on configuration
-pub fn create_synchronizer(
+pub fn create_synchronizer<R>(
     config: &DistributedConfig,
-) -> Result<Box<dyn GradientSynchronizer>> {
+) -> Result<Box<dyn GradientSynchronizer<R>>>
+where
+    R: RuntimeDeviceFromOrdinal,
+{
     if !config.enabled || config.gpu_ids.len() <= 1 {
         // Single GPU - use no-op synchronizer
         return Ok(Box::new(CpuStagingSynchronizer::single_gpu(
@@ -51,24 +54,17 @@ pub fn create_synchronizer(
     }
 
     match config.backend {
-        SyncBackend::Single => {
-            Ok(Box::new(CpuStagingSynchronizer::single_gpu(
-                config.gpu_ids[0],
-            )?))
-        }
-        SyncBackend::CpuStaging => {
-            Ok(Box::new(CpuStagingSynchronizer::new(&config.gpu_ids)?))
-        }
+        SyncBackend::Single => Ok(Box::new(CpuStagingSynchronizer::single_gpu(
+            config.gpu_ids[0],
+        )?)),
+        SyncBackend::CpuStaging => Ok(Box::new(CpuStagingSynchronizer::new(&config.gpu_ids)?)),
         #[cfg(feature = "nccl")]
-        SyncBackend::Nccl => {
-            Ok(Box::new(NcclSynchronizer::new(&config.gpu_ids)?))
-        }
+        SyncBackend::Nccl => Ok(Box::new(NcclSynchronizer::new(&config.gpu_ids)?)),
         #[cfg(not(feature = "nccl"))]
-        SyncBackend::Nccl => {
-            Err(Error::Msg(
-                "NCCL backend requested but 'nccl' feature is not enabled. \
-                 Compile with --features nccl to enable NCCL support.".to_string()
-            ))
-        }
+        SyncBackend::Nccl => Err(Error::DistributedError {
+            reason: "NCCL backend requested but 'nccl' feature is not enabled. \
+                 Compile with --features nccl to enable NCCL support."
+                .to_string(),
+        }),
     }
 }

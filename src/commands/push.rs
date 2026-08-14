@@ -90,7 +90,8 @@ fn scan_packaged_models() -> Result<Vec<PackagedModel>> {
             continue;
         }
 
-        let username = user_path.file_name()
+        let username = user_path
+            .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
@@ -104,7 +105,8 @@ fn scan_packaged_models() -> Result<Vec<PackagedModel>> {
                 continue;
             }
 
-            let model_name = model_path.file_name()
+            let model_name = model_path
+                .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
@@ -128,7 +130,10 @@ fn scan_packaged_models() -> Result<Vec<PackagedModel>> {
 }
 
 /// Select a packaged model interactively or by path
-fn select_model<'a>(models: &'a [PackagedModel], selection: Option<&str>) -> Result<&'a PackagedModel> {
+fn select_model<'a>(
+    models: &'a [PackagedModel],
+    selection: Option<&str>,
+) -> Result<&'a PackagedModel> {
     match selection {
         Some(path_str) => {
             // Find by path or repo_id
@@ -162,10 +167,7 @@ fn select_model<'a>(models: &'a [PackagedModel], selection: Option<&str>) -> Res
 /// Check if hf CLI is available
 fn check_hf_cli() -> bool {
     // Just check if the command exists and runs (exit code doesn't matter)
-    Command::new("hf")
-        .arg("--help")
-        .output()
-        .is_ok()
+    Command::new("hf").arg("--help").output().is_ok()
 }
 
 /// Run the push command
@@ -187,8 +189,7 @@ pub fn run_push(args: PushArgs) -> Result<()> {
     }
 
     // Get HuggingFace token (optional - hf CLI may already be logged in)
-    let token = args.token
-        .or_else(|| std::env::var("HF_TOKEN").ok());
+    let token = args.token.or_else(|| std::env::var("HF_TOKEN").ok());
 
     // Scan for packaged models
     let models = scan_packaged_models()?;
@@ -201,7 +202,11 @@ pub fn run_push(args: PushArgs) -> Result<()> {
         return Err(anyhow::anyhow!(
             "Model {} is incomplete. Missing: {}{}",
             model.repo_id(),
-            if !model.has_model { "model.safetensors " } else { "" },
+            if !model.has_model {
+                "model.safetensors "
+            } else {
+                ""
+            },
             if !model.has_config { "config.json" } else { "" },
         ));
     }
@@ -225,7 +230,10 @@ pub fn run_push(args: PushArgs) -> Result<()> {
     // Confirm upload
     if !args.yes {
         let confirm = Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt(format!("Push to https://huggingface.co/{}?", model.repo_id()))
+            .with_prompt(format!(
+                "Push to https://huggingface.co/{}?",
+                model.repo_id()
+            ))
             .default(true)
             .interact()
             .context("Failed to get confirmation")?;
@@ -259,9 +267,7 @@ pub fn run_push(args: PushArgs) -> Result<()> {
     println!("\n⏳ Uploading to HuggingFace Hub...\n");
 
     // Execute upload
-    let status = cmd
-        .status()
-        .context("Failed to execute hf CLI")?;
+    let status = cmd.status().context("Failed to execute hf CLI")?;
 
     if status.success() {
         println!("\n✅ Upload complete!");
