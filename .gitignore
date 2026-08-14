@@ -3,6 +3,10 @@
 **/*.rs.bk
 *.pdb
 
+# Local dev overrides ([patch.crates-io] pointing at sibling checkouts).
+# Machine-specific paths — must never be committed.
+.cargo/
+
 # Cargo lock file (uncomment if this is a library)
 # Cargo.lock
 
