@@ -16,7 +16,7 @@ use crate::config::{
 };
 use crate::data::{create_dummy_data, LitDataLoader, PrefetchDataLoader};
 use crate::model::LitGPT;
-use crate::trainer::LitTrainer;
+use crate::trainer::{LitTrainer, TrainerRunConfig};
 
 /// Training command arguments
 #[derive(Args, Debug)]
@@ -145,7 +145,7 @@ fn clear_checkpoint_directory(checkpoint_dir: &str) -> Result<usize> {
 fn get_cuda_memory_info<R: Runtime>(_device: &R::Device) -> Result<String> {
     // Just query all GPUs - simpler and more reliable
     let output = std::process::Command::new("nvidia-smi")
-        .args(&[
+        .args([
             "--query-gpu=memory.total,memory.used,memory.free",
             "--format=csv,noheader,nounits",
         ])
@@ -238,14 +238,14 @@ where
 /// Run the training command
 pub fn run_train(args: TrainArgs) -> Result<()> {
     let config = LitConfig::from_yaml(&args.config_file)?;
-    let use_cpu = args
-        .target_device
-        .as_deref()
-        .map(|dev| dev.eq_ignore_ascii_case("cpu"))
-        .unwrap_or(config.trainer.target_device == crate::config::TargetDevice::Cpu);
 
     #[cfg(feature = "cuda")]
     {
+        let use_cpu = args
+            .target_device
+            .as_deref()
+            .map(|dev| dev.eq_ignore_ascii_case("cpu"))
+            .unwrap_or(config.trainer.target_device == crate::config::TargetDevice::Cpu);
         if !use_cpu {
             return run_train_with_runtime::<boostr::CudaRuntime>(args, config);
         }
@@ -627,7 +627,7 @@ where
 
     // For step calculation, we need total tokens per step
     let tokens_per_step = batch_size * seq_len * config_trainer.gradient_accumulation;
-    let steps_per_epoch = (dataset_size + tokens_per_step - 1) / tokens_per_step;
+    let steps_per_epoch = dataset_size.div_ceil(tokens_per_step);
     let total_steps = steps_per_epoch * config_trainer.num_epochs;
 
     // Effective batch size is the number of samples per optimizer step
@@ -659,14 +659,16 @@ where
         parameter_names,
         client.clone(),
         device.clone(),
-        dataset_size,
-        batch_size,
-        seq_len,
-        steps_json_path.clone(),
-        headless,
-        start_step,
-        config.model.clone(),
-        args.data_file.clone(),
+        TrainerRunConfig {
+            dataset_size,
+            batch_size,
+            seq_len,
+            steps_json_path: steps_json_path.clone(),
+            headless,
+            start_step,
+            model_config: config.model.clone(),
+            data_file_path: args.data_file.clone(),
+        },
     )?;
 
     if !headless {
@@ -706,7 +708,7 @@ where
         );
         println!("  Dataset: {} tokens", dataset_size);
         println!("  Checkpoint Dir: {}", config_trainer.checkpoint_dir);
-        println!("");
+        println!();
         println!("  Max Seq Length: {}", config.model.max_seq_len);
         if let Some(num_experts) = config.model.num_experts {
             println!(
@@ -722,7 +724,7 @@ where
         );
         println!("  Learning Rate: {:.6}", config_trainer.learning_rate);
         println!("  Epochs: {}", config_trainer.num_epochs);
-        println!("");
+        println!();
 
         println!("📊 Training Plan:");
         println!(
@@ -744,12 +746,12 @@ where
             "  Total batch size ({} x {}) = {}",
             batch_size, config_trainer.gradient_accumulation, actual_batch
         );
-        println!("");
+        println!();
 
         println!("============================================================");
         println!("🚀 STARTING TRAINING");
         println!("============================================================");
-        println!("");
+        println!();
         println!("Training in progress... (progress bar should appear below)");
         println!("If no progress bar appears, use --headless for text output.\n");
     }
@@ -840,7 +842,7 @@ where
                     println!("  2. Reduce seq_len (currently {})", seq_len);
                     println!("  3. Reduce model size (hidden_size, num_layers, or num_experts)");
                     println!("  4. Use --dtype bf16 or --dtype f16 for lower memory usage");
-                    println!("");
+                    println!();
                 }
                 Err(anyhow::anyhow!("CUDA out of memory"))
             } else {

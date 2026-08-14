@@ -243,8 +243,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_sync_backend_parsing() {
         use super::super::sync::SyncBackend;

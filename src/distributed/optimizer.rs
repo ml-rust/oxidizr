@@ -137,15 +137,6 @@ where
     }
 }
 
-/// Compute or clip gradient norm by delegating to boostr's gradient utility.
-pub fn compute_grad_norm<R, C>(client: &C, grads: &mut GradStore<R>, max_norm: f64) -> Result<f64>
-where
-    R: Runtime<DType = DType>,
-    C: RuntimeClient<R> + TensorOps<R> + ScalarOps<R>,
-{
-    boostr::optimizer::clip_grad_norm(client, grads, max_norm)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

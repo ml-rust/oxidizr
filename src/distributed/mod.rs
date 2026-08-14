@@ -31,7 +31,7 @@ pub mod nccl;
 
 // Re-exports for convenience
 pub use cpu_staging::{CpuStagingSynchronizer, RuntimeDeviceFromOrdinal};
-pub use optimizer::{compute_grad_norm, AdamWConfig, DistributedAdamW};
+pub use optimizer::{AdamWConfig, DistributedAdamW};
 pub use sync::{DistributedConfig, GradientSynchronizer, SyncBackend};
 
 #[cfg(feature = "nccl")]

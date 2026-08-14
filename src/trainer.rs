@@ -15,6 +15,23 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
+/// Run-specific metadata needed to construct a `LitTrainer`.
+///
+/// Bundled into a single struct (rather than passed as separate
+/// `LitTrainer::new` arguments) so the constructor's signature stays under
+/// clippy's argument-count lint; the fields themselves are unrelated to each
+/// other beyond all describing "this particular training run".
+pub struct TrainerRunConfig {
+    pub dataset_size: usize,
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub steps_json_path: String,
+    pub headless: bool,
+    pub start_step: usize,
+    pub model_config: ModelConfig,
+    pub data_file_path: Option<String>,
+}
+
 /// The "LitGPT" style Trainer abstraction.
 /// It owns the loop state, the optimizer, and handles the "boring" stuff.
 pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
@@ -74,15 +91,19 @@ where
         parameter_names: Vec<(String, TensorId)>,
         client: R::Client,
         device: R::Device,
-        dataset_size: usize,
-        batch_size: usize,
-        seq_len: usize,
-        steps_json_path: String,
-        headless: bool,
-        start_step: usize,
-        model_config: ModelConfig,
-        data_file_path: Option<String>,
+        run: TrainerRunConfig,
     ) -> Result<Self> {
+        let TrainerRunConfig {
+            dataset_size,
+            batch_size,
+            seq_len,
+            steps_json_path,
+            headless,
+            start_step,
+            model_config,
+            data_file_path,
+        } = run;
+
         // Init FusedAdamW with configurable SOTA parameters (from optimization.md)
         // - beta2 = 0.95: Lower β₂ stabilizes MoE sparse expert updates
         // - eps = 1e-6: Higher ε for BF16 numerical safety
@@ -97,7 +118,7 @@ where
 
         // Calculate total steps from dataset
         let effective_batch_size = batch_size * seq_len * config.gradient_accumulation;
-        let steps_per_epoch = (dataset_size + effective_batch_size - 1) / effective_batch_size; // Ceiling division
+        let steps_per_epoch = dataset_size.div_ceil(effective_batch_size); // Ceiling division
         let total_steps = steps_per_epoch * config.num_epochs;
 
         // Initialize distributed training components if enabled
@@ -229,7 +250,7 @@ where
                     {
                         let size_info = if let Some(start) = panic_msg.find("size:") {
                             let size_str = &panic_msg[start + 5..];
-                            if let Some(size) = size_str.trim().split_whitespace().next() {
+                            if let Some(size) = size_str.split_whitespace().next() {
                                 if let Ok(bytes) = size.parse::<u64>() {
                                     format!(" ({:.1} MB)", bytes as f64 / 1_000_000.0)
                                 } else {
@@ -417,7 +438,7 @@ where
                     // Extract the requested size if present
                     let size_info = if let Some(start) = panic_msg.find("size:") {
                         let size_str = &panic_msg[start + 5..];
-                        if let Some(size) = size_str.trim().split_whitespace().next() {
+                        if let Some(size) = size_str.split_whitespace().next() {
                             if let Ok(bytes) = size.parse::<u64>() {
                                 format!(" ({:.1} MB)", bytes as f64 / 1_000_000.0)
                             } else {
@@ -640,7 +661,7 @@ where
         data_loader: &mut D,
     ) -> Result<()> {
         let tokens_per_step = self.batch_size * self.seq_len * self.config.gradient_accumulation;
-        let steps_per_epoch = (self.dataset_size + tokens_per_step - 1) / tokens_per_step;
+        let steps_per_epoch = self.dataset_size.div_ceil(tokens_per_step);
         let training_start = Instant::now();
 
         // max_steps=0 means unlimited (train for full epochs)
@@ -686,7 +707,7 @@ where
 
                 // Get VRAM usage via nvidia-smi
                 let vram = std::process::Command::new("nvidia-smi")
-                    .args(&[
+                    .args([
                         "--query-compute-apps=used_memory",
                         "--format=csv,noheader,nounits",
                     ])
@@ -721,7 +742,7 @@ where
         data_loader: &mut D,
     ) -> Result<()> {
         let tokens_per_step = self.batch_size * self.seq_len * self.config.gradient_accumulation;
-        let steps_per_epoch = (self.dataset_size + tokens_per_step - 1) / tokens_per_step;
+        let steps_per_epoch = self.dataset_size.div_ceil(tokens_per_step);
 
         // Respect max_steps limit (0 = unlimited, train for full epochs)
         let effective_steps = if self.config.max_steps == 0 {
@@ -786,21 +807,20 @@ where
                     {
                         mp.println(format!("   🔥 CUDA Error: {}", err_msg)).ok();
                         mp.println(
-                            "   💡 Try: reduce batch_size, seq_len, or use gradient accumulation"
-                                .to_string(),
+                            "   💡 Try: reduce batch_size, seq_len, or use gradient accumulation",
                         )
                         .ok();
                     } else if err_msg.contains("NaN") || err_msg.contains("nan") {
                         mp.println(format!("   🔥 Numerical Error: {}", err_msg))
                             .ok();
-                        mp.println("   💡 Try: lower learning rate or check data".to_string())
+                        mp.println("   💡 Try: lower learning rate or check data")
                             .ok();
                     } else {
                         mp.println(format!("   🔥 Error: {}", err_msg)).ok();
                     }
 
                     // Force exit - CUDA cleanup can hang
-                    mp.println("".to_string()).ok();
+                    mp.println("").ok();
                     std::process::exit(1);
                 }
             };

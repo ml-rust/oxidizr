@@ -136,7 +136,7 @@ pub enum DTypePrecision {
 }
 
 impl DTypePrecision {
-    pub fn to_dtype(&self) -> crate::prelude::DType {
+    pub fn to_dtype(self) -> crate::prelude::DType {
         match self {
             DTypePrecision::F32 => crate::prelude::DType::F32,
             DTypePrecision::F16 => crate::prelude::DType::F16,
@@ -346,7 +346,7 @@ impl LitConfig {
             .model
             .mamba_layers
             .as_ref()
-            .map_or(false, |v| !v.is_empty());
+            .is_some_and(|v| !v.is_empty());
         let has_mamba2_config = self.model.mamba2_num_heads.is_some();
         if has_mamba_layers && !has_mamba2_config {
             eprintln!(

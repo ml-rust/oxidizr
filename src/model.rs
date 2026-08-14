@@ -1,10 +1,16 @@
-use crate::prelude::{DType, Device, Embedding, Init, Linear, Result, RmsNorm, Tensor, VarBuilder};
+use crate::prelude::{DType, Embedding, Init, Linear, Result, RmsNorm, Tensor, VarBuilder};
 
 use crate::config::ModelConfig;
 use boostr::tensor::TensorId;
 // `cast` is a TypeConversionOps method; the trait must be in scope to call it.
 use boostr::TypeConversionOps;
 use std::collections::HashMap;
+
+/// A weight tensor paired with the stable parameter id it was registered
+/// under. Used throughout the `*_weights_with_ids`/`with_ids` rebuild path
+/// so a checkpoint's tensors can be re-associated with boostr's `TensorId`
+/// keys without re-running initialization.
+type WeightWithId<R> = (Tensor<R>, boostr::autograd::TensorId);
 
 /// Take a tensor from the VarBuilder, or initialize it when absent.
 ///
@@ -30,24 +36,6 @@ where
         + boostr::TensorOps<R>,
 {
     vb.take_or_init_tensor(name, shape, dtype, init, client)
-}
-
-fn first_dim(shape: &[usize], init_name: &str) -> Result<usize> {
-    shape
-        .first()
-        .copied()
-        .ok_or_else(|| boostr::error::Error::ModelError {
-            reason: format!("{init_name} initialization requires a non-empty shape"),
-        })
-}
-
-fn element_count(shape: &[usize], context: &str) -> Result<usize> {
-    if shape.is_empty() {
-        return Err(boostr::error::Error::ModelError {
-            reason: format!("{context} requires a non-empty shape"),
-        });
-    }
-    Ok(shape.iter().product())
 }
 
 // --- Rotary Positional Embeddings (RoPE) ---
@@ -423,7 +411,7 @@ where
                 reason: "MLA num_heads must be non-zero".into(),
             });
         }
-        if cfg.hidden_size % cfg.num_heads != 0 {
+        if !cfg.hidden_size.is_multiple_of(cfg.num_heads) {
             return Err(boostr::error::Error::ModelError {
                 reason: format!(
                     "MLA hidden_size ({}) must be divisible by num_heads ({})",
@@ -668,7 +656,7 @@ where
                 reason: "attention num_heads must be non-zero".into(),
             });
         }
-        if cfg.hidden_size % cfg.num_heads != 0 {
+        if !cfg.hidden_size.is_multiple_of(cfg.num_heads) {
             return Err(boostr::error::Error::ModelError {
                 reason: format!(
                     "hidden_size ({}) must be divisible by num_heads ({})",
@@ -685,7 +673,7 @@ where
                 reason: "attention num_key_value_heads must be non-zero".into(),
             });
         }
-        if num_heads % num_kv_heads != 0 {
+        if !num_heads.is_multiple_of(num_kv_heads) {
             return Err(boostr::error::Error::ModelError {
                 reason: format!(
                     "num_heads ({num_heads}) must be divisible by num_key_value_heads ({num_kv_heads})"
@@ -1061,29 +1049,6 @@ where
         })
     }
 
-    fn forward<C>(
-        &self,
-        client: &C,
-        x: &boostr::autograd::Var<R>,
-    ) -> Result<boostr::autograd::Var<R>>
-    where
-        C: boostr::RuntimeClient<R>
-            + boostr::TensorOps<R>
-            + boostr::ScalarOps<R>
-            + boostr::ReduceOps<R>
-            + boostr::ShapeOps<R>
-            + boostr::ActivationOps<R>,
-        R::Client: boostr::TensorOps<R> + boostr::ActivationOps<R> + boostr::ScalarOps<R>,
-    {
-        self.expert.forward(client, x)
-    }
-
-    fn trainable_parameters(&self) -> Vec<(boostr::autograd::TensorId, &boostr::autograd::Var<R>)> {
-        let mut params = Vec::new();
-        Self::extend_trainable_parameters(&mut params, &self.expert);
-        params
-    }
-
     fn into_inner(self) -> boostr::nn::moe::expert::Expert<R> {
         self.expert
     }
@@ -1205,29 +1170,6 @@ where
         Ok(Self {
             router: boostr::nn::moe::router::MoeRouter::new(gate, config),
         })
-    }
-
-    fn route<C>(
-        &self,
-        client: &C,
-        x: &boostr::autograd::Var<R>,
-    ) -> Result<boostr::nn::moe::router::RouterOutput<R>>
-    where
-        C: boostr::RuntimeClient<R>
-            + boostr::TensorOps<R>
-            + boostr::ScalarOps<R>
-            + boostr::ReduceOps<R>
-            + boostr::ShapeOps<R>
-            + boostr::ActivationOps<R>
-            + boostr::SortingOps<R>
-            + boostr::IndexingOps<R>,
-        R::Client: boostr::TensorOps<R> + boostr::ReduceOps<R> + boostr::ScalarOps<R>,
-    {
-        self.router.route(client, x)
-    }
-
-    fn trainable_parameters(&self) -> Vec<(boostr::autograd::TensorId, &boostr::autograd::Var<R>)> {
-        self.router.gate().trainable_parameters()
     }
 
     fn into_inner(self) -> boostr::nn::moe::router::MoeRouter<R> {
@@ -1462,9 +1404,11 @@ where
 // --- Feed-Forward Network Layer (MLP or MoE) ---
 // Supports both simple MLP and Mixture of Experts based on config
 
+// Both payloads are large (hundreds of bytes of projections), so both are boxed:
+// an unboxed variant would make every Block pay that variant's full size.
 enum FfnLayer<R: boostr::Runtime> {
-    Mlp(Mlp<R>),
-    Moe(MoeLayer<R>),
+    Mlp(Box<Mlp<R>>),
+    Moe(Box<MoeLayer<R>>),
 }
 
 impl<R> FfnLayer<R>
@@ -1482,10 +1426,12 @@ where
     {
         if cfg.num_experts.is_some() {
             // MoE mode
-            Ok(FfnLayer::Moe(MoeLayer::new(cfg, vb, client, dtype)?))
+            Ok(FfnLayer::Moe(Box::new(MoeLayer::new(
+                cfg, vb, client, dtype,
+            )?)))
         } else {
             // Simple MLP mode (no MoE)
-            Ok(FfnLayer::Mlp(Mlp::new(cfg, vb, client, dtype)?))
+            Ok(FfnLayer::Mlp(Box::new(Mlp::new(cfg, vb, client, dtype)?)))
         }
     }
 
@@ -1517,21 +1463,21 @@ where
                     reason: "FfnLayer::with_ids requires MoE weights when cfg.num_experts is set"
                         .into(),
                 })?;
-            Ok(FfnLayer::Moe(MoeLayer::with_ids(
+            Ok(FfnLayer::Moe(Box::new(MoeLayer::with_ids(
                 cfg,
                 experts,
                 shared_expert,
                 router_gate,
-            )?))
+            )?)))
         } else {
             let (gate_proj, up_proj, down_proj) =
                 mlp.ok_or_else(|| boostr::error::Error::ModelError {
                     reason: "FfnLayer::with_ids requires MLP weights when cfg.num_experts is unset"
                         .into(),
                 })?;
-            Ok(FfnLayer::Mlp(Mlp::with_ids(
+            Ok(FfnLayer::Mlp(Box::new(Mlp::with_ids(
                 cfg, gate_proj, up_proj, down_proj,
-            )?))
+            )?)))
         }
     }
 
@@ -1612,12 +1558,14 @@ pub struct BlockOutput<R: boostr::Runtime> {
 const MAMBA_PRENORM_EPS: f32 = 1e-6;
 
 enum BlockType<R: boostr::Runtime> {
+    // The SSM blocks are far larger than the attention variants; boxing them
+    // keeps every Block from paying the largest variant's footprint.
     Mamba {
-        block: boostr::model::Mamba1<R>,
+        block: Box<boostr::model::Mamba1<R>>,
         norm: RmsNorm<R>,
     },
     Mamba2 {
-        block: boostr::model::Mamba2<R>,
+        block: Box<boostr::model::Mamba2<R>>,
         /// Pre-norm on the block input.
         ///
         /// boostr's `Mamba2` is the mixer alone — its internal norm operates on
@@ -1627,19 +1575,19 @@ enum BlockType<R: boostr::Runtime> {
         norm: RmsNorm<R>,
     },
     Mamba3 {
-        block: boostr::model::Mamba3<R>,
+        block: Box<boostr::model::Mamba3<R>>,
         /// Pre-norm on the block input. Mamba3 uses LayerNorm, not RmsNorm.
         norm: boostr::nn::LayerNorm<R>,
     },
     Attention {
-        attn: MultiHeadLatentAttention<R>,
+        attn: Box<MultiHeadLatentAttention<R>>,
         ffn: FfnLayer<R>, // MLP or MoE based on config
         input_layernorm: RmsNorm<R>,
         post_attention_layernorm: RmsNorm<R>,
     },
     LegacyAttention {
-        attn: CausalSelfAttention<R>,
-        mlp: Mlp<R>,
+        attn: Box<CausalSelfAttention<R>>,
+        mlp: Box<Mlp<R>>,
         input_layernorm: RmsNorm<R>,
         post_attention_layernorm: RmsNorm<R>,
     },
@@ -1699,13 +1647,13 @@ where
             )?;
             let mut mamba3_vb = vb.pp("mamba3");
             BlockType::Mamba3 {
-                block: boostr::model::Mamba3::init(
+                block: Box::new(boostr::model::Mamba3::init(
                     &mamba3_config,
                     &mut mamba3_vb,
                     dtype,
                     client,
                     true,
-                )?,
+                )?),
                 norm,
             }
         } else if is_mamba && use_mamba2 {
@@ -1720,13 +1668,13 @@ where
             )?;
             let mut mamba2_vb = vb.pp("mamba2");
             BlockType::Mamba2 {
-                block: boostr::model::Mamba2::init(
+                block: Box::new(boostr::model::Mamba2::init(
                     &mamba2_config,
                     &mut mamba2_vb,
                     dtype,
                     client,
                     true,
-                )?,
+                )?),
                 norm,
             }
         } else if is_mamba {
@@ -1734,13 +1682,13 @@ where
             let mamba1_config = Self::mamba1_config(cfg)?;
             let mut mamba1_vb = vb.pp("mamba");
             BlockType::Mamba {
-                block: boostr::model::Mamba1::init(
+                block: Box::new(boostr::model::Mamba1::init(
                     &mamba1_config,
                     &mut mamba1_vb,
                     dtype,
                     client,
                     true,
-                )?,
+                )?),
                 norm: Self::take_rms_norm(vb.pp("norm"), cfg.hidden_size, eps, dtype, client)?,
             }
         } else if use_mla {
@@ -1751,7 +1699,12 @@ where
                 "mlp"
             };
             BlockType::Attention {
-                attn: MultiHeadLatentAttention::new(cfg, vb.pp("self_attn"), client, dtype)?,
+                attn: Box::new(MultiHeadLatentAttention::new(
+                    cfg,
+                    vb.pp("self_attn"),
+                    client,
+                    dtype,
+                )?),
                 ffn: FfnLayer::new(cfg, vb.pp(ffn_prefix), client, dtype)?,
                 input_layernorm: Self::take_rms_norm(
                     vb.pp("input_layernorm"),
@@ -1771,8 +1724,13 @@ where
         } else {
             // Legacy GQA + MLP attention layer (original nano)
             BlockType::LegacyAttention {
-                attn: CausalSelfAttention::new(cfg, vb.pp("self_attn"), client, dtype)?,
-                mlp: Mlp::new(cfg, vb.pp("mlp"), client, dtype)?,
+                attn: Box::new(CausalSelfAttention::new(
+                    cfg,
+                    vb.pp("self_attn"),
+                    client,
+                    dtype,
+                )?),
+                mlp: Box::new(Mlp::new(cfg, vb.pp("mlp"), client, dtype)?),
                 input_layernorm: Self::take_rms_norm(
                     vb.pp("input_layernorm"),
                     cfg.hidden_size,
@@ -1882,7 +1840,11 @@ where
                             .into(),
                 })?;
             BlockType::Mamba3 {
-                block: boostr::model::Mamba3::with_ids(Self::mamba3_config(cfg)?, weights, true),
+                block: Box::new(boostr::model::Mamba3::with_ids(
+                    Self::mamba3_config(cfg)?,
+                    weights,
+                    true,
+                )),
                 norm: Self::layer_norm_with_ids(
                     "norm",
                     norm_weight,
@@ -1897,7 +1859,11 @@ where
                     .into(),
             })?;
             BlockType::Mamba2 {
-                block: boostr::model::Mamba2::with_ids(Self::mamba2_config(cfg)?, weights, true),
+                block: Box::new(boostr::model::Mamba2::with_ids(
+                    Self::mamba2_config(cfg)?,
+                    weights,
+                    true,
+                )),
                 norm: Self::rms_norm_with_id(
                     "norm.weight",
                     norm.0,
@@ -1912,7 +1878,11 @@ where
                     .into(),
             })?;
             BlockType::Mamba {
-                block: boostr::model::Mamba1::with_ids(Self::mamba1_config(cfg)?, weights, true),
+                block: Box::new(boostr::model::Mamba1::with_ids(
+                    Self::mamba1_config(cfg)?,
+                    weights,
+                    true,
+                )),
                 norm: Self::rms_norm_with_id("norm.weight", norm.0, norm.1, cfg.hidden_size, eps)?,
             }
         } else if use_mla {
@@ -1934,7 +1904,7 @@ where
             })?;
 
             BlockType::Attention {
-                attn: MultiHeadLatentAttention::with_ids(
+                attn: Box::new(MultiHeadLatentAttention::with_ids(
                     cfg,
                     q_a_proj,
                     q_b_proj,
@@ -1944,7 +1914,7 @@ where
                     kv_b_proj,
                     o_proj,
                     device,
-                )?,
+                )?),
                 ffn: FfnLayer::with_ids(cfg, mlp, moe)?,
                 input_layernorm: Self::rms_norm_with_id(
                     "input_layernorm.weight",
@@ -1980,10 +1950,10 @@ where
             })?;
 
             BlockType::LegacyAttention {
-                attn: CausalSelfAttention::with_ids(
+                attn: Box::new(CausalSelfAttention::with_ids(
                     cfg, q_proj, k_proj, v_proj, o_proj, rope_cos, rope_sin,
-                )?,
-                mlp: Mlp::with_ids(cfg, gate_proj, up_proj, down_proj)?,
+                )?),
+                mlp: Box::new(Mlp::with_ids(cfg, gate_proj, up_proj, down_proj)?),
                 input_layernorm: Self::rms_norm_with_id(
                     "input_layernorm.weight",
                     input_layernorm.0,
@@ -2416,6 +2386,16 @@ pub struct LitGPT<R: boostr::Runtime> {
     compute_dtype: DType,
 }
 
+/// Conv1d hyperparameters needed to rebuild a `Conv1d` from named tensors.
+/// Grouped so `conv1d_from_named` doesn't need to take them as four separate
+/// arguments.
+struct Conv1dHyperParams {
+    stride: usize,
+    padding: boostr::PaddingMode,
+    dilation: usize,
+    groups: usize,
+}
+
 impl<R> LitGPT<R>
 where
     R: boostr::Runtime<DType = DType>,
@@ -2479,7 +2459,7 @@ where
         )
     }
 
-    pub fn with_ids(
+    fn with_ids(
         cfg: &ModelConfig,
         embed_tokens: (Tensor<R>, boostr::autograd::TensorId),
         layers: Vec<Block<R>>,
@@ -2819,10 +2799,7 @@ where
                 params,
                 "conv1d.weight",
                 "conv1d.bias",
-                1,
-                boostr::PaddingMode::Custom(config.d_conv - 1, 0, 0, 0),
-                1,
-                config.conv_channels(),
+                Self::conv1d_hyperparams_for(config.d_conv, config.conv_channels()),
             )?,
             x_proj: Self::linear_from_named(&named, params, "x_proj.weight", "x_proj.bias")?,
             dt_proj: Self::linear_from_named(&named, params, "dt_proj.weight", "dt_proj.bias")?,
@@ -2856,10 +2833,7 @@ where
                 params,
                 "conv1d.weight",
                 "conv1d.bias",
-                1,
-                boostr::PaddingMode::Custom(config.d_conv - 1, 0, 0, 0),
-                1,
-                config.conv_channels(),
+                Self::conv1d_hyperparams_for(config.d_conv, config.conv_channels()),
             )?,
             out_proj: Self::linear_from_named(&named, params, "out_proj.weight", "out_proj.bias")?,
             a_log: Self::pair_from_named(&named, params, "a_log")?,
@@ -2875,14 +2849,9 @@ where
     ) -> Result<boostr::model::mamba::Mamba3WeightsWithIds<R>> {
         let named = <boostr::model::Mamba3<R> as boostr::nn::Module<R>>::named_parameters(block);
         let config = block.config();
-        let theta_proj = if config.use_complex_rope {
-            Some(Self::linear_from_named(
-                &named,
-                params,
-                "theta_proj.weight",
-                "theta_proj.bias",
-            )?)
-        } else if Self::optional_named_var(&named, "theta_proj.weight").is_some() {
+        let theta_proj = if config.use_complex_rope
+            || Self::optional_named_var(&named, "theta_proj.weight").is_some()
+        {
             Some(Self::linear_from_named(
                 &named,
                 params,
@@ -2898,10 +2867,7 @@ where
                 params,
                 "conv1d.weight",
                 "conv1d.bias",
-                1,
-                boostr::PaddingMode::Custom(config.d_conv - 1, 0, 0, 0),
-                1,
-                config.conv_channels(),
+                Self::conv1d_hyperparams_for(config.d_conv, config.conv_channels()),
             )?)
         } else {
             None
@@ -2961,11 +2927,7 @@ where
     fn mlp_weights_with_ids(
         mlp: &Mlp<R>,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
-    ) -> Result<(
-        (Tensor<R>, boostr::autograd::TensorId),
-        (Tensor<R>, boostr::autograd::TensorId),
-        (Tensor<R>, boostr::autograd::TensorId),
-    )> {
+    ) -> Result<(WeightWithId<R>, WeightWithId<R>, WeightWithId<R>)> {
         Ok((
             Self::tensor_with_stable_id(mlp.gate_proj.weight(), params)?,
             Self::tensor_with_stable_id(mlp.up_proj.weight(), params)?,
@@ -3013,6 +2975,15 @@ where
         Ok((experts, shared_expert, router_gate))
     }
 
+    fn conv1d_hyperparams_for(config_d_conv: usize, conv_channels: usize) -> Conv1dHyperParams {
+        Conv1dHyperParams {
+            stride: 1,
+            padding: boostr::PaddingMode::Custom(config_d_conv - 1, 0, 0, 0),
+            dilation: 1,
+            groups: conv_channels,
+        }
+    }
+
     fn linear_from_named(
         named: &[(String, &boostr::autograd::Var<R>)],
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
@@ -3029,15 +3000,19 @@ where
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
         weight_name: &str,
         bias_name: &str,
-        stride: usize,
-        padding: boostr::PaddingMode,
-        dilation: usize,
-        groups: usize,
+        conv: Conv1dHyperParams,
     ) -> Result<boostr::nn::Conv1d<R>> {
         let weight = Self::pair_from_named(named, params, weight_name)?;
         let bias = Self::optional_pair_from_named(named, params, bias_name)?;
         Ok(boostr::nn::Conv1d::with_ids(
-            weight.0, weight.1, bias, stride, padding, dilation, groups, true,
+            weight.0,
+            weight.1,
+            bias,
+            conv.stride,
+            conv.padding,
+            conv.dilation,
+            conv.groups,
+            true,
         ))
     }
 

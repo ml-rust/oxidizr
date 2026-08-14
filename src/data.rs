@@ -357,7 +357,7 @@ struct PrefetchedBatch {
 ///     // GPU training on inputs/targets while next batch is being loaded
 /// }
 ///
-/// prefetch_loader.shutdown(); // Clean up background thread
+/// // Background thread is joined automatically when `prefetch_loader` is dropped.
 /// ```
 #[allow(dead_code)]
 pub struct PrefetchDataLoader<R>
@@ -504,20 +504,6 @@ where
         Ok((inputs, targets))
     }
 
-    /// Gracefully shutdown the prefetch thread
-    ///
-    /// Call this when training is complete to clean up resources.
-    pub fn shutdown(&mut self) {
-        self.stop_signal.store(true, Ordering::Relaxed);
-
-        // Take ownership of the thread handle and join
-        if let Some(handle) = self.prefetch_thread.take() {
-            // Drop the receiver first to unblock the sender
-            // (handled automatically when self is dropped)
-            let _ = handle.join();
-        }
-    }
-
     /// Get batch size
     #[allow(dead_code)]
     pub fn batch_size(&self) -> usize {
@@ -555,7 +541,14 @@ where
     R: Runtime<DType = DType>,
 {
     fn drop(&mut self) {
-        self.shutdown();
+        self.stop_signal.store(true, Ordering::Relaxed);
+
+        // Take ownership of the thread handle and join
+        if let Some(handle) = self.prefetch_thread.take() {
+            // Drop the receiver first to unblock the sender
+            // (handled automatically when self is dropped)
+            let _ = handle.join();
+        }
     }
 }
 
