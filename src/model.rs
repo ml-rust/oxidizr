@@ -3471,14 +3471,33 @@ where
         + boostr::BinaryOps<R>
         + boostr::CompareOps<R>
         + boostr::TensorOps<R>
-        + boostr::TypeConversionOps<R>,
+        + boostr::TypeConversionOps<R>
+        + boostr::ReduceOps<R>
+        + boostr::ShapeOps<R>,
 {
     let cfg = model.cfg.clone();
     let device = model.embed_tokens.weight().tensor().device().clone();
     let client = R::default_client(&device);
 
     let mut safetensors = boostr::format::SafeTensors::open(path)?;
-    let loaded = safetensors.load_all::<R>(&device)?;
+    let mut loaded = safetensors.load_all::<R>(&device)?;
+
+    // Grow embed_tokens/lm_head row counts before they enter the VarMap: once
+    // wrapped in a trainable `Var` by `LitGPT::new`, the pretrained and grown
+    // rows must already be one contiguous tensor, since
+    // `VarBuilder::take_or_init_tensor` hard-errors on a shape mismatch.
+    for name in ["embed_tokens.weight", "lm_head.weight"] {
+        if let Some(weight) = loaded.get(name) {
+            let grown = crate::vocab::fit_vocab_rows(
+                &client,
+                weight,
+                cfg.vocab_size,
+                cfg.grow_vocab,
+                name,
+            )?;
+            loaded.insert(name.to_string(), grown);
+        }
+    }
 
     let mut missing = model
         .named_trainable_parameters()

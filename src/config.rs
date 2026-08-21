@@ -102,6 +102,12 @@ pub struct ModelConfig {
     pub mamba3_use_conv: Option<bool>, // Optional conv (default: false, trapezoidal replaces it)
 
     pub vocab_size: usize,
+    /// Grow a smaller checkpoint's `embed_tokens` / `lm_head` tables to
+    /// `vocab_size` on load, mean-initializing the added rows. Off by default:
+    /// without it, a row-count shortfall is a hard error rather than a silent
+    /// reinterpretation of the checkpoint.
+    #[serde(default)]
+    pub grow_vocab: bool,
     /// Tokenizer vocabulary name (cl100k_base, o200k_base, llama3, deepseek_v3, custom)
     /// REQUIRED: Must match the vocabulary used to tokenize your training data
     /// Use "custom" if you have a custom tokenizer not listed above
@@ -400,6 +406,7 @@ impl LitConfig {
                 mamba3_mimo_rank: None,
                 mamba3_use_conv: None,
                 vocab_size: 128354, // Llama 3 + splintr agent tokens
+                grow_vocab: false,
                 tokenizer_vocab: "llama3".to_string(),
                 max_seq_len: 512,
                 rope_theta: 10000.0,
@@ -479,6 +486,7 @@ impl LitConfig {
                 mamba3_use_conv: None,
 
                 vocab_size: 128354, // Llama 3 + splintr agent tokens
+                grow_vocab: false,
                 tokenizer_vocab: "llama3".to_string(),
                 max_seq_len: 512, // Can handle longer context with MLA
                 rope_theta: 10000.0,

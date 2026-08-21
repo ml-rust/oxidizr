@@ -5,6 +5,7 @@ mod distributed;
 mod model;
 mod prelude;
 mod trainer;
+mod vocab;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
