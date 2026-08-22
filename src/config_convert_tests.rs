@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::LitConfig;
+use crate::config::{LitConfig, RopeScalingSpec};
 
 fn dense_baseline() -> OxidizrModelConfig {
     LitConfig::nano_baseline().model
@@ -179,4 +179,118 @@ fn tie_word_embeddings_round_trips_both_ways() {
         ..dense_baseline()
     };
     assert!(tied.to_boostr().unwrap().tie_word_embeddings);
+}
+
+fn yarn_scaling() -> RopeScalingSpec {
+    RopeScalingSpec {
+        scaling_type: "yarn".to_string(),
+        factor: 4.0,
+        original_max_position_embeddings: Some(4096),
+        low_freq_factor: None,
+        high_freq_factor: None,
+        attention_factor: Some(1.0),
+        beta_fast: Some(32.0),
+        beta_slow: Some(1.0),
+    }
+}
+
+/// A valid `AttentionOnly` config carries `sliding_window` and
+/// `rope_scaling` straight through onto the resulting `AttentionConfig`.
+#[test]
+fn sliding_window_and_rope_scaling_land_on_attention() {
+    let cfg = OxidizrModelConfig {
+        sliding_window: Some(4096),
+        rope_scaling: Some(yarn_scaling()),
+        ..dense_baseline()
+    };
+    let boostr_cfg = cfg.to_boostr().unwrap();
+    boostr_cfg.validate().unwrap();
+
+    let attn = boostr_cfg.attention.as_ref().unwrap();
+    assert_eq!(attn.sliding_window, Some(4096));
+    let scaling = attn.rope_scaling.as_ref().unwrap();
+    assert_eq!(scaling.scaling_type, "yarn");
+    assert_eq!(scaling.factor, 4.0);
+    assert_eq!(scaling.original_max_position_embeddings, Some(4096));
+    assert_eq!(scaling.attention_factor, Some(1.0));
+    assert_eq!(scaling.beta_fast, Some(32.0));
+    assert_eq!(scaling.beta_slow, Some(1.0));
+}
+
+#[test]
+fn sliding_window_on_hybrid_is_rejected() {
+    let cfg = OxidizrModelConfig {
+        sliding_window: Some(1024),
+        ..hybrid_moe_baseline()
+    };
+    let err = cfg.to_boostr().unwrap_err().to_string();
+    assert!(
+        err.contains("sliding_window"),
+        "error must name sliding_window: {err}"
+    );
+}
+
+#[test]
+fn attention_extras_on_ssm_only_are_rejected() {
+    let base = dense_baseline();
+    let ssm_only = OxidizrModelConfig {
+        mamba_layers: Some((0..base.num_layers).collect()),
+        mamba2_num_heads: Some(64),
+        mamba2_head_dim: Some(16),
+        mamba2_state_size: Some(64),
+        mamba2_chunk_size: Some(64),
+        mamba2_n_groups: Some(1),
+        mamba2_conv_kernel: Some(4),
+        mamba2_expand: Some(2),
+        ..base
+    };
+
+    let with_rope_scaling = OxidizrModelConfig {
+        rope_scaling: Some(yarn_scaling()),
+        ..ssm_only.clone()
+    };
+    let err = with_rope_scaling.to_boostr().unwrap_err().to_string();
+    assert!(
+        err.contains("rope_scaling"),
+        "error must name rope_scaling: {err}"
+    );
+
+    let with_sliding_window = OxidizrModelConfig {
+        sliding_window: Some(1024),
+        ..ssm_only.clone()
+    };
+    let err = with_sliding_window.to_boostr().unwrap_err().to_string();
+    assert!(
+        err.contains("sliding_window"),
+        "error must name sliding_window: {err}"
+    );
+}
+
+#[test]
+fn unsupported_rope_scaling_type_is_rejected() {
+    let cfg = OxidizrModelConfig {
+        rope_scaling: Some(RopeScalingSpec {
+            scaling_type: "dynamic".to_string(),
+            ..yarn_scaling()
+        }),
+        ..dense_baseline()
+    };
+    let err = cfg.to_boostr().unwrap_err().to_string();
+    assert!(
+        err.contains("rope_scaling") && err.contains("dynamic"),
+        "error must name rope_scaling and the offending value: {err}"
+    );
+}
+
+#[test]
+fn zero_sliding_window_is_rejected() {
+    let cfg = OxidizrModelConfig {
+        sliding_window: Some(0),
+        ..dense_baseline()
+    };
+    let err = cfg.to_boostr().unwrap_err().to_string();
+    assert!(
+        err.contains("sliding_window"),
+        "error must name sliding_window: {err}"
+    );
 }

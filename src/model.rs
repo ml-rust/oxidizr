@@ -51,8 +51,15 @@ impl<R> RotaryEmbedding<R>
 where
     R: boostr::Runtime<DType = DType>,
 {
-    fn new(dim: usize, max_seq_len: usize, theta: f32, device: &R::Device) -> Result<Self> {
-        let rope = boostr::nn::RoPE::<R>::precompute_freqs(max_seq_len, dim, theta, None, device);
+    fn new(
+        dim: usize,
+        max_seq_len: usize,
+        theta: f32,
+        scaling: Option<&boostr::model::config::RopeScalingConfig>,
+        device: &R::Device,
+    ) -> Result<Self> {
+        let rope =
+            boostr::nn::RoPE::<R>::precompute_freqs(max_seq_len, dim, theta, scaling, device)?;
         Ok(Self {
             cos: boostr::autograd::Var::<R>::with_id(
                 rope.cos_cache().tensor().clone(),
@@ -480,6 +487,9 @@ struct CausalSelfAttention<R: boostr::Runtime> {
     num_kv_heads: usize,
     head_dim: usize,
     rope: RotaryEmbedding<R>,
+    /// Sliding-window attention span. `0` disables it (boostr's kernel
+    /// sentinel for "no window").
+    sliding_window: usize,
 }
 
 impl<R> CausalSelfAttention<R>
@@ -536,8 +546,13 @@ where
             dtype,
             client,
         )?;
-        let rope =
-            RotaryEmbedding::new(head_dim, cfg.max_seq_len, attn_cfg.rope_theta, vb.device())?;
+        let rope = RotaryEmbedding::new(
+            head_dim,
+            cfg.max_seq_len,
+            attn_cfg.rope_theta,
+            attn_cfg.rope_scaling.as_ref(),
+            vb.device(),
+        )?;
 
         Ok(Self {
             q_proj,
@@ -548,6 +563,7 @@ where
             num_kv_heads: kv_heads,
             head_dim,
             rope,
+            sliding_window: attn_cfg.sliding_window(),
         })
     }
 
@@ -603,6 +619,7 @@ where
             rope: RotaryEmbedding::with_ids(
                 rope_cos.0, rope_cos.1, rope_sin.0, rope_sin.1, head_dim,
             ),
+            sliding_window: attn_cfg.sliding_window(),
         })
     }
 
@@ -654,7 +671,7 @@ where
             self.num_kv_heads,
             self.head_dim,
             true,
-            0,
+            self.sliding_window,
         )?;
 
         // [B, H, Seq, D] -> [B, Seq, H, D] -> [B, Seq, Hidden]
@@ -3702,6 +3719,8 @@ mod tie_word_embeddings_tests {
             tokenizer_vocab: "custom".to_string(),
             max_seq_len: 8,
             rope_theta: 10000.0,
+            rope_scaling: None,
+            sliding_window: None,
             dtype: crate::config::DTypePrecision::F32,
         }
     }
@@ -3784,5 +3803,106 @@ mod tie_word_embeddings_tests {
         // HashMap must see the tied parameter exactly once.
         assert_eq!(map.len(), 2);
         assert!(map.contains_key(&model.embed_tokens.weight().id()));
+    }
+}
+
+/// `sliding_window`/`rope_scaling` on `AttentionConfig` must reach the
+/// dense-attention block's own `var_*`-based construction path (`src/model.rs`),
+/// not just boostr's `Llama` builder that oxidizr does not use.
+#[cfg(test)]
+mod attention_extras_reach_dense_attention_tests {
+    use super::*;
+    use boostr::model::config::{AttentionConfig, RopeScalingConfig};
+    use boostr::{CpuClient, CpuDevice, CpuRuntime};
+
+    fn attn_cfg(
+        sliding_window: Option<usize>,
+        rope_scaling: Option<RopeScalingConfig>,
+    ) -> AttentionConfig {
+        AttentionConfig {
+            num_heads: 2,
+            num_kv_heads: None,
+            head_dim: None,
+            rope_theta: 10000.0,
+            rope_scaling,
+            kv_latent_dim: None,
+            q_latent_dim: None,
+            d_rope: None,
+            sliding_window,
+            use_alibi: false,
+        }
+    }
+
+    fn model_cfg(attention: AttentionConfig) -> ModelConfig {
+        ModelConfig {
+            model_type: "llama".to_string(),
+            vocab_size: 16,
+            hidden_size: 8,
+            num_layers: 1,
+            max_seq_len: 8,
+            intermediate_size: None,
+            rms_norm_eps: default_rms_norm_eps(),
+            attention: Some(attention),
+            ssm: None,
+            moe: None,
+            hybrid_layers: None,
+            tie_word_embeddings: false,
+            grow_vocab: false,
+            vision: None,
+            audio: None,
+        }
+    }
+
+    fn build_attention(attention: AttentionConfig) -> CausalSelfAttention<CpuRuntime> {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let cfg = model_cfg(attention);
+        let mut varmap = boostr::VarMap::<CpuRuntime>::new();
+        let vb = VarBuilder::new(&mut varmap, &device);
+        CausalSelfAttention::<CpuRuntime>::new(&cfg, vb, &client, DType::F32).unwrap()
+    }
+
+    #[test]
+    fn sliding_window_set_reaches_the_attention_block() {
+        let attn = build_attention(attn_cfg(Some(4096), None));
+        assert_eq!(attn.sliding_window, 4096);
+    }
+
+    #[test]
+    fn sliding_window_unset_disables_the_window() {
+        let attn = build_attention(attn_cfg(None, None));
+        assert_eq!(
+            attn.sliding_window, 0,
+            "unset sliding_window must map to boostr's 0 = disabled sentinel"
+        );
+    }
+
+    #[test]
+    fn rope_scaling_changes_the_rotary_cache_versus_unscaled() {
+        let device = CpuDevice::new();
+        let head_dim = 4; // hidden_size(8) / num_heads(2), matching build_attention's cfg
+        let plain =
+            RotaryEmbedding::<CpuRuntime>::new(head_dim, 8, 10000.0, None, &device).unwrap();
+        let scaling = RopeScalingConfig {
+            scaling_type: "linear".to_string(),
+            factor: 4.0,
+            original_max_position_embeddings: None,
+            low_freq_factor: None,
+            high_freq_factor: None,
+            attention_factor: None,
+            beta_fast: None,
+            beta_slow: None,
+        };
+        let scaled =
+            RotaryEmbedding::<CpuRuntime>::new(head_dim, 8, 10000.0, Some(&scaling), &device)
+                .unwrap();
+
+        let plain_cos: Vec<f32> = plain.cos.tensor().to_vec();
+        let scaled_cos: Vec<f32> = scaled.cos.tensor().to_vec();
+        assert_ne!(
+            plain_cos, scaled_cos,
+            "rope_scaling must change the precomputed cos cache reaching \
+             oxidizr's own attention block, not just boostr's unused Llama builder"
+        );
     }
 }

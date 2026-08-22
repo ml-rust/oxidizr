@@ -118,11 +118,40 @@ pub struct OxidizrModelConfig {
     pub tokenizer_vocab: String,
     pub max_seq_len: usize,
     pub rope_theta: f32,
+    /// RoPE frequency scaling (linear / llama3 / yarn). Only honored on the
+    /// dense-attention and hybrid model paths; see `RopeScalingSpec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_scaling: Option<RopeScalingSpec>,
+    /// Sliding-window attention span (Mistral-style). Only honored on the
+    /// dense-attention path; boostr's hybrid path never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sliding_window: Option<usize>,
 
     /// Model precision (f32/f16/bf16) - default F32
     /// Mixed precision: SSM (Mamba/Mamba2) and RMSNorm always use F32 internally
     #[serde(default)]
     pub dtype: DTypePrecision,
+}
+
+/// RoPE scaling parameters, mirroring `boostr::model::config::RopeScalingConfig`
+/// field-for-field so an HF `rope_scaling` block pastes in unchanged.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RopeScalingSpec {
+    #[serde(rename = "type")]
+    pub scaling_type: String,
+    pub factor: f32,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub low_freq_factor: Option<f32>,
+    #[serde(default)]
+    pub high_freq_factor: Option<f32>,
+    #[serde(default)]
+    pub attention_factor: Option<f32>,
+    #[serde(default)]
+    pub beta_fast: Option<f32>,
+    #[serde(default)]
+    pub beta_slow: Option<f32>,
 }
 
 /// Target device for training/inference
@@ -422,6 +451,8 @@ impl LitConfig {
                 tokenizer_vocab: "llama3".to_string(),
                 max_seq_len: 512,
                 rope_theta: 10000.0,
+                rope_scaling: None,
+                sliding_window: None,
                 dtype: DTypePrecision::F32,
             },
             trainer: TrainerConfig {
@@ -503,6 +534,8 @@ impl LitConfig {
                 tokenizer_vocab: "llama3".to_string(),
                 max_seq_len: 512, // Can handle longer context with MLA
                 rope_theta: 10000.0,
+                rope_scaling: None,
+                sliding_window: None,
                 dtype: DTypePrecision::F32,
             },
             trainer: TrainerConfig {
@@ -905,6 +938,54 @@ mod tests {
         let mut cfg = LitConfig::nano().model;
         let before = compute_model_config_hash(&cfg);
         cfg.vocab_size += 1;
+        assert_ne!(before, compute_model_config_hash(&cfg));
+    }
+
+    /// `rope_scaling`/`sliding_window` are new fields on an existing struct.
+    /// Every config written before they existed has them unset, so the JSON
+    /// must omit the keys entirely (not serialize as `null`) or every
+    /// pre-existing checkpoint fails resume validation with a false "model
+    /// mismatch".
+    #[test]
+    fn new_attention_extras_unset_do_not_change_the_config_hash() {
+        let cfg = LitConfig::nano_baseline().model;
+        assert!(cfg.rope_scaling.is_none());
+        assert!(cfg.sliding_window.is_none());
+
+        let value = serde_json::to_value(&cfg).unwrap();
+        let map = value.as_object().unwrap();
+        assert!(
+            !map.contains_key("rope_scaling"),
+            "rope_scaling must be omitted from JSON when unset"
+        );
+        assert!(
+            !map.contains_key("sliding_window"),
+            "sliding_window must be omitted from JSON when unset"
+        );
+    }
+
+    #[test]
+    fn sliding_window_set_changes_the_config_hash() {
+        let mut cfg = LitConfig::nano_baseline().model;
+        let before = compute_model_config_hash(&cfg);
+        cfg.sliding_window = Some(4096);
+        assert_ne!(before, compute_model_config_hash(&cfg));
+    }
+
+    #[test]
+    fn rope_scaling_set_changes_the_config_hash() {
+        let mut cfg = LitConfig::nano_baseline().model;
+        let before = compute_model_config_hash(&cfg);
+        cfg.rope_scaling = Some(RopeScalingSpec {
+            scaling_type: "yarn".to_string(),
+            factor: 2.0,
+            original_max_position_embeddings: None,
+            low_freq_factor: None,
+            high_freq_factor: None,
+            attention_factor: None,
+            beta_fast: None,
+            beta_slow: None,
+        });
         assert_ne!(before, compute_model_config_hash(&cfg));
     }
 }

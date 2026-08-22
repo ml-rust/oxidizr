@@ -7,14 +7,19 @@
 //! place that bridges the two, so architecture features only need to be taught
 //! to boostr once instead of hand-ported into every oxidizr consumer.
 
-use crate::config::OxidizrModelConfig;
+use crate::config::{OxidizrModelConfig, RopeScalingSpec};
 use crate::prelude::Result;
 use boostr::error::Error;
 use boostr::model::config::{
     default_conv_kernel, default_expand, default_load_balance_alpha, default_n_groups,
     default_rms_norm_eps, default_z_loss_alpha, AttentionConfig, HybridConfig, ModelConfig,
-    MoeConfig, SsmConfig,
+    MoeConfig, RopeScalingConfig, SsmConfig,
 };
+
+/// `scaling_type` values boostr accepts (`AttentionConfig`/RoPE construction
+/// hard-errors on anything else, deep inside model construction). Rejected
+/// here instead, at config-conversion time.
+const SUPPORTED_ROPE_SCALING_TYPES: [&str; 3] = ["linear", "llama3", "yarn"];
 
 fn model_error(reason: impl Into<String>) -> Error {
     Error::ModelError {
@@ -84,6 +89,74 @@ fn model_type(shape: &LayerShape, mamba3_enabled: bool) -> &'static str {
     }
 }
 
+fn to_rope_scaling(spec: &RopeScalingSpec) -> RopeScalingConfig {
+    RopeScalingConfig {
+        scaling_type: spec.scaling_type.clone(),
+        factor: spec.factor,
+        original_max_position_embeddings: spec.original_max_position_embeddings,
+        low_freq_factor: spec.low_freq_factor,
+        high_freq_factor: spec.high_freq_factor,
+        attention_factor: spec.attention_factor,
+        beta_fast: spec.beta_fast,
+        beta_slow: spec.beta_slow,
+    }
+}
+
+/// Reject `rope_scaling`/`sliding_window` combinations boostr cannot honor.
+/// Must run before conversion: boostr accepts these fields structurally on
+/// every model type but only the `llama` (`AttentionOnly`) path actually
+/// reads `sliding_window`, and only `llama`/`hybrid` read `rope_scaling` —
+/// the rest would silently do nothing.
+fn validate_attention_extras(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Result<()> {
+    if matches!(shape, LayerShape::SsmOnly) {
+        if cfg.rope_scaling.is_some() {
+            return Err(model_error(
+                "rope_scaling is set but mamba_layers covers every layer (SsmOnly): \
+                 there is no attention block to apply it to. Remove rope_scaling or \
+                 leave at least one attention layer.",
+            ));
+        }
+        if cfg.sliding_window.is_some() {
+            return Err(model_error(
+                "sliding_window is set but mamba_layers covers every layer (SsmOnly): \
+                 there is no attention block to apply it to. Remove sliding_window or \
+                 leave at least one attention layer.",
+            ));
+        }
+        return Ok(());
+    }
+
+    if cfg.sliding_window.is_some() && matches!(shape, LayerShape::Hybrid) {
+        return Err(model_error(
+            "sliding_window is set on a hybrid model (mamba_layers is a non-empty \
+             strict subset of layers): boostr's hybrid attention path never reads \
+             sliding_window, so it would be silently ignored. Remove sliding_window or \
+             make this model attention-only (mamba_layers empty).",
+        ));
+    }
+
+    if let Some(scaling) = &cfg.rope_scaling {
+        if !SUPPORTED_ROPE_SCALING_TYPES.contains(&scaling.scaling_type.as_str()) {
+            return Err(model_error(format!(
+                "rope_scaling.type is {:?}, which boostr does not support. Supported \
+                 values are: {}.",
+                scaling.scaling_type,
+                SUPPORTED_ROPE_SCALING_TYPES.join(", ")
+            )));
+        }
+    }
+
+    if cfg.sliding_window == Some(0) {
+        return Err(model_error(
+            "sliding_window is set to 0: boostr treats 0 as the sentinel for \
+             \"disabled\", so this reads as a window but silently means no window at \
+             all. Remove sliding_window instead of setting it to 0.",
+        ));
+    }
+
+    Ok(())
+}
+
 fn to_attention(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Option<AttentionConfig> {
     if matches!(shape, LayerShape::SsmOnly) {
         return None;
@@ -93,11 +166,14 @@ fn to_attention(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Option<Attentio
         num_kv_heads: cfg.kv_heads,
         head_dim: None,
         rope_theta: cfg.rope_theta,
-        rope_scaling: None,
+        rope_scaling: cfg.rope_scaling.as_ref().map(to_rope_scaling),
         kv_latent_dim: cfg.kv_latent_dim,
         q_latent_dim: cfg.q_latent_dim,
         d_rope: cfg.d_rope,
-        sliding_window: None,
+        sliding_window: cfg.sliding_window,
+        // oxidizr's own attention block (src/model.rs) has no ALiBi path, and
+        // boostr exposes no autograd/`var_*` ALiBi-biased attention primitive
+        // for it to call — so this is always false, never a config knob.
         use_alibi: false,
     })
 }
@@ -220,6 +296,7 @@ impl OxidizrModelConfig {
         let shape = layer_shape(&ssm_layers, self.num_layers);
         let has_mamba = !ssm_layers.is_empty();
         let mamba3 = self.mamba3_enabled.unwrap_or(false);
+        validate_attention_extras(self, &shape)?;
 
         let moe = to_moe(self)?;
         let intermediate_size = if moe.is_some() {
