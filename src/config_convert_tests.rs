@@ -130,11 +130,34 @@ fn duplicate_layer_index_is_rejected() {
     assert!(cfg.to_boostr().is_err());
 }
 
+/// Bare Mamba1 predates Mamba2's head decomposition and has no `mamba2_*`
+/// dims to give. It must convert to the `mamba1` variant rather than being
+/// rejected for a field it never had — losing this silently turns a valid
+/// Mamba1 config into a hard error.
 #[test]
-fn missing_required_mamba2_field_is_rejected() {
+fn mamba_layers_without_mamba2_dims_is_mamba1() {
     let cfg = OxidizrModelConfig {
         mamba_layers: Some(vec![0]),
         mamba2_num_heads: None,
+        ..dense_baseline()
+    };
+    let boostr_cfg = cfg.to_boostr().expect("bare mamba1 must convert");
+    let ssm = boostr_cfg.ssm.as_ref().expect("ssm present");
+    assert_eq!(ssm.variant, "mamba1");
+    // One SISO channel spanning the whole inner width — this is also what
+    // keeps `hidden_size * expand == num_heads * head_dim` satisfied.
+    assert_eq!(ssm.num_heads, 1);
+    assert_eq!(ssm.head_dim, cfg.hidden_size * ssm.expand);
+    boostr_cfg.validate().expect("mamba1 config must validate");
+}
+
+/// Mamba3 genuinely needs the head dims, so their absence is still an error.
+#[test]
+fn mamba3_without_mamba2_dims_is_rejected() {
+    let cfg = OxidizrModelConfig {
+        mamba_layers: Some(vec![0]),
+        mamba2_num_heads: None,
+        mamba3_enabled: Some(true),
         ..dense_baseline()
     };
     assert!(cfg.to_boostr().is_err());

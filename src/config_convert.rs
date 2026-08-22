@@ -121,9 +121,38 @@ fn required_ssm_dims(cfg: &OxidizrModelConfig) -> Result<(usize, usize, usize, u
     Ok((num_heads, head_dim, state_size, chunk_size))
 }
 
+/// Mamba1 has no head decomposition — it is a single SISO channel of width
+/// `d_inner`. boostr's `SsmConfig` requires `num_heads`/`head_dim` regardless of
+/// variant, and validates `hidden_size * expand == num_heads * head_dim`, so the
+/// faithful encoding is one head that spans the whole inner width. The classic
+/// Mamba1 constants (state 16, conv kernel 4, expand 2, chunk 64) match
+/// `boostr::model::Mamba1Config::new`, which is what actually gets built.
+fn to_mamba1_ssm(cfg: &OxidizrModelConfig) -> SsmConfig {
+    let expand = cfg.mamba2_expand.unwrap_or(2);
+    SsmConfig {
+        variant: "mamba1".to_string(),
+        num_heads: 1,
+        head_dim: cfg.hidden_size * expand,
+        state_size: cfg.mamba2_state_size.unwrap_or(16),
+        chunk_size: cfg.mamba2_chunk_size.unwrap_or(64),
+        n_groups: cfg.mamba2_n_groups.unwrap_or_else(default_n_groups),
+        conv_kernel: cfg.mamba2_conv_kernel.unwrap_or(4),
+        expand,
+        complex_rope: None,
+        mimo_rank: None,
+        use_conv: None,
+    }
+}
+
 fn to_ssm(cfg: &OxidizrModelConfig, has_mamba: bool) -> Result<Option<SsmConfig>> {
     if !has_mamba {
         return Ok(None);
+    }
+    // No `mamba2_num_heads` means bare Mamba1, which predates the head-based
+    // Mamba2 shape and cannot supply those dims. Encode it as such rather than
+    // rejecting the config for a field Mamba1 never had.
+    if cfg.mamba2_num_heads.is_none() && !cfg.mamba3_enabled.unwrap_or(false) {
+        return Ok(Some(to_mamba1_ssm(cfg)));
     }
     let (num_heads, head_dim, state_size, chunk_size) = required_ssm_dims(cfg)?;
     let mamba3 = cfg.mamba3_enabled.unwrap_or(false);
@@ -186,7 +215,6 @@ impl OxidizrModelConfig {
     /// Convert this training-facing config into boostr's canonical
     /// [`ModelConfig`], failing loudly instead of substituting a default when
     /// a required boostr field has no oxidizr source.
-    #[allow(dead_code)] // Call sites land in a later unit; conversion + tests only for now.
     pub fn to_boostr(&self) -> Result<ModelConfig> {
         let ssm_layers = checked_mamba_layers(self)?;
         let shape = layer_shape(&ssm_layers, self.num_layers);

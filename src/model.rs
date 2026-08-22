@@ -1,6 +1,7 @@
 use crate::prelude::{DType, Embedding, Init, Linear, Result, RmsNorm, Tensor, VarBuilder};
 
 use crate::config::OxidizrModelConfig;
+use boostr::model::config::ModelConfig;
 use boostr::tensor::TensorId;
 // `cast` is a TypeConversionOps method; the trait must be in scope to call it.
 use boostr::TypeConversionOps;
@@ -115,7 +116,7 @@ where
     R: boostr::Runtime<DType = DType>,
 {
     fn new<C>(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
@@ -136,7 +137,7 @@ where
 
     #[allow(clippy::too_many_arguments)]
     fn with_ids(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         q_a_proj: (Tensor<R>, boostr::autograd::TensorId),
         q_b_proj: (Tensor<R>, boostr::autograd::TensorId),
         q_a_layernorm: (Tensor<R>, boostr::autograd::TensorId),
@@ -230,22 +231,28 @@ where
         self.mla.trainable_parameters()
     }
 
-    fn mla_config(cfg: &OxidizrModelConfig) -> Result<boostr::nn::MlaConfig> {
+    fn mla_config(cfg: &ModelConfig) -> Result<boostr::nn::MlaConfig> {
+        let attn = cfg
+            .attention
+            .as_ref()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: "attention config missing while building MLA config".into(),
+            })?;
         let head_dim = Self::head_dim(cfg)?;
-        let kv_latent_dim = Self::required_dim("kv_latent_dim", cfg.kv_latent_dim)?;
-        let q_latent_dim = Self::required_dim("q_latent_dim", cfg.q_latent_dim)?;
-        let d_rope = Self::required_dim("d_rope", cfg.d_rope)?;
+        let kv_latent_dim = Self::required_dim("kv_latent_dim", attn.kv_latent_dim)?;
+        let q_latent_dim = Self::required_dim("q_latent_dim", attn.q_latent_dim)?;
+        let d_rope = Self::required_dim("d_rope", attn.d_rope)?;
 
         let config = boostr::nn::MlaConfig {
             hidden_size: cfg.hidden_size,
-            num_heads: cfg.num_heads,
+            num_heads: attn.num_heads,
             head_dim,
             head_dim_v: head_dim,
             kv_lora_rank: kv_latent_dim,
             q_lora_rank: q_latent_dim,
             rope_head_dim: d_rope,
             max_seq_len: cfg.max_seq_len,
-            rope_theta: cfg.rope_theta,
+            rope_theta: attn.rope_theta,
             use_norm: true,
             norm_eps: 1e-6,
         };
@@ -405,21 +412,27 @@ where
         Ok(boostr::nn::RmsNorm::with_id(weight, weight_id, eps, true))
     }
 
-    fn head_dim(cfg: &OxidizrModelConfig) -> Result<usize> {
-        if cfg.num_heads == 0 {
+    fn head_dim(cfg: &ModelConfig) -> Result<usize> {
+        let attn = cfg
+            .attention
+            .as_ref()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: "attention config missing while computing MLA head_dim".into(),
+            })?;
+        if attn.num_heads == 0 {
             return Err(boostr::error::Error::ModelError {
                 reason: "MLA num_heads must be non-zero".into(),
             });
         }
-        if !cfg.hidden_size.is_multiple_of(cfg.num_heads) {
+        if !cfg.hidden_size.is_multiple_of(attn.num_heads) {
             return Err(boostr::error::Error::ModelError {
                 reason: format!(
                     "MLA hidden_size ({}) must be divisible by num_heads ({})",
-                    cfg.hidden_size, cfg.num_heads
+                    cfg.hidden_size, attn.num_heads
                 ),
             });
         }
-        Ok(cfg.hidden_size / cfg.num_heads)
+        Ok(cfg.hidden_size / attn.num_heads)
     }
 
     fn required_dim(name: &str, value: Option<usize>) -> Result<usize> {
@@ -474,7 +487,7 @@ where
     R: boostr::Runtime<DType = DType>,
 {
     fn new<C>(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
@@ -487,9 +500,16 @@ where
             + boostr::CompareOps<R>
             + boostr::TensorOps<R>,
     {
+        let attn_cfg = cfg
+            .attention
+            .as_ref()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: "attention config missing while building legacy causal self-attention"
+                    .into(),
+            })?;
         let head_dim = Self::head_dim(cfg)?;
-        let kv_heads = cfg.kv_heads.unwrap_or(cfg.num_heads);
-        Self::validate_heads(cfg.num_heads, kv_heads)?;
+        let kv_heads = attn_cfg.num_kv_heads.unwrap_or(attn_cfg.num_heads);
+        Self::validate_heads(attn_cfg.num_heads, kv_heads)?;
         let kv_hidden = kv_heads * head_dim;
 
         let q_proj = Self::linear_no_bias(
@@ -516,14 +536,15 @@ where
             dtype,
             client,
         )?;
-        let rope = RotaryEmbedding::new(head_dim, cfg.max_seq_len, cfg.rope_theta, vb.device())?;
+        let rope =
+            RotaryEmbedding::new(head_dim, cfg.max_seq_len, attn_cfg.rope_theta, vb.device())?;
 
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
-            num_heads: cfg.num_heads,
+            num_heads: attn_cfg.num_heads,
             num_kv_heads: kv_heads,
             head_dim,
             rope,
@@ -531,7 +552,7 @@ where
     }
 
     fn with_ids(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         q_proj: (Tensor<R>, boostr::autograd::TensorId),
         k_proj: (Tensor<R>, boostr::autograd::TensorId),
         v_proj: (Tensor<R>, boostr::autograd::TensorId),
@@ -539,9 +560,16 @@ where
         rope_cos: (Tensor<R>, boostr::autograd::TensorId),
         rope_sin: (Tensor<R>, boostr::autograd::TensorId),
     ) -> Result<Self> {
+        let attn_cfg = cfg
+            .attention
+            .as_ref()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: "attention config missing while rebuilding legacy causal self-attention"
+                    .into(),
+            })?;
         let head_dim = Self::head_dim(cfg)?;
-        let kv_heads = cfg.kv_heads.unwrap_or(cfg.num_heads);
-        Self::validate_heads(cfg.num_heads, kv_heads)?;
+        let kv_heads = attn_cfg.num_kv_heads.unwrap_or(attn_cfg.num_heads);
+        Self::validate_heads(attn_cfg.num_heads, kv_heads)?;
         let kv_hidden = kv_heads * head_dim;
 
         Ok(Self {
@@ -569,7 +597,7 @@ where
                 o_proj.1,
                 &[cfg.hidden_size, cfg.hidden_size],
             )?,
-            num_heads: cfg.num_heads,
+            num_heads: attn_cfg.num_heads,
             num_kv_heads: kv_heads,
             head_dim,
             rope: RotaryEmbedding::with_ids(
@@ -650,21 +678,28 @@ where
         params
     }
 
-    fn head_dim(cfg: &OxidizrModelConfig) -> Result<usize> {
-        if cfg.num_heads == 0 {
+    fn head_dim(cfg: &ModelConfig) -> Result<usize> {
+        let attn = cfg
+            .attention
+            .as_ref()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: "attention config missing while computing causal self-attention head_dim"
+                    .into(),
+            })?;
+        if attn.num_heads == 0 {
             return Err(boostr::error::Error::ModelError {
                 reason: "attention num_heads must be non-zero".into(),
             });
         }
-        if !cfg.hidden_size.is_multiple_of(cfg.num_heads) {
+        if !cfg.hidden_size.is_multiple_of(attn.num_heads) {
             return Err(boostr::error::Error::ModelError {
                 reason: format!(
                     "hidden_size ({}) must be divisible by num_heads ({})",
-                    cfg.hidden_size, cfg.num_heads
+                    cfg.hidden_size, attn.num_heads
                 ),
             });
         }
-        Ok(cfg.hidden_size / cfg.num_heads)
+        Ok(cfg.hidden_size / attn.num_heads)
     }
 
     fn validate_heads(num_heads: usize, num_kv_heads: usize) -> Result<()> {
@@ -752,7 +787,7 @@ where
     R: boostr::Runtime<DType = DType>,
 {
     fn new<C>(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
@@ -790,7 +825,7 @@ where
     }
 
     fn with_ids(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         gate_proj: (Tensor<R>, boostr::autograd::TensorId),
         up_proj: (Tensor<R>, boostr::autograd::TensorId),
         down_proj: (Tensor<R>, boostr::autograd::TensorId),
@@ -1186,7 +1221,7 @@ where
     R: boostr::Runtime<DType = DType>,
 {
     fn new<C>(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
@@ -1238,7 +1273,7 @@ where
 
     #[allow(clippy::type_complexity)]
     fn with_ids(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         experts: Vec<(
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
@@ -1255,7 +1290,7 @@ where
         if experts.len() != num_experts {
             return Err(boostr::error::Error::ModelError {
                 reason: format!(
-                    "MoE expected {num_experts} experts from cfg.num_experts, got {}",
+                    "MoE expected {num_experts} experts from cfg.moe.num_experts, got {}",
                     experts.len()
                 ),
             });
@@ -1374,10 +1409,16 @@ where
         1.0 / (experts_per_tok as f32 + 1.0)
     }
 
-    fn required_moe_dims(cfg: &OxidizrModelConfig) -> Result<(usize, usize, usize)> {
-        let num_experts = Self::required_positive("num_experts", cfg.num_experts)?;
-        let experts_per_tok = Self::required_positive("experts_per_tok", cfg.experts_per_tok)?;
-        let intermediate = Self::required_positive("intermediate_size", cfg.intermediate_size)?;
+    fn required_moe_dims(cfg: &ModelConfig) -> Result<(usize, usize, usize)> {
+        let moe = cfg
+            .moe
+            .as_ref()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: "moe config missing while building an MoE FfnLayer".into(),
+            })?;
+        let intermediate = Self::required_positive("moe.intermediate_size", moe.intermediate_size)?;
+        let num_experts = moe.num_experts;
+        let experts_per_tok = moe.experts_per_tok;
         if experts_per_tok > num_experts {
             return Err(boostr::error::Error::ModelError {
                 reason: format!(
@@ -1415,12 +1456,7 @@ impl<R> FfnLayer<R>
 where
     R: boostr::Runtime<DType = DType>,
 {
-    fn new<C>(
-        cfg: &OxidizrModelConfig,
-        vb: VarBuilder<'_, R>,
-        client: &C,
-        dtype: DType,
-    ) -> Result<Self>
+    fn new<C>(cfg: &ModelConfig, vb: VarBuilder<'_, R>, client: &C, dtype: DType) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
             + boostr::RandomOps<R>
@@ -1429,7 +1465,7 @@ where
             + boostr::CompareOps<R>
             + boostr::TensorOps<R>,
     {
-        if cfg.num_experts.is_some() {
+        if cfg.moe.is_some() {
             // MoE mode
             Ok(FfnLayer::Moe(Box::new(MoeLayer::new(
                 cfg, vb, client, dtype,
@@ -1442,7 +1478,7 @@ where
 
     #[allow(clippy::type_complexity)]
     fn with_ids(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         mlp: Option<(
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
@@ -1462,11 +1498,10 @@ where
             (Tensor<R>, boostr::autograd::TensorId),
         )>,
     ) -> Result<Self> {
-        if cfg.num_experts.is_some() {
+        if cfg.moe.is_some() {
             let (experts, shared_expert, router_gate) =
                 moe.ok_or_else(|| boostr::error::Error::ModelError {
-                    reason: "FfnLayer::with_ids requires MoE weights when cfg.num_experts is set"
-                        .into(),
+                    reason: "FfnLayer::with_ids requires MoE weights when cfg.moe is set".into(),
                 })?;
             Ok(FfnLayer::Moe(Box::new(MoeLayer::with_ids(
                 cfg,
@@ -1477,8 +1512,7 @@ where
         } else {
             let (gate_proj, up_proj, down_proj) =
                 mlp.ok_or_else(|| boostr::error::Error::ModelError {
-                    reason: "FfnLayer::with_ids requires MLP weights when cfg.num_experts is unset"
-                        .into(),
+                    reason: "FfnLayer::with_ids requires MLP weights when cfg.moe is unset".into(),
                 })?;
             Ok(FfnLayer::Mlp(Box::new(Mlp::with_ids(
                 cfg, gate_proj, up_proj, down_proj,
@@ -1608,7 +1642,7 @@ where
 {
     // Create appropriate block type based on configuration
     fn new<C>(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         layer_idx: usize,
         mut vb: VarBuilder<'_, R>,
         client: &C,
@@ -1624,21 +1658,29 @@ where
     {
         let eps = 1e-5;
 
-        // Determine if this should be a Mamba layer
-        let is_mamba = cfg
-            .mamba_layers
-            .as_ref()
-            .map(|layers| layers.contains(&layer_idx))
-            .unwrap_or(false);
+        // Determine if this should be a Mamba layer. `is_ssm_layer` handles
+        // all three config shapes (pure attention, pure SSM, hybrid) — a raw
+        // `hybrid_layers` read would misreport every layer of a pure-SSM
+        // config as attention, since pure-SSM configs carry no
+        // `hybrid_layers` at all.
+        let is_mamba = cfg.is_ssm_layer(layer_idx);
 
         // Determine if using Mamba3 (Trapezoidal + Complex RoPE + MIMO)
-        let use_mamba3 = cfg.mamba3_enabled.unwrap_or(false);
+        let use_mamba3 = cfg
+            .ssm
+            .as_ref()
+            .map(|ssm| ssm.variant == "mamba3")
+            .unwrap_or(false);
 
         // Determine if using Mamba2 (State Space Duality)
-        let use_mamba2 = cfg.mamba2_num_heads.is_some();
+        let use_mamba2 = cfg.ssm.as_ref().is_some_and(|s| s.variant != "mamba1");
 
         // Determine if using MLA (Multi-Head Latent Attention) or legacy GQA
-        let use_mla = cfg.kv_latent_dim.is_some();
+        let use_mla = cfg
+            .attention
+            .as_ref()
+            .and_then(|a| a.kv_latent_dim)
+            .is_some();
 
         let block_type = if is_mamba && use_mamba3 && use_mamba2 {
             // Mamba3 layer (extends Mamba2 with trapezoidal discretization, complex RoPE, MIMO)
@@ -1698,11 +1740,7 @@ where
             }
         } else if use_mla {
             // MLA attention layer (with MLP or MoE based on config)
-            let ffn_prefix = if cfg.num_experts.is_some() {
-                "moe"
-            } else {
-                "mlp"
-            };
+            let ffn_prefix = if cfg.moe.is_some() { "moe" } else { "mlp" };
             BlockType::Attention {
                 attn: Box::new(MultiHeadLatentAttention::new(
                     cfg,
@@ -1758,7 +1796,7 @@ where
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn with_ids(
-        cfg: &OxidizrModelConfig,
+        cfg: &ModelConfig,
         layer_idx: usize,
         mamba1: Option<(
             boostr::model::mamba::Mamba1WeightsWithIds<R>,
@@ -1821,21 +1859,29 @@ where
     ) -> Result<Self> {
         let eps = 1e-5;
 
-        // Determine if this should be a Mamba layer
-        let is_mamba = cfg
-            .mamba_layers
-            .as_ref()
-            .map(|layers| layers.contains(&layer_idx))
-            .unwrap_or(false);
+        // Determine if this should be a Mamba layer. `is_ssm_layer` handles
+        // all three config shapes (pure attention, pure SSM, hybrid) — a raw
+        // `hybrid_layers` read would misreport every layer of a pure-SSM
+        // config as attention, since pure-SSM configs carry no
+        // `hybrid_layers` at all.
+        let is_mamba = cfg.is_ssm_layer(layer_idx);
 
         // Determine if using Mamba3 (Trapezoidal + Complex RoPE + MIMO)
-        let use_mamba3 = cfg.mamba3_enabled.unwrap_or(false);
+        let use_mamba3 = cfg
+            .ssm
+            .as_ref()
+            .map(|ssm| ssm.variant == "mamba3")
+            .unwrap_or(false);
 
         // Determine if using Mamba2 (State Space Duality)
-        let use_mamba2 = cfg.mamba2_num_heads.is_some();
+        let use_mamba2 = cfg.ssm.as_ref().is_some_and(|s| s.variant != "mamba1");
 
         // Determine if using MLA (Multi-Head Latent Attention) or legacy GQA
-        let use_mla = cfg.kv_latent_dim.is_some();
+        let use_mla = cfg
+            .attention
+            .as_ref()
+            .and_then(|a| a.kv_latent_dim)
+            .is_some();
 
         let block_type = if is_mamba && use_mamba3 && use_mamba2 {
             let (weights, norm_weight, norm_bias) =
@@ -2153,46 +2199,51 @@ where
         params
     }
 
-    fn mamba1_config(cfg: &OxidizrModelConfig) -> Result<boostr::model::Mamba1Config> {
-        Self::reject_unexpressed_mamba1_value("mamba2_num_heads", cfg.mamba2_num_heads)?;
-        Self::reject_unexpressed_mamba1_value("mamba2_head_dim", cfg.mamba2_head_dim)?;
-        Self::reject_unexpressed_mamba1_value("mamba2_n_groups", cfg.mamba2_n_groups)?;
-        if cfg.mamba3_enabled.unwrap_or(false) {
-            return Err(boostr::error::Error::ModelError {
-                reason: "Mamba1Config has no field for cfg.mamba3_enabled".into(),
-            });
-        }
-        Self::reject_unexpressed_mamba1_value("mamba3_complex_rope", cfg.mamba3_complex_rope)?;
-        Self::reject_unexpressed_mamba1_value("mamba3_mimo_rank", cfg.mamba3_mimo_rank)?;
-        Self::reject_unexpressed_mamba1_value("mamba3_use_conv", cfg.mamba3_use_conv)?;
-
-        let mut config = boostr::model::Mamba1Config::new(cfg.hidden_size);
-        if let Some(state_size) = cfg.mamba2_state_size {
-            config.d_state = state_size;
-        }
-        if let Some(chunk_size) = cfg.mamba2_chunk_size {
-            config.chunk_size = chunk_size;
-        }
-        if let Some(expand) = cfg.mamba2_expand {
-            config.expand = expand;
-        }
-        if let Some(conv_kernel) = cfg.mamba2_conv_kernel {
-            config.d_conv = conv_kernel;
-        }
-        config.validate()?;
-        Ok(config)
+    /// Build a `Mamba1Config` for a bare-Mamba1 layer.
+    ///
+    /// Unreachable via `OxidizrModelConfig::to_boostr`: `ssm` on boostr's
+    /// `ModelConfig` carries mandatory Mamba2-shaped dims (`num_heads`,
+    /// `head_dim`, `state_size`, `chunk_size`) whenever it is present at
+    /// all — there is no "SSM present but incompletely configured" state
+    /// like flat `OxidizrModelConfig` had, where a missing
+    /// `mamba2_num_heads` meant "this is Mamba1". So `is_mamba` (now
+    /// `cfg.is_ssm_layer`) already implies `cfg.ssm.is_some()`, which means
+    /// `use_mamba2` is always true whenever this branch would be taken —
+    /// the `is_mamba && !use_mamba2` case that calls this function can
+    /// never be populated by a converted config. Kept for call-site
+    /// completeness; errors loudly instead of fabricating a sourceless
+    /// config.
+    fn mamba1_config(cfg: &ModelConfig) -> Result<boostr::model::Mamba1Config> {
+        let ssm = cfg
+            .ssm
+            .as_ref()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: "mamba1_config: ssm config missing while building an SSM layer".into(),
+            })?;
+        // Mamba1 carries no head decomposition, so `num_heads`/`head_dim` are
+        // not read here — the inner width follows from `hidden_size * expand`.
+        Ok(boostr::model::Mamba1Config::new(cfg.hidden_size)
+            .with_d_state(ssm.state_size)
+            .with_expand(ssm.expand)
+            .with_d_conv(ssm.conv_kernel))
     }
 
-    fn mamba2_config(cfg: &OxidizrModelConfig) -> Result<boostr::model::Mamba2Config> {
+    fn mamba2_config(cfg: &ModelConfig) -> Result<boostr::model::Mamba2Config> {
+        let ssm = cfg
+            .ssm
+            .as_ref()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: "ssm config missing while building a Mamba2 layer".into(),
+            })?;
         let config = boostr::model::Mamba2Config {
             d_model: cfg.hidden_size,
-            d_state: Self::required_mamba_value("mamba2_state_size", cfg.mamba2_state_size)?,
-            nheads: Self::required_mamba_value("mamba2_num_heads", cfg.mamba2_num_heads)?,
-            headdim: Self::required_mamba_value("mamba2_head_dim", cfg.mamba2_head_dim)?,
-            expand: Self::required_mamba_value("mamba2_expand", cfg.mamba2_expand)?,
-            ngroups: Self::required_mamba_value("mamba2_n_groups", cfg.mamba2_n_groups)?,
-            d_conv: Self::required_mamba_value("mamba2_conv_kernel", cfg.mamba2_conv_kernel)?,
-            chunk_size: Self::required_mamba_value("mamba2_chunk_size", cfg.mamba2_chunk_size)?,
+            d_state: ssm.state_size,
+            nheads: ssm.num_heads,
+            headdim: ssm.head_dim,
+            expand: ssm.expand,
+            ngroups: ssm.n_groups,
+            d_conv: ssm.conv_kernel,
+            chunk_size: ssm.chunk_size,
             use_dt_bias: true,
             use_d: true,
             dt_softplus: true,
@@ -2201,48 +2252,33 @@ where
         Ok(config)
     }
 
-    fn mamba3_config(cfg: &OxidizrModelConfig) -> Result<boostr::model::Mamba3Config> {
+    fn mamba3_config(cfg: &ModelConfig) -> Result<boostr::model::Mamba3Config> {
+        let ssm = cfg
+            .ssm
+            .as_ref()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: "ssm config missing while building a Mamba3 layer".into(),
+            })?;
         let config = boostr::model::Mamba3Config {
             d_model: cfg.hidden_size,
-            d_state: Self::required_mamba_value("mamba2_state_size", cfg.mamba2_state_size)?,
-            nheads: Self::required_mamba_value("mamba2_num_heads", cfg.mamba2_num_heads)?,
-            headdim: Self::required_mamba_value("mamba2_head_dim", cfg.mamba2_head_dim)?,
-            expand: Self::required_mamba_value("mamba2_expand", cfg.mamba2_expand)?,
-            ngroups: Self::required_mamba_value("mamba2_n_groups", cfg.mamba2_n_groups)?,
-            d_conv: cfg.mamba2_conv_kernel.unwrap_or(4),
-            chunk_size: Self::required_mamba_value("mamba2_chunk_size", cfg.mamba2_chunk_size)?,
+            d_state: ssm.state_size,
+            nheads: ssm.num_heads,
+            headdim: ssm.head_dim,
+            expand: ssm.expand,
+            ngroups: ssm.n_groups,
+            d_conv: ssm.conv_kernel,
+            chunk_size: ssm.chunk_size,
             dt_softplus: true,
             use_d: true,
             use_dt_bias: true,
-            use_complex_rope: cfg.mamba3_complex_rope.unwrap_or(true),
-            mimo_rank: cfg.mamba3_mimo_rank.unwrap_or(0),
-            use_conv: cfg.mamba3_use_conv.unwrap_or(false),
+            use_complex_rope: ssm.complex_rope.unwrap_or(true),
+            mimo_rank: ssm.mimo_rank.unwrap_or(0),
+            use_conv: ssm.use_conv.unwrap_or(false),
             time_step_min: 0.001,
             time_step_max: 4.0,
         };
         config.validate()?;
         Ok(config)
-    }
-
-    fn required_mamba_value(name: &str, value: Option<usize>) -> Result<usize> {
-        let value = value.ok_or_else(|| boostr::error::Error::ModelError {
-            reason: format!("Mamba config requires cfg.{name}"),
-        })?;
-        if value == 0 {
-            return Err(boostr::error::Error::ModelError {
-                reason: format!("Mamba cfg.{name} must be non-zero"),
-            });
-        }
-        Ok(value)
-    }
-
-    fn reject_unexpressed_mamba1_value<T>(name: &str, value: Option<T>) -> Result<()> {
-        if value.is_some() {
-            return Err(boostr::error::Error::ModelError {
-                reason: format!("Mamba1Config has no field for cfg.{name}"),
-            });
-        }
-        Ok(())
     }
 
     fn take_rms_norm<C>(
@@ -2414,6 +2450,7 @@ where
             + boostr::CompareOps<R>
             + boostr::TensorOps<R>,
     {
+        let bcfg = cfg.to_boostr()?;
         let compute_dtype = cfg.dtype.to_dtype();
         let embed = Self::take_embedding(
             vb.pp("embed_tokens"),
@@ -2438,7 +2475,7 @@ where
         let mut layers = Vec::new();
         for i in 0..cfg.num_layers {
             layers.push(Block::new(
-                cfg,
+                &bcfg,
                 i,
                 vb.pp(&format!("layers.{}", i)),
                 client,
@@ -2686,9 +2723,10 @@ where
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
         device: &R::Device,
     ) -> Result<Block<R>> {
+        let bcfg = cfg.to_boostr()?;
         match &layer.block_type {
             BlockType::Mamba { block, norm } => Block::with_ids(
-                cfg,
+                &bcfg,
                 layer_idx,
                 Some((
                     Self::mamba1_weights_with_ids(block, params)?,
@@ -2701,7 +2739,7 @@ where
                 device,
             ),
             BlockType::Mamba2 { block, norm } => Block::with_ids(
-                cfg,
+                &bcfg,
                 layer_idx,
                 None,
                 Some((
@@ -2714,7 +2752,7 @@ where
                 device,
             ),
             BlockType::Mamba3 { block, norm } => Block::with_ids(
-                cfg,
+                &bcfg,
                 layer_idx,
                 None,
                 None,
@@ -2739,7 +2777,7 @@ where
                 };
                 let attn_named = attn.mla.named_parameters();
                 Block::with_ids(
-                    cfg,
+                    &bcfg,
                     layer_idx,
                     None,
                     None,
@@ -2767,7 +2805,7 @@ where
                 input_layernorm,
                 post_attention_layernorm,
             } => Block::with_ids(
-                cfg,
+                &bcfg,
                 layer_idx,
                 None,
                 None,
