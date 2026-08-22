@@ -623,6 +623,18 @@ struct AttnProjWithIds<R: boostr::Runtime> {
     lora: Option<LoraWithIds<R>>,
 }
 
+/// One SwiGLU FFN's `gate_proj`/`up_proj`/`down_proj`, in `named_parameters`
+/// order, for the `*_with_ids` rebuild path.
+type MlpWeightsWithIds<R> = (AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>);
+
+/// One MoE FFN's routed experts, its shared expert, and its router gate, for
+/// the `*_with_ids` rebuild path.
+type MoeWeightsWithIds<R> = (
+    Vec<MlpWeightsWithIds<R>>,
+    MlpWeightsWithIds<R>,
+    WeightWithId<R>,
+);
+
 /// A LoRA adapter's factors with their stable parameter ids, plus the `alpha`
 /// the rebuilt layer must re-derive its scaling from.
 struct LoraWithIds<R: boostr::Runtime> {
@@ -2025,7 +2037,10 @@ enum BlockType<R: boostr::Runtime> {
     },
     LegacyAttention {
         attn: Box<CausalSelfAttention<R>>,
-        mlp: Box<Mlp<R>>,
+        // MLP or MoE based on config, exactly as the MLA arm above: a config
+        // that sets `num_experts` gets a MoE block whether or not it also sets
+        // `kv_latent_dim`.
+        ffn: FfnLayer<R>,
         input_layernorm: RmsNorm<R>,
         post_attention_layernorm: RmsNorm<R>,
     },
@@ -2086,6 +2101,11 @@ where
             .and_then(|a| a.kv_latent_dim)
             .is_some();
 
+        // The FFN's parameter prefix, on the MLA and the legacy attention path
+        // alike: a MoE block names its parameters `layers.N.moe.*`, a dense
+        // MLP `layers.N.mlp.*`.
+        let ffn_prefix = if cfg.moe.is_some() { "moe" } else { "mlp" };
+
         let block_type = if is_mamba && use_mamba3 && use_mamba2 {
             // Mamba3 layer (extends Mamba2 with trapezoidal discretization, complex RoPE, MIMO)
             let mamba3_config = Self::mamba3_config(cfg)?;
@@ -2144,7 +2164,6 @@ where
             }
         } else if use_mla {
             // MLA attention layer (with MLP or MoE based on config)
-            let ffn_prefix = if cfg.moe.is_some() { "moe" } else { "mlp" };
             BlockType::Attention {
                 attn: Box::new(MultiHeadLatentAttention::new(
                     cfg,
@@ -2169,7 +2188,8 @@ where
                 )?,
             }
         } else {
-            // Legacy GQA + MLP attention layer (original nano)
+            // Legacy GQA attention layer (original nano), with MLP or MoE
+            // based on config.
             BlockType::LegacyAttention {
                 attn: Box::new(CausalSelfAttention::new(
                     cfg,
@@ -2178,7 +2198,7 @@ where
                     dtype,
                     lora,
                 )?),
-                mlp: Box::new(Mlp::new(cfg, vb.pp("mlp"), client, dtype, lora)?),
+                ffn: FfnLayer::new(cfg, vb.pp(ffn_prefix), client, dtype, lora)?,
                 input_layernorm: Self::take_rms_norm(
                     vb.pp("input_layernorm"),
                     cfg.hidden_size,
@@ -2242,9 +2262,10 @@ where
             AttnProjWithIds<R>,
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
-            AttnProjWithIds<R>,
-            AttnProjWithIds<R>,
-            AttnProjWithIds<R>,
+            // Exactly one of these is populated, chosen by `cfg.moe`, the same
+            // way the MLA arm above carries its FFN.
+            Option<MlpWeightsWithIds<R>>,
+            Option<MoeWeightsWithIds<R>>,
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
         )>,
@@ -2434,9 +2455,8 @@ where
                 o_proj,
                 rope_cos,
                 rope_sin,
-                gate_proj,
-                up_proj,
-                down_proj,
+                mlp,
+                moe,
                 input_layernorm,
                 post_attention_layernorm,
             ) = legacy_attention.ok_or_else(|| boostr::error::Error::ModelError {
@@ -2448,7 +2468,7 @@ where
                 attn: Box::new(CausalSelfAttention::with_ids(
                     cfg, q_proj, k_proj, v_proj, o_proj, rope_cos, rope_sin, frozen,
                 )?),
-                mlp: Box::new(Mlp::with_ids(cfg, gate_proj, up_proj, down_proj, frozen)?),
+                ffn: FfnLayer::with_ids(cfg, mlp, moe, frozen)?,
                 input_layernorm: Self::rms_norm_with_id(
                     "input_layernorm.weight",
                     input_layernorm.0,
@@ -2582,11 +2602,11 @@ where
             }
             BlockType::LegacyAttention {
                 attn,
-                mlp,
+                ffn,
                 input_layernorm,
                 post_attention_layernorm,
             } => {
-                // Legacy GQA + MLP (original nano)
+                // Legacy GQA + MLP or MoE (original nano)
                 let residual = x;
                 let x = input_layernorm.forward(client, x)?;
                 let x = attn.forward(client, &x)?;
@@ -2595,14 +2615,23 @@ where
 
                 let residual = &x;
                 let x = post_attention_layernorm.forward(client, &x)?;
-                let x = mlp.forward(client, &x)?;
+                let (x, ffn_aux_loss, ffn_z_loss) = ffn.forward(client, &x)?;
                 let x = boostr::autograd::var_add(&x, residual, client)
                     .map_err(boostr::error::Error::Numr)?;
 
+                // A dense MLP reports no auxiliary loss at all rather than a
+                // constant zero: the trainer scales and adds whatever it is
+                // handed, and a zero Var would put a no-op term into every
+                // dense model's loss graph that was never there before.
+                let (aux_loss, z_loss) = match ffn {
+                    FfnLayer::Mlp(_) => (None, None),
+                    FfnLayer::Moe(_) => (Some(ffn_aux_loss), Some(ffn_z_loss)),
+                };
+
                 Ok(BlockOutput {
                     hidden: x,
-                    aux_loss: None,
-                    z_loss: None,
+                    aux_loss,
+                    z_loss,
                 })
             }
         }
@@ -2636,14 +2665,14 @@ where
             }
             BlockType::LegacyAttention {
                 attn,
-                mlp,
+                ffn,
                 input_layernorm,
                 post_attention_layernorm,
             } => {
                 params.extend(input_layernorm.trainable_parameters());
                 params.extend(attn.trainable_parameters());
                 params.extend(post_attention_layernorm.trainable_parameters());
-                params.extend(mlp.trainable_parameters());
+                params.extend(ffn.trainable_parameters());
             }
         }
         params
@@ -3023,42 +3052,44 @@ where
         };
         for layer in &self.layers {
             match &layer.block_type {
-                BlockType::LegacyAttention { attn, mlp, .. } => {
+                BlockType::LegacyAttention { attn, ffn, .. } => {
                     for proj in [&attn.q_proj, &attn.k_proj, &attn.v_proj, &attn.o_proj] {
                         freeze_adapted(proj);
                     }
-                    for proj in mlp.projections() {
+                    for proj in Self::ffn_projections(ffn) {
                         freeze_adapted(proj);
                     }
                 }
-                // The MLA path's MLP shares `Mlp`, so an adapter reaching it
-                // must freeze its base here too rather than train both halves.
-                BlockType::Attention {
-                    ffn: FfnLayer::Mlp(mlp),
-                    ..
-                } => {
-                    for proj in mlp.projections() {
+                // The MLA path's FFN shares `FfnLayer`, so an adapter reaching
+                // it must freeze its base here too rather than train both
+                // halves.
+                BlockType::Attention { ffn, .. } => {
+                    for proj in Self::ffn_projections(ffn) {
                         freeze_adapted(proj);
-                    }
-                }
-                // Every expert's three projections, routed and shared alike:
-                // an MLP target on a MoE model adapts all of them, so all of
-                // their bases must be frozen.
-                BlockType::Attention {
-                    ffn: FfnLayer::Moe(moe),
-                    ..
-                } => {
-                    let experts = moe.moe.experts().iter().chain(moe.moe.shared_expert());
-                    for expert in experts {
-                        for proj in [expert.gate_proj(), expert.up_proj(), expert.down_proj()] {
-                            freeze_adapted(proj);
-                        }
                     }
                 }
                 _ => {}
             }
         }
         frozen
+    }
+
+    /// Every adaptable projection an FFN holds, in `named_parameters` order:
+    /// a dense MLP's three, or every expert's three — routed then shared.
+    ///
+    /// An MLP target on a MoE model names the projection inside EVERY expert,
+    /// so all of them are listed rather than the routed ones alone.
+    fn ffn_projections(ffn: &FfnLayer<R>) -> Vec<&MaybeLora<R>> {
+        match ffn {
+            FfnLayer::Mlp(mlp) => mlp.projections().to_vec(),
+            FfnLayer::Moe(moe) => moe
+                .moe
+                .experts()
+                .iter()
+                .chain(moe.moe.shared_expert())
+                .flat_map(|expert| [expert.gate_proj(), expert.up_proj(), expert.down_proj()])
+                .collect(),
+        }
     }
 
     fn with_ids(
@@ -3353,18 +3384,26 @@ where
             // and the SSM blocks carry plain `Linear` fields that never had an
             // adapter to merge.
             let projections: Vec<&mut MaybeLora<R>> = match &mut layer.block_type {
-                BlockType::LegacyAttention { attn, mlp, .. } => {
+                BlockType::LegacyAttention { attn, ffn, .. } => {
                     let attn: &mut CausalSelfAttention<R> = attn;
-                    let mlp: &mut Mlp<R> = mlp;
-                    vec![
+                    let mut projections: Vec<&mut MaybeLora<R>> = vec![
                         &mut attn.q_proj,
                         &mut attn.k_proj,
                         &mut attn.v_proj,
                         &mut attn.o_proj,
-                        &mut mlp.gate_proj,
-                        &mut mlp.up_proj,
-                        &mut mlp.down_proj,
-                    ]
+                    ];
+                    match ffn {
+                        FfnLayer::Mlp(mlp) => {
+                            let mlp: &mut Mlp<R> = mlp;
+                            projections.extend([
+                                &mut mlp.gate_proj,
+                                &mut mlp.up_proj,
+                                &mut mlp.down_proj,
+                            ]);
+                        }
+                        FfnLayer::Moe(moe) => merged += moe.merge_adapters(client)?,
+                    }
+                    projections
                 }
                 BlockType::Attention {
                     ffn: FfnLayer::Mlp(mlp),
@@ -3504,14 +3543,7 @@ where
                 input_layernorm,
                 post_attention_layernorm,
             } => {
-                let (mlp, moe) = match ffn {
-                    FfnLayer::Mlp(mlp) => {
-                        (Some(Self::mlp_weights_with_ids(cfg, mlp, params)?), None)
-                    }
-                    FfnLayer::Moe(moe) => {
-                        (None, Some(Self::moe_weights_with_ids(cfg, moe, params)?))
-                    }
-                };
+                let (mlp, moe) = Self::ffn_weights_with_ids(cfg, ffn, params)?;
                 let attn_named = attn.mla.named_parameters();
                 Block::with_ids(
                     &bcfg,
@@ -3539,11 +3571,11 @@ where
             }
             BlockType::LegacyAttention {
                 attn,
-                mlp,
+                ffn,
                 input_layernorm,
                 post_attention_layernorm,
             } => {
-                let (gate_proj, up_proj, down_proj) = Self::mlp_weights_with_ids(cfg, mlp, params)?;
+                let (mlp, moe) = Self::ffn_weights_with_ids(cfg, ffn, params)?;
                 Block::with_ids(
                     &bcfg,
                     layer_idx,
@@ -3558,9 +3590,8 @@ where
                         Self::attn_proj_with_ids(cfg, "o_proj", &attn.o_proj, params)?,
                         Self::tensor_with_stable_id(&attn.rope.cos, params)?,
                         Self::tensor_with_stable_id(&attn.rope.sin, params)?,
-                        gate_proj,
-                        up_proj,
-                        down_proj,
+                        mlp,
+                        moe,
                         Self::tensor_with_stable_id(input_layernorm.weight(), params)?,
                         Self::tensor_with_stable_id(post_attention_layernorm.weight(), params)?,
                     )),
@@ -3773,6 +3804,23 @@ where
     /// Snapshot the MLP's three projections for the rebuild path, adapters
     /// included. Routing through `attn_proj_with_ids` is what carries every
     /// `lora_a`/`lora_b` id across a step instead of minting a fresh one.
+    /// Snapshot whichever FFN a block holds for the rebuild path, as the
+    /// `(mlp, moe)` pair `Block::with_ids` takes: exactly one is `Some`,
+    /// chosen by the variant present, so `FfnLayer::with_ids` reconstructs the
+    /// same variant with the same stable ids. Shared by the MLA and the legacy
+    /// attention arm.
+    #[allow(clippy::type_complexity)]
+    fn ffn_weights_with_ids(
+        cfg: &OxidizrModelConfig,
+        ffn: &FfnLayer<R>,
+        params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
+    ) -> Result<(Option<MlpWeightsWithIds<R>>, Option<MoeWeightsWithIds<R>>)> {
+        Ok(match ffn {
+            FfnLayer::Mlp(mlp) => (Some(Self::mlp_weights_with_ids(cfg, mlp, params)?), None),
+            FfnLayer::Moe(moe) => (None, Some(Self::moe_weights_with_ids(cfg, moe, params)?)),
+        })
+    }
+
     fn mlp_weights_with_ids(
         cfg: &OxidizrModelConfig,
         mlp: &Mlp<R>,
@@ -4291,7 +4339,7 @@ where
             }
             BlockType::LegacyAttention {
                 attn,
-                mlp,
+                ffn,
                 input_layernorm,
                 post_attention_layernorm,
             } => {
@@ -4317,13 +4365,7 @@ where
                     format!("{prefix}.post_attention_layernorm.weight"),
                     post_attention_layernorm.weight(),
                 );
-                for (name, proj) in [
-                    ("gate_proj", &mlp.gate_proj),
-                    ("up_proj", &mlp.up_proj),
-                    ("down_proj", &mlp.down_proj),
-                ] {
-                    Self::push_named_projection(params, &format!("{prefix}.mlp.{name}"), proj);
-                }
+                Self::extend_ffn_named_trainable(params, &prefix, ffn);
             }
         }
     }
@@ -5158,7 +5200,10 @@ mod lora_tests {
     /// The MLP's three projections, in `MLP_TARGETS` order.
     fn mlp_projections(model: &LitGPT<CpuRuntime>) -> Vec<&MaybeLora<CpuRuntime>> {
         match &model.layers[0].block_type {
-            BlockType::LegacyAttention { mlp, .. } => mlp.projections().to_vec(),
+            BlockType::LegacyAttention {
+                ffn: FfnLayer::Mlp(mlp),
+                ..
+            } => mlp.projections().to_vec(),
             _ => panic!("lora-test config must produce a LegacyAttention block"),
         }
     }
@@ -5771,9 +5816,10 @@ mod moe_lora_tests {
     const MLP_TARGETS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
     const NUM_EXPERTS: usize = 2;
 
-    /// A MoE model is only reachable through the MLA attention path —
-    /// `Block::new` builds an `FfnLayer` there and nowhere else — so a MoE test
-    /// config carries `kv_latent_dim`/`q_latent_dim`/`d_rope` too.
+    /// This config exercises MoE on the MLA attention path, so it carries
+    /// `kv_latent_dim`/`q_latent_dim`/`d_rope` too. (MoE on the legacy
+    /// attention path — `num_experts` without `kv_latent_dim` — is covered by
+    /// `legacy_moe_tests`.)
     ///
     /// `experts_per_tok == num_experts` so every expert receives every token:
     /// the gradient test asserts a NONZERO adapter gradient, and an expert no
@@ -6519,5 +6565,311 @@ mod checkpoint_completeness_tests {
         load_checkpoint_into_model(&mut restored, &path).expect("legacy checkpoint must load");
         let _ = std::fs::remove_file(&path);
         assert_eq!(expected, all_values(&restored));
+    }
+}
+
+/// MoE on the LEGACY attention path — `num_experts` set WITHOUT
+/// `kv_latent_dim`.
+///
+/// `Block::new` used to build an `FfnLayer` only under `kv_latent_dim`, so this
+/// config silently produced a dense MLP: a user who asked for Mixture of
+/// Experts got a plain MLP with no error, no warning, and a parameter count and
+/// loss curve plausible enough that nothing surfaced it. These tests pin the
+/// block down to the MoE variant, to the MLA path's parameter names, and to a
+/// gradient that actually reaches an expert.
+#[cfg(test)]
+mod legacy_moe_tests {
+    use super::*;
+    use boostr::{CpuClient, CpuDevice, CpuRuntime};
+
+    const NUM_EXPERTS: usize = 2;
+    const MLP_TARGETS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
+
+    /// The legacy attention path: `kv_latent_dim` deliberately absent.
+    ///
+    /// `experts_per_tok == num_experts` so every expert receives every token —
+    /// the gradient test asserts a NONZERO gradient, and an expert no token
+    /// routed to would legitimately get zero.
+    fn cfg(num_experts: Option<usize>, lora: Option<LoraConfig>) -> OxidizrModelConfig {
+        OxidizrModelConfig {
+            name: "legacy-moe-test".to_string(),
+            hidden_size: 8,
+            num_layers: 1,
+            num_heads: 2,
+            kv_heads: None,
+            kv_latent_dim: None,
+            q_latent_dim: None,
+            d_rope: None,
+            num_experts,
+            experts_per_tok: num_experts,
+            shared_expert_enabled: num_experts.map(|_| true),
+            intermediate_size: Some(16),
+            mamba_layers: None,
+            mamba2_num_heads: None,
+            mamba2_head_dim: None,
+            mamba2_state_size: None,
+            mamba2_chunk_size: None,
+            mamba2_n_groups: None,
+            mamba2_conv_kernel: None,
+            mamba2_expand: None,
+            mamba3_enabled: None,
+            mamba3_complex_rope: None,
+            mamba3_mimo_rank: None,
+            mamba3_use_conv: None,
+            vocab_size: 12,
+            grow_vocab: false,
+            tie_word_embeddings: false,
+            tokenizer_vocab: "custom".to_string(),
+            max_seq_len: 8,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            sliding_window: None,
+            speech_vocab: None,
+            lora,
+            dtype: crate::config::DTypePrecision::F32,
+        }
+    }
+
+    /// The same MoE config with `kv_latent_dim` (and the dims MLA needs) added:
+    /// the combination that already worked, kept here to prove it still does.
+    fn mla_moe_cfg() -> OxidizrModelConfig {
+        OxidizrModelConfig {
+            kv_latent_dim: Some(4),
+            q_latent_dim: Some(4),
+            d_rope: Some(2),
+            ..cfg(Some(NUM_EXPERTS), None)
+        }
+    }
+
+    fn build(cfg: &OxidizrModelConfig) -> LitGPT<CpuRuntime> {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut varmap = boostr::VarMap::<CpuRuntime>::new();
+        let mut vb = VarBuilder::new(&mut varmap, &device);
+        LitGPT::<CpuRuntime>::new(cfg, &mut vb, &client).expect("model builds")
+    }
+
+    fn names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
+        model
+            .named_trainable_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    fn trainable_ids(
+        model: &LitGPT<CpuRuntime>,
+    ) -> std::collections::HashSet<boostr::autograd::TensorId> {
+        model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn optimizer_params(
+        model: &LitGPT<CpuRuntime>,
+    ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
+        model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, var)| (id, var.tensor().clone()))
+            .collect()
+    }
+
+    /// Every expert parameter name the MLA path produces for this config, with
+    /// the routed experts first and the shared expert last.
+    fn expected_expert_names() -> Vec<String> {
+        let mut prefixes: Vec<String> = (0..NUM_EXPERTS)
+            .map(|index| format!("layers.0.moe.experts.{index}"))
+            .collect();
+        prefixes.push("layers.0.moe.shared_expert".to_string());
+        prefixes
+            .into_iter()
+            .flat_map(|prefix| {
+                MLP_TARGETS
+                    .iter()
+                    .map(move |target| format!("{prefix}.{target}.weight"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn num_experts_without_kv_latent_dim_builds_a_moe_block() {
+        let model = build(&cfg(Some(NUM_EXPERTS), None));
+        match &model.layers[0].block_type {
+            BlockType::LegacyAttention {
+                ffn: FfnLayer::Moe(moe),
+                ..
+            } => {
+                assert_eq!(moe.moe.experts().len(), NUM_EXPERTS);
+                assert!(
+                    moe.moe.shared_expert().is_some(),
+                    "shared_expert_enabled must reach the legacy-path MoE too"
+                );
+            }
+            BlockType::LegacyAttention {
+                ffn: FfnLayer::Mlp(_),
+                ..
+            } => panic!(
+                "num_experts without kv_latent_dim silently degraded to a dense MLP — \
+                 the exact regression this module exists to catch"
+            ),
+            _ => panic!("this config must produce a LegacyAttention block"),
+        }
+    }
+
+    #[test]
+    fn legacy_moe_parameter_names_match_the_mla_scheme() {
+        let legacy = names(&build(&cfg(Some(NUM_EXPERTS), None)));
+        let mla = names(&build(&mla_moe_cfg()));
+
+        for expected in expected_expert_names() {
+            assert!(
+                legacy.contains(&expected),
+                "the legacy-path MoE must name {expected}: {legacy:?}"
+            );
+            assert!(
+                mla.contains(&expected),
+                "the MLA-path MoE must name {expected}: {mla:?}"
+            );
+        }
+        assert!(
+            legacy.contains(&"layers.0.moe.router.gate.weight".to_string()),
+            "the legacy-path MoE must carry a router gate: {legacy:?}"
+        );
+        assert!(
+            !legacy.iter().any(|name| name.starts_with("layers.0.mlp.")),
+            "a MoE block must not also name dense MLP parameters: {legacy:?}"
+        );
+    }
+
+    #[test]
+    fn trainable_ids_and_names_are_identical_across_a_rebuild() {
+        let model = build(&cfg(Some(NUM_EXPERTS), None));
+        let before_ids = trainable_ids(&model);
+        let before_names = names(&model);
+
+        let rebuilt = model
+            .rebuild_with_parameters(&optimizer_params(&model))
+            .expect("rebuild succeeds");
+
+        assert_eq!(
+            before_ids,
+            trainable_ids(&rebuilt),
+            "a fresh TensorId on the rebuild path detaches optimizer state"
+        );
+        assert_eq!(before_names, names(&rebuilt));
+        assert!(matches!(
+            &rebuilt.layers[0].block_type,
+            BlockType::LegacyAttention {
+                ffn: FfnLayer::Moe(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_gradient_reaches_every_expert_parameter() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let model = build(&cfg(Some(NUM_EXPERTS), None));
+
+        // i64, matching what `data.rs` uploads (it casts the u32 stream first).
+        let input_ids = Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device);
+        let output = model.forward(&client, &input_ids).expect("forward");
+        let loss =
+            boostr::autograd::var_sum(&output.logits, &[0, 1, 2], false, &client).expect("reduce");
+        let grads = boostr::autograd::backward(&loss, &client).expect("backward");
+
+        let named: HashMap<String, boostr::autograd::TensorId> = model
+            .named_trainable_parameters()
+            .into_iter()
+            .map(|(name, id, _)| (name, id))
+            .collect();
+        for expected in expected_expert_names() {
+            let id = named
+                .get(&expected)
+                .unwrap_or_else(|| panic!("{expected} must be a trainable parameter"));
+            let grad = grads
+                .get(*id)
+                .unwrap_or_else(|| panic!("{expected} received no gradient"));
+            let values: Vec<f32> = grad.contiguous().expect("contiguous").to_vec();
+            let magnitude: f32 = values.iter().map(|value| value.abs()).sum();
+            assert!(
+                magnitude > 1e-8,
+                "{expected} gradient is all zeros ({magnitude}) — the expert is severed \
+                 from the loss"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lora_mlp_target_adapts_every_legacy_path_expert() {
+        let lora = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: MLP_TARGETS.iter().map(|name| name.to_string()).collect(),
+        };
+        let model = build(&cfg(Some(NUM_EXPERTS), Some(lora)));
+        let listed = names(&model);
+        for base in expected_expert_names() {
+            let prefix = base
+                .strip_suffix(".weight")
+                .unwrap_or_else(|| panic!("{base} must end in .weight"));
+            assert!(
+                listed.contains(&format!("{prefix}.lora_a")),
+                "{prefix}.lora_a must be trainable: {listed:?}"
+            );
+            assert!(
+                listed.contains(&format!("{prefix}.lora_b")),
+                "{prefix}.lora_b must be trainable: {listed:?}"
+            );
+            assert!(
+                !listed.contains(&base),
+                "{base} is a wrapped LoRA base and must be frozen"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_with_neither_field_still_builds_a_dense_legacy_mlp() {
+        let model = build(&cfg(None, None));
+        assert!(
+            matches!(
+                &model.layers[0].block_type,
+                BlockType::LegacyAttention {
+                    ffn: FfnLayer::Mlp(_),
+                    ..
+                }
+            ),
+            "a config with no num_experts must keep its dense MLP block"
+        );
+        let listed = names(&model);
+        for target in MLP_TARGETS {
+            assert!(
+                listed.contains(&format!("layers.0.mlp.{target}.weight")),
+                "layers.0.mlp.{target}.weight must keep its name: {listed:?}"
+            );
+        }
+        assert!(
+            !listed.iter().any(|name| name.starts_with("layers.0.moe.")),
+            "a dense config must name no MoE parameters: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_with_both_fields_still_builds_an_mla_moe_block() {
+        let model = build(&mla_moe_cfg());
+        assert!(
+            matches!(
+                &model.layers[0].block_type,
+                BlockType::Attention {
+                    ffn: FfnLayer::Moe(_),
+                    ..
+                }
+            ),
+            "kv_latent_dim with num_experts must keep the MLA + MoE block"
+        );
     }
 }
