@@ -11,7 +11,7 @@ mod vocab;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use commands::{PackArgs, TrainArgs};
+use commands::{MergeArgs, PackArgs, TrainArgs};
 
 #[cfg(feature = "huggingface")]
 use commands::PushArgs;
@@ -91,6 +91,9 @@ enum Commands {
     /// Package a trained model for distribution
     Pack(PackArgs),
 
+    /// Merge LoRA adapters into base weights, writing a plain checkpoint
+    Merge(MergeArgs),
+
     /// Push a packaged model to HuggingFace Hub
     #[cfg(feature = "huggingface")]
     Push(PushArgs),
@@ -126,6 +129,7 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Train(args)) => commands::run_train(args),
         Some(Commands::Pack(args)) => commands::run_pack(args),
+        Some(Commands::Merge(args)) => commands::run_merge(args),
         #[cfg(feature = "huggingface")]
         Some(Commands::Push(args)) => commands::run_push(args),
         None => {
@@ -156,6 +160,12 @@ fn main() -> Result<()> {
                 println!("Usage:");
                 println!("  oxidizr train -f <config.yaml>     Train a model");
                 println!("  oxidizr pack                       Package a trained model");
+                println!(
+                "  oxidizr merge -f <config.yaml> -c <lora.safetensors> -o <merged.safetensors>"
+            );
+                println!(
+                    "                                     Merge LoRA adapters into base weights"
+                );
                 #[cfg(feature = "huggingface")]
                 println!("  oxidizr push                       Push model to HuggingFace");
                 println!("\nLegacy usage (backwards compatible):");

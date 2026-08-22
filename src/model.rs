@@ -655,6 +655,28 @@ where
         }
     }
 
+    /// Fold this projection's adapter into its base weight, turning it into a
+    /// `Plain` projection whose `<prefix>.weight` already carries
+    /// `W + scaling * (B @ A)`.
+    ///
+    /// Returns whether a merge happened. A `Plain` projection is left
+    /// untouched, so a partially-adapted model merges through the same call.
+    fn merge_adapter<C>(&mut self, client: &C) -> Result<bool>
+    where
+        C: boostr::RuntimeClient<R>
+            + boostr::TensorOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::ScalarOps<R>,
+        R::Client: boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R>,
+    {
+        let MaybeLora::Lora(lora) = self else {
+            return Ok(false);
+        };
+        let merged = lora.merge_into_base(client)?;
+        *self = MaybeLora::Plain(merged);
+        Ok(true)
+    }
+
     fn forward<C>(
         &self,
         client: &C,
@@ -3304,6 +3326,62 @@ where
         params
     }
 
+    /// Fold every LoRA adapter into the base weight it wraps.
+    ///
+    /// Returns how many projections were merged. Afterwards
+    /// `named_parameters` lists exactly the names the SAME config without its
+    /// `lora` block produces: each `<prefix>.weight` holds
+    /// `W + scaling * (B @ A)`, and no `lora_a`/`lora_b` remains. `cfg.lora`
+    /// and the frozen set are cleared with them — a merged model has no
+    /// adapter left to freeze a base for, and leaving either behind would make
+    /// `rebuild_with_parameters` hunt for parameter ids that no longer exist.
+    pub fn merge_lora_adapters<C>(&mut self, client: &C) -> Result<usize>
+    where
+        C: boostr::RuntimeClient<R>
+            + boostr::TensorOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::ScalarOps<R>,
+        R::Client: boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R>,
+    {
+        let mut merged = 0usize;
+        for layer in &mut self.layers {
+            // Only the dense-attention block and the SwiGLU MLP hold a
+            // `MaybeLora`; MLA, MoE, and the SSM blocks carry plain `Linear`
+            // fields that never had an adapter to merge.
+            let projections: Vec<&mut MaybeLora<R>> = match &mut layer.block_type {
+                BlockType::LegacyAttention { attn, mlp, .. } => {
+                    let attn: &mut CausalSelfAttention<R> = attn;
+                    let mlp: &mut Mlp<R> = mlp;
+                    vec![
+                        &mut attn.q_proj,
+                        &mut attn.k_proj,
+                        &mut attn.v_proj,
+                        &mut attn.o_proj,
+                        &mut mlp.gate_proj,
+                        &mut mlp.up_proj,
+                        &mut mlp.down_proj,
+                    ]
+                }
+                BlockType::Attention {
+                    ffn: FfnLayer::Mlp(mlp),
+                    ..
+                } => {
+                    let mlp: &mut Mlp<R> = mlp;
+                    vec![&mut mlp.gate_proj, &mut mlp.up_proj, &mut mlp.down_proj]
+                }
+                _ => Vec::new(),
+            };
+            for projection in projections {
+                if projection.merge_adapter(client)? {
+                    merged += 1;
+                }
+            }
+        }
+        self.frozen = FrozenParams::new();
+        self.cfg.lora = None;
+        Ok(merged)
+    }
+
     /// Every parameter a checkpoint must carry to reconstruct this model,
     /// frozen ones included.
     ///
@@ -5056,6 +5134,13 @@ mod lora_tests {
         }
     }
 
+    /// All seven adaptable projections. `lora_cfg()` covers attention only, so
+    /// merge tests — which assert every projection merges — need this instead.
+    fn all_targets_cfg() -> LoraConfig {
+        let targets: Vec<&str> = TARGETS.iter().chain(MLP_TARGETS.iter()).copied().collect();
+        lora_cfg_for(&targets)
+    }
+
     /// Every adapted projection, paired with the dotted prefix its parameters
     /// are named under.
     fn adapted_with_prefixes(model: &LitGPT<CpuRuntime>) -> Vec<(String, &MaybeLora<CpuRuntime>)> {
@@ -5487,6 +5572,169 @@ mod lora_tests {
             message.contains("num_experts"),
             "the error must name what to change: {message}"
         );
+    }
+
+    /// A model whose `lora_b` factors are all NON-zero.
+    ///
+    /// `lora_b` is zero-initialized, so a freshly built model's adapters
+    /// contribute nothing and a merge of them proves nothing: the merged and
+    /// unmerged forward passes would agree even if `merge_into_base` returned
+    /// the base weight untouched. Rewriting the factors through
+    /// `rebuild_with_parameters` is the same path the trainer takes after an
+    /// optimizer step.
+    fn with_nonzero_adapters(model: LitGPT<CpuRuntime>, device: &CpuDevice) -> LitGPT<CpuRuntime> {
+        let mut params = optimizer_params(&model);
+        for (index, (prefix, proj)) in adapted_with_prefixes(&model).into_iter().enumerate() {
+            let (_, lora_b) = proj
+                .adapters()
+                .unwrap_or_else(|| panic!("{prefix} must be adapted"));
+            let shape = lora_b.tensor().shape().to_vec();
+            let count: usize = shape.iter().product();
+            let values: Vec<f32> = (0..count)
+                .map(|i| 0.05 + 0.01 * ((index + i) % 7) as f32)
+                .collect();
+            params.insert(
+                lora_b.id(),
+                Tensor::<CpuRuntime>::from_slice(&values, &shape, device),
+            );
+        }
+        model.rebuild_with_parameters(&params).expect("rebuild")
+    }
+
+    fn logits(model: &LitGPT<CpuRuntime>, client: &CpuClient, device: &CpuDevice) -> Vec<f32> {
+        // i64, matching what `data.rs` uploads.
+        let input_ids = Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], device);
+        let output = model.forward(client, &input_ids).expect("forward");
+        output
+            .logits
+            .tensor()
+            .contiguous()
+            .expect("contiguous")
+            .to_vec::<f32>()
+    }
+
+    /// Every parameter's current value, keyed by id — the map
+    /// `save_checkpoint_from_params` reads. A merged model has no optimizer
+    /// behind it, so each `Var` is its own source.
+    fn all_params(
+        model: &LitGPT<CpuRuntime>,
+    ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
+        model
+            .named_parameters()
+            .into_iter()
+            .map(|(_, id, var)| (id, var.tensor().clone()))
+            .collect()
+    }
+
+    fn merge_temp_path(tag: &str) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!(
+                "oxidizr-merge-{tag}-{}-{unique}.safetensors",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn sorted_checkpoint_names(path: &str) -> Vec<String> {
+        let device = CpuDevice::new();
+        let mut safetensors = boostr::format::SafeTensors::open(path).expect("open checkpoint");
+        let mut names: Vec<String> = safetensors
+            .load_all::<CpuRuntime>(&device)
+            .expect("load checkpoint")
+            .into_keys()
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn sorted_parameter_names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
+        let mut names: Vec<String> = model
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The load-bearing property: folding `scaling * (B @ A)` into the base
+    /// weight must leave the forward pass numerically where it was. If it does
+    /// not, every merged export silently answers differently from the model
+    /// that was trained.
+    #[test]
+    fn merging_does_not_change_model_output() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut model = with_nonzero_adapters(build(Some(all_targets_cfg())), &device);
+        let before = logits(&model, &client, &device);
+
+        let merged = model.merge_lora_adapters(&client).expect("merge");
+        assert_eq!(merged, TARGETS.len() + MLP_TARGETS.len());
+
+        let after = logits(&model, &client, &device);
+        assert_eq!(before.len(), after.len());
+        for (index, (lhs, rhs)) in before.iter().zip(&after).enumerate() {
+            assert!(
+                (lhs - rhs).abs() < 1e-5,
+                "logit {index} moved on merge: {lhs} -> {rhs}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_merged_model_exposes_the_plain_parameter_set() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut model = with_nonzero_adapters(build(Some(all_targets_cfg())), &device);
+        model.merge_lora_adapters(&client).expect("merge");
+
+        let path = merge_temp_path("names");
+        save_checkpoint_from_params(&path, &model, &all_params(&model)).expect("save");
+        let written = sorted_checkpoint_names(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !written.iter().any(|name| name.contains("lora_")),
+            "a merged checkpoint must carry no adapter tensor: {written:?}"
+        );
+        assert_eq!(
+            written,
+            sorted_parameter_names(&build(None)),
+            "a merged checkpoint must carry exactly the parameter set of the same config \
+             without its lora block"
+        );
+    }
+
+    #[test]
+    fn a_merged_checkpoint_loads_under_the_config_without_its_lora_block() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut model = with_nonzero_adapters(build(Some(all_targets_cfg())), &device);
+        let before = logits(&model, &client, &device);
+        model.merge_lora_adapters(&client).expect("merge");
+
+        let path = merge_temp_path("load");
+        save_checkpoint_from_params(&path, &model, &all_params(&model)).expect("save");
+
+        // `cfg(None)` is the SAME config with the lora block removed: this is
+        // the load blazr and every non-LoRA path performs.
+        let mut plain = build(None);
+        load_checkpoint_into_model(&mut plain, &path)
+            .expect("a merged checkpoint must load under the lora-free config");
+        let _ = std::fs::remove_file(&path);
+
+        let after = logits(&plain, &client, &device);
+        assert_eq!(before.len(), after.len());
+        for (index, (lhs, rhs)) in before.iter().zip(&after).enumerate() {
+            assert!(
+                (lhs - rhs).abs() < 1e-5,
+                "logit {index} moved through merge and reload: {lhs} -> {rhs}"
+            );
+        }
     }
 }
 
