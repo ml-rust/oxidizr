@@ -1,6 +1,6 @@
 use crate::prelude::{DType, Embedding, Init, Linear, Result, RmsNorm, Tensor, VarBuilder};
 
-use crate::config::OxidizrModelConfig;
+use crate::config::{LoraConfig, OxidizrModelConfig};
 use boostr::model::config::{default_rms_norm_eps, ModelConfig};
 use boostr::tensor::TensorId;
 // `cast` is a TypeConversionOps method; the trait must be in scope to call it.
@@ -40,8 +40,8 @@ pub struct FrozenParams {
     ids: std::collections::HashSet<boostr::autograd::TensorId>,
 }
 
-// The constructors below are the freeze API. Nothing inside `model.rs`
-// populates a non-empty set yet, so they read as dead to a binary-crate build.
+// The constructors below are the freeze API. `from_ids` has no caller outside
+// tests, so the block keeps the allow.
 #[allow(dead_code)]
 impl FrozenParams {
     /// An empty set: every parameter is trainable. This is what
@@ -599,13 +599,96 @@ where
     }
 }
 
+// --- Optionally LoRA-adapted attention projection ---
+
+/// An attention projection that is either a plain `Linear` or that same
+/// `Linear` wrapped in a LoRA adapter.
+///
+/// `LoraLinear::forward` is signature-compatible with `Linear::forward`, so the
+/// forward path treats the two identically. Everything else on this type exists
+/// so an adapted projection enumerates, names, and rebuilds through the SAME
+/// paths a plain one does — a LoRA parameter that skips those paths is a
+/// parameter the optimizer, the checkpoint, and `assert_stable_parameter_ids`
+/// never see.
+enum MaybeLora<R: boostr::Runtime> {
+    Plain(boostr::nn::Linear<R>),
+    Lora(boostr::nn::LoraLinear<R>),
+}
+
+/// One projection's tensors paired with their stable parameter ids, for the
+/// `*_with_ids` rebuild path. The adapter pair is present exactly when the
+/// projection being rebuilt carries one.
+struct AttnProjWithIds<R: boostr::Runtime> {
+    weight: WeightWithId<R>,
+    lora: Option<LoraWithIds<R>>,
+}
+
+/// A LoRA adapter's factors with their stable parameter ids, plus the `alpha`
+/// the rebuilt layer must re-derive its scaling from.
+struct LoraWithIds<R: boostr::Runtime> {
+    a: WeightWithId<R>,
+    b: WeightWithId<R>,
+    alpha: f32,
+}
+
+impl<R> MaybeLora<R>
+where
+    R: boostr::Runtime<DType = DType>,
+{
+    /// The base projection weight, under either variant. This is the
+    /// `<prefix>.weight` every existing caller already expects.
+    fn weight(&self) -> &boostr::autograd::Var<R> {
+        match self {
+            MaybeLora::Plain(linear) => linear.weight(),
+            MaybeLora::Lora(lora) => lora.base().weight(),
+        }
+    }
+
+    /// `(lora_a, lora_b)` when this projection carries an adapter.
+    fn adapters(&self) -> Option<(&boostr::autograd::Var<R>, &boostr::autograd::Var<R>)> {
+        match self {
+            MaybeLora::Plain(_) => None,
+            MaybeLora::Lora(lora) => Some((lora.lora_a(), lora.lora_b())),
+        }
+    }
+
+    fn forward<C>(
+        &self,
+        client: &C,
+        input: &boostr::autograd::Var<R>,
+    ) -> Result<boostr::autograd::Var<R>>
+    where
+        C: boostr::RuntimeClient<R>
+            + boostr::TensorOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::ScalarOps<R>,
+        R::Client: boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R>,
+    {
+        match self {
+            MaybeLora::Plain(linear) => linear.forward(client, input),
+            MaybeLora::Lora(lora) => lora.forward(client, input),
+        }
+    }
+
+    /// Trainable parameters in `named_parameters` order: base weight first (it
+    /// is absent once frozen), then `lora_a`, then `lora_b`.
+    fn trainable_parameters(&self) -> Vec<(boostr::autograd::TensorId, &boostr::autograd::Var<R>)> {
+        match self {
+            MaybeLora::Plain(linear) => linear.trainable_parameters(),
+            MaybeLora::Lora(lora) => {
+                <boostr::nn::LoraLinear<R> as boostr::nn::Module<R>>::trainable_parameters(lora)
+            }
+        }
+    }
+}
+
 // --- Causal Self Attention with Grouped Query Attention ---
 
 struct CausalSelfAttention<R: boostr::Runtime> {
-    q_proj: boostr::nn::Linear<R>,
-    k_proj: boostr::nn::Linear<R>,
-    v_proj: boostr::nn::Linear<R>,
-    o_proj: boostr::nn::Linear<R>,
+    q_proj: MaybeLora<R>,
+    k_proj: MaybeLora<R>,
+    v_proj: MaybeLora<R>,
+    o_proj: MaybeLora<R>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -624,6 +707,7 @@ where
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
+        lora: Option<&LoraConfig>,
     ) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
@@ -645,28 +729,36 @@ where
         Self::validate_heads(attn_cfg.num_heads, kv_heads)?;
         let kv_hidden = kv_heads * head_dim;
 
-        let q_proj = Self::linear_no_bias(
+        let q_proj = Self::projection(
             vb.pp("q_proj"),
+            "q_proj",
             &[cfg.hidden_size, cfg.hidden_size],
             dtype,
+            lora,
             client,
         )?;
-        let k_proj = Self::linear_no_bias(
+        let k_proj = Self::projection(
             vb.pp("k_proj"),
+            "k_proj",
             &[kv_hidden, cfg.hidden_size],
             dtype,
+            lora,
             client,
         )?;
-        let v_proj = Self::linear_no_bias(
+        let v_proj = Self::projection(
             vb.pp("v_proj"),
+            "v_proj",
             &[kv_hidden, cfg.hidden_size],
             dtype,
+            lora,
             client,
         )?;
-        let o_proj = Self::linear_no_bias(
+        let o_proj = Self::projection(
             vb.pp("o_proj"),
+            "o_proj",
             &[cfg.hidden_size, cfg.hidden_size],
             dtype,
+            lora,
             client,
         )?;
         let rope = RotaryEmbedding::new(
@@ -692,10 +784,10 @@ where
 
     fn with_ids(
         cfg: &ModelConfig,
-        q_proj: (Tensor<R>, boostr::autograd::TensorId),
-        k_proj: (Tensor<R>, boostr::autograd::TensorId),
-        v_proj: (Tensor<R>, boostr::autograd::TensorId),
-        o_proj: (Tensor<R>, boostr::autograd::TensorId),
+        q_proj: AttnProjWithIds<R>,
+        k_proj: AttnProjWithIds<R>,
+        v_proj: AttnProjWithIds<R>,
+        o_proj: AttnProjWithIds<R>,
         rope_cos: (Tensor<R>, boostr::autograd::TensorId),
         rope_sin: (Tensor<R>, boostr::autograd::TensorId),
         frozen: &FrozenParams,
@@ -713,31 +805,27 @@ where
         let kv_hidden = kv_heads * head_dim;
 
         Ok(Self {
-            q_proj: Self::linear_with_ids(
-                "q_proj.weight",
-                q_proj.0,
-                q_proj.1,
+            q_proj: Self::projection_with_ids(
+                "q_proj",
+                q_proj,
                 &[cfg.hidden_size, cfg.hidden_size],
                 frozen,
             )?,
-            k_proj: Self::linear_with_ids(
-                "k_proj.weight",
-                k_proj.0,
-                k_proj.1,
+            k_proj: Self::projection_with_ids(
+                "k_proj",
+                k_proj,
                 &[kv_hidden, cfg.hidden_size],
                 frozen,
             )?,
-            v_proj: Self::linear_with_ids(
-                "v_proj.weight",
-                v_proj.0,
-                v_proj.1,
+            v_proj: Self::projection_with_ids(
+                "v_proj",
+                v_proj,
                 &[kv_hidden, cfg.hidden_size],
                 frozen,
             )?,
-            o_proj: Self::linear_with_ids(
-                "o_proj.weight",
-                o_proj.0,
-                o_proj.1,
+            o_proj: Self::projection_with_ids(
+                "o_proj",
+                o_proj,
                 &[cfg.hidden_size, cfg.hidden_size],
                 frozen,
             )?,
@@ -757,8 +845,19 @@ where
         x: &boostr::autograd::Var<R>,
     ) -> Result<boostr::autograd::Var<R>>
     where
-        C: boostr::RuntimeClient<R> + boostr::RoPEOps<R> + boostr::TensorOps<R>,
-        R::Client: boostr::FlashAttentionOps<R> + boostr::TensorOps<R>,
+        // `BinaryOps`/`ScalarOps` are `LoraLinear::forward`'s bounds: a
+        // LoRA-adapted projection scales and adds its low-rank branch through
+        // `var_mul_scalar`/`var_add`. A plain `Linear` needs neither, but the
+        // variant is a runtime choice, so the bounds apply either way.
+        C: boostr::RuntimeClient<R>
+            + boostr::RoPEOps<R>
+            + boostr::TensorOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::ScalarOps<R>,
+        R::Client: boostr::FlashAttentionOps<R>
+            + boostr::TensorOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::ScalarOps<R>,
     {
         let shape = x.shape();
         if shape.len() != 3 {
@@ -863,12 +962,26 @@ where
         Ok(())
     }
 
-    fn linear_no_bias<C>(
+    /// Build one no-bias projection, wrapping it in a LoRA adapter when `lora`
+    /// targets `name`.
+    ///
+    /// The adapter factors are taken from the same `VarBuilder` as every other
+    /// parameter, so they carry the model's `dtype` and are addressable as
+    /// `<prefix>.lora_a` / `<prefix>.lora_b`. `LoraLinear::new` would instead
+    /// allocate them F32 from its own PRNG, which mismatches a BF16/F16 model
+    /// and hides the factors from the checkpoint's name space.
+    ///
+    /// Both the base and the adapters come back TRAINABLE here. Freezing the
+    /// base is `LitGPT::new`'s job, via `FrozenParams` — see
+    /// `INITIALIZED_TRAINABLE`.
+    fn projection<C>(
         mut vb: VarBuilder<'_, R>,
+        name: &str,
         expected_shape: &[usize],
         dtype: DType,
+        lora: Option<&LoraConfig>,
         client: &C,
-    ) -> Result<boostr::nn::Linear<R>>
+    ) -> Result<MaybeLora<R>>
     where
         C: boostr::RuntimeClient<R>
             + boostr::RandomOps<R>
@@ -877,10 +990,11 @@ where
             + boostr::CompareOps<R>
             + boostr::TensorOps<R>,
     {
-        let param_name = if vb.prefix().is_empty() {
+        let prefix = vb.prefix().to_string();
+        let param_name = if prefix.is_empty() {
             "weight".to_string()
         } else {
-            format!("{}.weight", vb.prefix())
+            format!("{prefix}.weight")
         };
         let weight = take_or_init_tensor(
             &mut vb,
@@ -892,26 +1006,107 @@ where
         )?;
         Self::ensure_shape(&param_name, &weight, expected_shape)?;
         let weight_id = weight.id();
-        Ok(boostr::nn::Linear::with_ids(
-            weight,
-            weight_id,
-            None,
+        let base = boostr::nn::Linear::with_ids(weight, weight_id, None, INITIALIZED_TRAINABLE);
+
+        let Some(lora) = lora.filter(|lora| lora.targets(name)) else {
+            return Ok(MaybeLora::Plain(base));
+        };
+        let [out_features, in_features] = expected_shape else {
+            return Err(boostr::error::Error::ModelError {
+                reason: format!(
+                    "'{param_name}' has shape {expected_shape:?}, but a LoRA adapter needs a \
+                     2-D [out_features, in_features] projection to size its factors. Remove \
+                     '{name}' from lora.target_modules."
+                ),
+            });
+        };
+        // A is the standard Kaiming-uniform down-projection; B is zeros, so
+        // the adapter contributes nothing at step 0 and the wrapped model
+        // starts exactly where the base model left off.
+        let lora_a = take_or_init_tensor(
+            &mut vb,
+            "lora_a",
+            &[lora.rank, *in_features],
+            dtype,
+            Init::PyTorchLinear,
+            client,
+        )?;
+        let lora_b = take_or_init_tensor(
+            &mut vb,
+            "lora_b",
+            &[*out_features, lora.rank],
+            dtype,
+            Init::Zeros,
+            client,
+        )?;
+        let (lora_a_id, lora_b_id) = (lora_a.id(), lora_b.id());
+        Ok(MaybeLora::Lora(boostr::nn::LoraLinear::with_ids(
+            base,
+            lora_a,
+            lora_a_id,
+            lora_b,
+            lora_b_id,
+            lora.alpha,
             INITIALIZED_TRAINABLE,
-        ))
+        )))
     }
 
-    fn linear_with_ids(
+    /// Rebuild one projection from optimizer-updated tensors, preserving every
+    /// stable id and the adapter's rank/alpha.
+    ///
+    /// The adapter factors go through `LoraLinear::with_ids`, never
+    /// `from_weights`: `from_weights` derives each id from the tensor it is
+    /// handed, and `tensor_with_stable_id` hands over a CLONE, whose id is
+    /// fresh. That would give every adapter a new `TensorId` each step,
+    /// detaching the optimizer state and tripping
+    /// `assert_stable_parameter_ids`.
+    fn projection_with_ids(
         name: &str,
-        weight: Tensor<R>,
-        weight_id: boostr::autograd::TensorId,
+        proj: AttnProjWithIds<R>,
         expected_shape: &[usize],
         frozen: &FrozenParams,
-    ) -> Result<boostr::nn::Linear<R>> {
-        Self::ensure_shape(name, &weight, expected_shape)?;
-        let trainable = frozen.trainable(weight_id);
-        Ok(boostr::nn::Linear::with_ids(
-            weight, weight_id, None, trainable,
-        ))
+    ) -> Result<MaybeLora<R>> {
+        let AttnProjWithIds { weight, lora } = proj;
+        let weight_name = format!("{name}.weight");
+        Self::ensure_shape(&weight_name, &weight.0, expected_shape)?;
+        let base =
+            boostr::nn::Linear::with_ids(weight.0, weight.1, None, frozen.trainable(weight.1));
+
+        let Some(lora) = lora else {
+            return Ok(MaybeLora::Plain(base));
+        };
+        let [out_features, in_features] = expected_shape else {
+            return Err(boostr::error::Error::ModelError {
+                reason: format!(
+                    "'{weight_name}' has shape {expected_shape:?}, but its LoRA adapter needs \
+                     a 2-D [out_features, in_features] projection to check its factors against."
+                ),
+            });
+        };
+        let a_name = format!("{name}.lora_a");
+        let b_name = format!("{name}.lora_b");
+        let rank = match lora.a.0.shape() {
+            [rank, a_in] if a_in == in_features => *rank,
+            other => {
+                return Err(boostr::error::Error::ModelError {
+                    reason: format!(
+                        "shape mismatch for '{a_name}': expected [rank, {in_features}], got \
+                         {other:?}"
+                    ),
+                })
+            }
+        };
+        Self::ensure_shape(&b_name, &lora.b.0, &[*out_features, rank])?;
+        // boostr's `LoraLinear` takes ONE trainability flag for the factor
+        // pair, so a half-frozen adapter is rejected rather than silently
+        // rounded to trainable or frozen.
+        let trainable = frozen.group_trainable(
+            name,
+            &[(a_name.as_str(), lora.a.1), (b_name.as_str(), lora.b.1)],
+        )?;
+        Ok(MaybeLora::Lora(boostr::nn::LoraLinear::with_ids(
+            base, lora.a.0, lora.a.1, lora.b.0, lora.b.1, lora.alpha, trainable,
+        )))
     }
 
     fn ensure_shape(name: &str, weight: &Tensor<R>, expected_shape: &[usize]) -> Result<()> {
@@ -1840,6 +2035,7 @@ where
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
+        lora: Option<&LoraConfig>,
     ) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
@@ -1969,6 +2165,7 @@ where
                     vb.pp("self_attn"),
                     client,
                     dtype,
+                    lora,
                 )?),
                 mlp: Box::new(Mlp::new(cfg, vb.pp("mlp"), client, dtype)?),
                 input_layernorm: Self::take_rms_norm(
@@ -2040,10 +2237,10 @@ where
             (Tensor<R>, boostr::autograd::TensorId),
         )>,
         legacy_attention: Option<(
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
+            AttnProjWithIds<R>,
+            AttnProjWithIds<R>,
+            AttnProjWithIds<R>,
+            AttnProjWithIds<R>,
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
@@ -2277,9 +2474,12 @@ where
 
     fn forward<C>(&self, client: &C, x: &boostr::autograd::Var<R>) -> Result<BlockOutput<R>>
     where
+        // `BinaryOps` is carried for `CausalSelfAttention::forward`, whose
+        // projections may be LoRA-adapted.
         C: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
+            + boostr::BinaryOps<R>
             + boostr::CompareOps<R>
             + boostr::ConvOps<R>
             + boostr::QuantMatmulOps<R>
@@ -2288,6 +2488,7 @@ where
         R::Client: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
+            + boostr::BinaryOps<R>
             + boostr::CompareOps<R>
             + boostr::ConvOps<R>
             + boostr::FlashAttentionOps<R>
@@ -2760,6 +2961,7 @@ where
                 vb.pp(&format!("layers.{}", i)),
                 client,
                 compute_dtype,
+                cfg.lora.as_ref(),
             )?);
         }
 
@@ -2786,7 +2988,7 @@ where
             (lm_head.weight().tensor().clone(), lm_head.weight().id())
         };
 
-        Self::with_ids(
+        let model = Self::with_ids(
             cfg,
             (embed.weight().tensor().clone(), embed.weight().id()),
             layers,
@@ -2795,7 +2997,35 @@ where
             // Every id above was minted by `take_*` in this call, so none of
             // them can be frozen yet. See `INITIALIZED_TRAINABLE`.
             FrozenParams::new(),
-        )
+        )?;
+
+        // LoRA trains the adapter, not the projection it adapts. This is the
+        // first point at which the wrapped base ids EXIST, and routing the
+        // freeze through `FrozenParams` is what makes it survive every later
+        // `rebuild_with_parameters` — the trainer calls that once per step.
+        let frozen = model.lora_frozen_base_ids();
+        if frozen.is_empty() {
+            return Ok(model);
+        }
+        model.with_frozen_parameters(frozen)
+    }
+
+    /// The base-weight ids of every LoRA-adapted attention projection.
+    ///
+    /// Empty when no projection carries an adapter, which is what keeps a
+    /// non-LoRA model's parameter set byte-identical to before LoRA existed.
+    fn lora_frozen_base_ids(&self) -> FrozenParams {
+        let mut frozen = FrozenParams::new();
+        for layer in &self.layers {
+            if let BlockType::LegacyAttention { attn, .. } = &layer.block_type {
+                for proj in [&attn.q_proj, &attn.k_proj, &attn.v_proj, &attn.o_proj] {
+                    if proj.adapters().is_some() {
+                        frozen.freeze(proj.weight().id());
+                    }
+                }
+            }
+        }
+        frozen
     }
 
     fn with_ids(
@@ -2928,9 +3158,12 @@ where
 
     pub fn forward<C>(&self, client: &C, input_ids: &Tensor<R>) -> Result<ModelOutput<R>>
     where
+        // `BinaryOps` is carried for LoRA-adapted attention projections; see
+        // `CausalSelfAttention::forward`.
         C: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
+            + boostr::BinaryOps<R>
             + boostr::CompareOps<R>
             + boostr::ConvOps<R>
             + boostr::QuantMatmulOps<R>
@@ -2941,6 +3174,7 @@ where
         R::Client: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
+            + boostr::BinaryOps<R>
             + boostr::CompareOps<R>
             + boostr::ConvOps<R>
             + boostr::FlashAttentionOps<R>
@@ -3193,10 +3427,10 @@ where
                 None,
                 None,
                 Some((
-                    Self::tensor_with_stable_id(attn.q_proj.weight(), params)?,
-                    Self::tensor_with_stable_id(attn.k_proj.weight(), params)?,
-                    Self::tensor_with_stable_id(attn.v_proj.weight(), params)?,
-                    Self::tensor_with_stable_id(attn.o_proj.weight(), params)?,
+                    Self::attn_proj_with_ids(cfg, "q_proj", &attn.q_proj, params)?,
+                    Self::attn_proj_with_ids(cfg, "k_proj", &attn.k_proj, params)?,
+                    Self::attn_proj_with_ids(cfg, "v_proj", &attn.v_proj, params)?,
+                    Self::attn_proj_with_ids(cfg, "o_proj", &attn.o_proj, params)?,
                     Self::tensor_with_stable_id(&attn.rope.cos, params)?,
                     Self::tensor_with_stable_id(&attn.rope.sin, params)?,
                     Self::tensor_with_stable_id(mlp.gate_proj.weight(), params)?,
@@ -3578,6 +3812,41 @@ where
             .find_map(|(param_name, var)| (param_name == name).then_some(*var))
     }
 
+    /// Snapshot one attention projection for the rebuild path.
+    ///
+    /// The adapter factors go through `tensor_with_stable_id` exactly like
+    /// every other parameter, so the rebuilt layer reuses their ids instead of
+    /// minting new ones — the difference between resuming a LoRA run and
+    /// silently restarting it with detached optimizer state.
+    fn attn_proj_with_ids(
+        cfg: &OxidizrModelConfig,
+        name: &str,
+        proj: &MaybeLora<R>,
+        params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
+    ) -> Result<AttnProjWithIds<R>> {
+        let weight = Self::tensor_with_stable_id(proj.weight(), params)?;
+        let Some((lora_a, lora_b)) = proj.adapters() else {
+            return Ok(AttnProjWithIds { weight, lora: None });
+        };
+        let alpha = cfg.lora.as_ref().map(|lora| lora.alpha).ok_or_else(|| {
+            boostr::error::Error::ModelError {
+                reason: format!(
+                    "'{name}' carries a LoRA adapter but the model config has no lora block, \
+                     so the adapter's alpha cannot be recovered for the rebuild. Rebuild the \
+                     model from the config that built it."
+                ),
+            }
+        })?;
+        Ok(AttnProjWithIds {
+            weight,
+            lora: Some(LoraWithIds {
+                a: Self::tensor_with_stable_id(lora_a, params)?,
+                b: Self::tensor_with_stable_id(lora_b, params)?,
+                alpha,
+            }),
+        })
+    }
+
     fn tensor_with_stable_id(
         var: &boostr::autograd::Var<R>,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
@@ -3737,6 +4006,26 @@ where
         }
     }
 
+    /// Name one attention projection's trainable parameters:
+    /// `<prefix>.weight`, then `<prefix>.lora_a` / `<prefix>.lora_b` when it
+    /// carries an adapter. `push_named_param` drops whichever of these is
+    /// frozen, so a LoRA layer contributes only its factors.
+    fn push_named_projection<'a>(
+        params: &mut Vec<(
+            String,
+            boostr::autograd::TensorId,
+            &'a boostr::autograd::Var<R>,
+        )>,
+        prefix: &str,
+        proj: &'a MaybeLora<R>,
+    ) {
+        Self::push_named_param(params, format!("{prefix}.weight"), proj.weight());
+        if let Some((lora_a, lora_b)) = proj.adapters() {
+            Self::push_named_param(params, format!("{prefix}.lora_a"), lora_a);
+            Self::push_named_param(params, format!("{prefix}.lora_b"), lora_b);
+        }
+    }
+
     fn extend_named_from_module<'a>(
         params: &mut Vec<(
             String,
@@ -3839,26 +4128,18 @@ where
                     format!("{prefix}.input_layernorm.weight"),
                     input_layernorm.weight(),
                 );
-                Self::push_named_param(
-                    params,
-                    format!("{prefix}.self_attn.q_proj.weight"),
-                    attn.q_proj.weight(),
-                );
-                Self::push_named_param(
-                    params,
-                    format!("{prefix}.self_attn.k_proj.weight"),
-                    attn.k_proj.weight(),
-                );
-                Self::push_named_param(
-                    params,
-                    format!("{prefix}.self_attn.v_proj.weight"),
-                    attn.v_proj.weight(),
-                );
-                Self::push_named_param(
-                    params,
-                    format!("{prefix}.self_attn.o_proj.weight"),
-                    attn.o_proj.weight(),
-                );
+                for (name, proj) in [
+                    ("q_proj", &attn.q_proj),
+                    ("k_proj", &attn.k_proj),
+                    ("v_proj", &attn.v_proj),
+                    ("o_proj", &attn.o_proj),
+                ] {
+                    Self::push_named_projection(
+                        params,
+                        &format!("{prefix}.self_attn.{name}"),
+                        proj,
+                    );
+                }
                 Self::push_named_param(
                     params,
                     format!("{prefix}.post_attention_layernorm.weight"),
@@ -4141,6 +4422,7 @@ mod tie_word_embeddings_tests {
             rope_scaling: None,
             sliding_window: None,
             speech_vocab: None,
+            lora: None,
             dtype: crate::config::DTypePrecision::F32,
         }
     }
@@ -4280,7 +4562,7 @@ mod attention_extras_reach_dense_attention_tests {
         let cfg = model_cfg(attention);
         let mut varmap = boostr::VarMap::<CpuRuntime>::new();
         let vb = VarBuilder::new(&mut varmap, &device);
-        CausalSelfAttention::<CpuRuntime>::new(&cfg, vb, &client, DType::F32).unwrap()
+        CausalSelfAttention::<CpuRuntime>::new(&cfg, vb, &client, DType::F32, None).unwrap()
     }
 
     #[test]
@@ -4377,6 +4659,7 @@ mod frozen_parameter_tests {
             rope_scaling: None,
             sliding_window: None,
             speech_vocab: None,
+            lora: None,
             dtype: crate::config::DTypePrecision::F32,
         }
     }
@@ -4600,5 +4883,362 @@ mod frozen_parameter_tests {
             .to_string();
         assert!(message.contains("norm.weight"), "{message}");
         assert!(message.contains("norm.bias"), "{message}");
+    }
+}
+
+/// LoRA must add adapters and freeze the projections it adapts, and must keep
+/// doing both across `rebuild_with_parameters` — the call the training loop
+/// makes on every step. A mistake here silently converts LoRA back into full
+/// fine-tuning, or severs the adapter from the gradient graph.
+#[cfg(test)]
+mod lora_tests {
+    use super::*;
+    use boostr::{CpuClient, CpuDevice, CpuRuntime};
+
+    const TARGETS: [&str; 4] = ["q_proj", "k_proj", "v_proj", "o_proj"];
+
+    fn cfg(lora: Option<LoraConfig>) -> OxidizrModelConfig {
+        OxidizrModelConfig {
+            name: "lora-test".to_string(),
+            hidden_size: 8,
+            num_layers: 1,
+            num_heads: 2,
+            kv_heads: None,
+            kv_latent_dim: None,
+            q_latent_dim: None,
+            d_rope: None,
+            num_experts: None,
+            experts_per_tok: None,
+            shared_expert_enabled: None,
+            intermediate_size: Some(16),
+            mamba_layers: None,
+            mamba2_num_heads: None,
+            mamba2_head_dim: None,
+            mamba2_state_size: None,
+            mamba2_chunk_size: None,
+            mamba2_n_groups: None,
+            mamba2_conv_kernel: None,
+            mamba2_expand: None,
+            mamba3_enabled: None,
+            mamba3_complex_rope: None,
+            mamba3_mimo_rank: None,
+            mamba3_use_conv: None,
+            vocab_size: 12,
+            grow_vocab: false,
+            tie_word_embeddings: false,
+            tokenizer_vocab: "custom".to_string(),
+            max_seq_len: 8,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            sliding_window: None,
+            speech_vocab: None,
+            lora,
+            dtype: crate::config::DTypePrecision::F32,
+        }
+    }
+
+    fn lora_cfg() -> LoraConfig {
+        LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: TARGETS.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    fn build(lora: Option<LoraConfig>) -> LitGPT<CpuRuntime> {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut varmap = boostr::VarMap::<CpuRuntime>::new();
+        let mut vb = VarBuilder::new(&mut varmap, &device);
+        LitGPT::<CpuRuntime>::new(&cfg(lora), &mut vb, &client).expect("model builds")
+    }
+
+    fn names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
+        model
+            .named_trainable_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    fn trainable_ids(
+        model: &LitGPT<CpuRuntime>,
+    ) -> std::collections::HashSet<boostr::autograd::TensorId> {
+        model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn optimizer_params(
+        model: &LitGPT<CpuRuntime>,
+    ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
+        model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, var)| (id, var.tensor().clone()))
+            .collect()
+    }
+
+    fn projections(model: &LitGPT<CpuRuntime>) -> Vec<&MaybeLora<CpuRuntime>> {
+        match &model.layers[0].block_type {
+            BlockType::LegacyAttention { attn, .. } => {
+                vec![&attn.q_proj, &attn.k_proj, &attn.v_proj, &attn.o_proj]
+            }
+            _ => panic!("lora-test config must produce a LegacyAttention block"),
+        }
+    }
+
+    #[test]
+    fn adapters_are_trainable_and_the_wrapped_bases_are_not() {
+        let model = build(Some(lora_cfg()));
+        let listed = names(&model);
+        for target in TARGETS {
+            assert!(
+                listed.contains(&format!("layers.0.self_attn.{target}.lora_a")),
+                "{target}.lora_a must be trainable: {listed:?}"
+            );
+            assert!(
+                listed.contains(&format!("layers.0.self_attn.{target}.lora_b")),
+                "{target}.lora_b must be trainable: {listed:?}"
+            );
+            assert!(
+                !listed.contains(&format!("layers.0.self_attn.{target}.weight")),
+                "{target}.weight is the wrapped base — LoRA must freeze it, not train it"
+            );
+        }
+        // The un-adapted siblings are untouched: LoRA freezes what it wraps,
+        // nothing more.
+        assert!(listed.contains(&"layers.0.mlp.gate_proj.weight".to_string()));
+        assert!(listed.contains(&"embed_tokens.weight".to_string()));
+    }
+
+    #[test]
+    fn base_weights_carry_requires_grad_false() {
+        let model = build(Some(lora_cfg()));
+        for proj in projections(&model) {
+            assert!(
+                proj.adapters().is_some(),
+                "every targeted projection must be adapted"
+            );
+            assert!(
+                !proj.weight().requires_grad(),
+                "a wrapped base must be reconstructed with requires_grad = false"
+            );
+        }
+    }
+
+    #[test]
+    fn trainable_set_and_ids_are_identical_across_a_rebuild() {
+        // This is exactly what `assert_stable_parameter_ids` enforces at
+        // runtime: a rebuilt model whose trainable-id set differs from the
+        // optimizer's cached set is a hard error every step.
+        let model = build(Some(lora_cfg()));
+        let before_ids = trainable_ids(&model);
+        let before_names = names(&model);
+
+        let rebuilt = model
+            .rebuild_with_parameters(&optimizer_params(&model))
+            .expect("rebuild succeeds");
+
+        assert_eq!(before_ids, trainable_ids(&rebuilt));
+        assert_eq!(before_names, names(&rebuilt));
+    }
+
+    #[test]
+    fn adapters_still_require_grad_and_bases_stay_frozen_after_a_rebuild() {
+        let model = build(Some(lora_cfg()));
+        let rebuilt = model
+            .rebuild_with_parameters(&optimizer_params(&model))
+            .expect("rebuild succeeds");
+
+        for (before, after) in projections(&model).into_iter().zip(projections(&rebuilt)) {
+            let (a_before, b_before) = before.adapters().expect("adapted before");
+            let (a_after, b_after) = after.adapters().expect("adapted after");
+            assert_eq!(a_before.id(), a_after.id(), "lora_a must keep its TensorId");
+            assert_eq!(b_before.id(), b_after.id(), "lora_b must keep its TensorId");
+            assert!(a_after.requires_grad(), "lora_a must stay trainable");
+            assert!(b_after.requires_grad(), "lora_b must stay trainable");
+            assert!(
+                !after.weight().requires_grad(),
+                "the wrapped base must stay frozen"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_preserves_rank_and_scaling() {
+        let model = build(Some(lora_cfg()));
+        let rebuilt = model
+            .rebuild_with_parameters(&optimizer_params(&model))
+            .expect("rebuild succeeds");
+
+        for proj in projections(&rebuilt) {
+            match proj {
+                MaybeLora::Lora(lora) => {
+                    assert_eq!(lora.rank(), 2);
+                    // alpha / rank = 4.0 / 2
+                    assert!((lora.scaling() - 2.0).abs() < 1e-6, "{}", lora.scaling());
+                }
+                MaybeLora::Plain(_) => panic!("a targeted projection came back un-adapted"),
+            }
+        }
+    }
+
+    /// The anti-severed-graph test, at MODEL level.
+    ///
+    /// boostr's own `LoraLinear` test covers the layer in isolation; this one
+    /// covers the whole forward pass, where the adapter sits behind reshapes,
+    /// RoPE, and flash attention. If any of that drops the adapter's grad_fn,
+    /// `lora_b` receives no gradient and every adapter silently never trains —
+    /// with no error, no NaN, and a loss that still falls because the rest of
+    /// the network learns.
+    #[test]
+    fn a_gradient_reaches_lora_b_through_the_model() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut varmap = boostr::VarMap::<CpuRuntime>::new();
+        let mut vb = VarBuilder::new(&mut varmap, &device);
+        let model = LitGPT::<CpuRuntime>::new(&cfg(Some(lora_cfg())), &mut vb, &client)
+            .expect("model builds");
+
+        // i64, matching what `data.rs` uploads (it casts the u32 stream first).
+        let input_ids = Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device);
+        let output = model.forward(&client, &input_ids).expect("forward");
+        let loss =
+            boostr::autograd::var_sum(&output.logits, &[0, 1, 2], false, &client).expect("reduce");
+        let grads = boostr::autograd::backward(&loss, &client).expect("backward");
+
+        for (proj, name) in projections(&model).into_iter().zip(TARGETS) {
+            let (lora_a, lora_b) = proj.adapters().expect("adapted");
+            // lora_b is zero-initialised, so d(loss)/d(lora_a) is zero at step
+            // 0 by construction; lora_b is the factor that must receive signal
+            // immediately.
+            let grad = grads
+                .get(lora_b.id())
+                .unwrap_or_else(|| panic!("{name}.lora_b received no gradient"));
+            let values: Vec<f32> = grad.contiguous().expect("contiguous").to_vec();
+            let magnitude: f32 = values.iter().map(|v| v.abs()).sum();
+            assert!(
+                magnitude > 1e-8,
+                "{name}.lora_b gradient is all zeros ({magnitude}) — the LoRA graph is severed"
+            );
+            assert!(
+                grads.get(lora_a.id()).is_some(),
+                "{name}.lora_a must be reachable from the loss"
+            );
+        }
+    }
+
+    #[test]
+    fn lora_disabled_leaves_the_parameter_set_unchanged() {
+        let model = build(None);
+        assert!(
+            model.frozen_parameters().is_empty(),
+            "without a lora block nothing may be frozen"
+        );
+        for proj in projections(&model) {
+            assert!(proj.adapters().is_none(), "no adapter without a lora block");
+            assert!(proj.weight().requires_grad());
+        }
+        let listed = names(&model);
+        for target in TARGETS {
+            assert!(listed.contains(&format!("layers.0.self_attn.{target}.weight")));
+        }
+        assert!(
+            !listed.iter().any(|name| name.contains("lora_")),
+            "a non-LoRA model must expose no lora parameters: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_targeted_projections_are_adapted() {
+        let model = build(Some(LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+        }));
+        let listed = names(&model);
+        for target in ["q_proj", "v_proj"] {
+            assert!(listed.contains(&format!("layers.0.self_attn.{target}.lora_a")));
+            assert!(!listed.contains(&format!("layers.0.self_attn.{target}.weight")));
+        }
+        for untargeted in ["k_proj", "o_proj"] {
+            assert!(!listed.contains(&format!("layers.0.self_attn.{untargeted}.lora_a")));
+            assert!(
+                listed.contains(&format!("layers.0.self_attn.{untargeted}.weight")),
+                "an untargeted projection must stay a plain trainable Linear"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsupported_target_module_is_rejected_by_name() {
+        let message = cfg(Some(LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".to_string(), "gate_proj".to_string()],
+        }))
+        .to_boostr()
+        .expect_err("an unsupported target must be rejected")
+        .to_string();
+        assert!(
+            message.contains("gate_proj"),
+            "the error must name the offending target: {message}"
+        );
+        for supported in TARGETS {
+            assert!(
+                message.contains(supported),
+                "the error must list what IS supported: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn rank_zero_is_rejected() {
+        let message = cfg(Some(LoraConfig {
+            rank: 0,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".to_string()],
+        }))
+        .to_boostr()
+        .expect_err("rank 0 must be rejected")
+        .to_string();
+        assert!(message.contains("lora.rank"), "{message}");
+    }
+
+    #[test]
+    fn empty_target_modules_is_rejected() {
+        let message = cfg(Some(LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: Vec::new(),
+        }))
+        .to_boostr()
+        .expect_err("an empty target list must be rejected")
+        .to_string();
+        assert!(message.contains("lora.target_modules"), "{message}");
+    }
+
+    #[test]
+    fn absent_lora_block_leaves_the_config_hash_unchanged() {
+        // `compute_model_config_hash` hashes serialized JSON. A plain
+        // `Option` would serialize as `null` and change the hash of every
+        // pre-existing config, failing resume validation on weights that are
+        // in fact compatible.
+        let json = serde_json::to_string(&cfg(None)).expect("serializes");
+        // Match the KEY, not the bare substring: the fixture's `name` is
+        // "lora-test", which contains "lora" and would pass/fail spuriously.
+        assert!(
+            !json.contains("\"lora\":"),
+            "an absent lora block must not reach the hashed JSON: {json}"
+        );
+        assert_ne!(
+            crate::config::compute_model_config_hash(&cfg(None)),
+            crate::config::compute_model_config_hash(&cfg(Some(lora_cfg()))),
+            "a PRESENT lora block must change the hash — it changes which \
+             parameters exist, so the two checkpoints are incompatible"
+        );
     }
 }

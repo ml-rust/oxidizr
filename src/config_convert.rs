@@ -7,7 +7,7 @@
 //! place that bridges the two, so architecture features only need to be taught
 //! to boostr once instead of hand-ported into every oxidizr consumer.
 
-use crate::config::{OxidizrModelConfig, RopeScalingSpec};
+use crate::config::{OxidizrModelConfig, RopeScalingSpec, SUPPORTED_LORA_TARGETS};
 use crate::prelude::Result;
 use boostr::error::Error;
 use boostr::model::config::{
@@ -126,6 +126,57 @@ fn validate_speech_vocab(cfg: &OxidizrModelConfig) -> Result<()> {
              to total {}.",
             cfg.vocab_size, cfg.vocab_size
         )));
+    }
+    Ok(())
+}
+
+/// Reject a `lora` block this build cannot honor in full.
+///
+/// Every rejection here is a case that would otherwise produce a model with
+/// FEWER adapters than the config asked for, with nothing at runtime to say
+/// so: the run would look like LoRA fine-tuning while training nothing (or
+/// only part) of what was requested.
+fn validate_lora(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Result<()> {
+    let Some(lora) = &cfg.lora else {
+        return Ok(());
+    };
+    if lora.rank == 0 {
+        return Err(model_error(
+            "lora.rank is 0: an adapter of rank 0 has no parameters, so LoRA would \
+             train nothing. Set lora.rank to a positive value (typical: 8), or remove \
+             the lora block.",
+        ));
+    }
+    if lora.target_modules.is_empty() {
+        return Err(model_error(format!(
+            "lora.target_modules is empty: no projection would get an adapter, so LoRA \
+             would train nothing. List at least one of: {}, or remove the lora block.",
+            SUPPORTED_LORA_TARGETS.join(", ")
+        )));
+    }
+    for target in &lora.target_modules {
+        if !SUPPORTED_LORA_TARGETS.contains(&target.as_str()) {
+            return Err(model_error(format!(
+                "lora.target_modules names {target:?}, which carries no adapter. \
+                 Supported targets are: {}. Remove {target:?} from lora.target_modules.",
+                SUPPORTED_LORA_TARGETS.join(", ")
+            )));
+        }
+    }
+    if matches!(shape, LayerShape::SsmOnly) {
+        return Err(model_error(
+            "lora is set but mamba_layers covers every layer (SsmOnly): there is no \
+             attention block to attach an adapter to. Remove the lora block, or leave \
+             at least one attention layer.",
+        ));
+    }
+    if cfg.kv_latent_dim.is_some() {
+        return Err(model_error(
+            "lora is set together with kv_latent_dim, which selects the MLA attention \
+             path (q_a_proj / q_b_proj / kv_a_proj_with_mqa / kv_b_proj). LoRA adapters \
+             are wired to the dense q_proj/k_proj/v_proj/o_proj path only, so no adapter \
+             would be created. Remove kv_latent_dim, or remove the lora block.",
+        ));
     }
     Ok(())
 }
@@ -321,6 +372,7 @@ impl OxidizrModelConfig {
         let mamba3 = self.mamba3_enabled.unwrap_or(false);
         validate_attention_extras(self, &shape)?;
         validate_speech_vocab(self)?;
+        validate_lora(self, &shape)?;
 
         let moe = to_moe(self)?;
         let intermediate_size = if moe.is_some() {

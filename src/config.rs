@@ -127,6 +127,22 @@ pub struct OxidizrModelConfig {
     /// dense-attention path; boostr's hybrid path never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sliding_window: Option<usize>,
+    /// LoRA adapters on the dense-attention projections. Absent = full
+    /// fine-tuning, byte-identical to before this field existed.
+    ///
+    /// On the MODEL config, not `TrainerConfig`, because enabling LoRA changes
+    /// which parameters exist: each targeted projection gains `lora_a`/`lora_b`
+    /// and its base weight is frozen. A LoRA checkpoint therefore is not
+    /// interchangeable with a full-fine-tune one, and
+    /// `compute_model_config_hash` must reflect that — the same reason
+    /// `tie_word_embeddings` is not stripped there. Optimizer/schedule knobs,
+    /// which never change the parameter set, stay on `TrainerConfig`.
+    ///
+    /// `skip_serializing_if` keeps the key out of the hashed JSON, so every
+    /// pre-existing checkpoint keeps its hash and still passes resume
+    /// validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lora: Option<LoraConfig>,
     /// Speech-LM id layout (text | control | audio regions).
     ///
     /// Present turns ON audio-only loss masking: the data loader emits a
@@ -165,6 +181,34 @@ pub struct RopeScalingSpec {
     pub beta_fast: Option<f32>,
     #[serde(default)]
     pub beta_slow: Option<f32>,
+}
+
+/// Attention projections that can carry a LoRA adapter.
+///
+/// Everything else (`gate_proj`/`up_proj`/`down_proj`, MoE experts, MLA's
+/// `q_a_proj`/`kv_b_proj`, the SSM projections) is NOT wrapped, so naming one
+/// is rejected rather than silently dropped — a config asking for four
+/// adapters must never yield three.
+pub const SUPPORTED_LORA_TARGETS: [&str; 4] = ["q_proj", "k_proj", "v_proj", "o_proj"];
+
+/// LoRA adapter parameters. See [`OxidizrModelConfig::lora`] for why this
+/// lives on the model config.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct LoraConfig {
+    /// Low-rank dimension of the adapter (typical: 4, 8, 16, 32).
+    pub rank: usize,
+    /// Adapter scaling numerator; the layer applies `alpha / rank`.
+    pub alpha: f32,
+    /// Which attention projections get an adapter. Must be a non-empty subset
+    /// of [`SUPPORTED_LORA_TARGETS`].
+    pub target_modules: Vec<String>,
+}
+
+impl LoraConfig {
+    /// Whether `projection` (e.g. `"q_proj"`) carries an adapter.
+    pub fn targets(&self, projection: &str) -> bool {
+        self.target_modules.iter().any(|name| name == projection)
+    }
 }
 
 /// Target device for training/inference
@@ -467,6 +511,7 @@ impl LitConfig {
                 rope_scaling: None,
                 sliding_window: None,
                 speech_vocab: None,
+                lora: None,
                 dtype: DTypePrecision::F32,
             },
             trainer: TrainerConfig {
@@ -551,6 +596,7 @@ impl LitConfig {
                 rope_scaling: None,
                 sliding_window: None,
                 speech_vocab: None,
+                lora: None,
                 dtype: DTypePrecision::F32,
             },
             trainer: TrainerConfig {

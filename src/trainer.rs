@@ -80,6 +80,7 @@ where
         + TensorOps<R>
         + FusedOptimizerOps<R>
         + boostr::ScalarOps<R>
+        + boostr::BinaryOps<R>
         + boostr::CompareOps<R>
         + boostr::ConvOps<R>
         + boostr::FlashAttentionOps<R>
