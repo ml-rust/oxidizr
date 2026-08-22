@@ -599,10 +599,10 @@ where
     }
 }
 
-// --- Optionally LoRA-adapted attention projection ---
+// --- Optionally LoRA-adapted projection ---
 
-/// An attention projection that is either a plain `Linear` or that same
-/// `Linear` wrapped in a LoRA adapter.
+/// A projection that is either a plain `Linear` or that same `Linear` wrapped
+/// in a LoRA adapter. Used by both the attention block and the MLP.
 ///
 /// `LoraLinear::forward` is signature-compatible with `Linear::forward`, so the
 /// forward path treats the two identically. Everything else on this type exists
@@ -618,6 +618,9 @@ enum MaybeLora<R: boostr::Runtime> {
 /// One projection's tensors paired with their stable parameter ids, for the
 /// `*_with_ids` rebuild path. The adapter pair is present exactly when the
 /// projection being rebuilt carries one.
+///
+/// Shared by the attention projections and the MLP's `gate_proj`/`up_proj`/
+/// `down_proj`: both rebuild through the same `projection_with_ids`.
 struct AttnProjWithIds<R: boostr::Runtime> {
     weight: WeightWithId<R>,
     lora: Option<LoraWithIds<R>>,
@@ -1126,9 +1129,9 @@ where
 // --- MLP with SwiGLU Activation ---
 
 struct Mlp<R: boostr::Runtime> {
-    gate_proj: boostr::nn::Linear<R>,
-    up_proj: boostr::nn::Linear<R>,
-    down_proj: boostr::nn::Linear<R>,
+    gate_proj: MaybeLora<R>,
+    up_proj: MaybeLora<R>,
+    down_proj: MaybeLora<R>,
 }
 
 impl<R> Mlp<R>
@@ -1140,6 +1143,7 @@ where
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
+        lora: Option<&LoraConfig>,
     ) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
@@ -1151,23 +1155,35 @@ where
     {
         let intermediate_size = cfg.intermediate_size.unwrap_or(cfg.hidden_size * 4);
 
+        // `CausalSelfAttention::projection` is the single builder for an
+        // optionally-adapted no-bias projection: it takes the factors from the
+        // same `VarBuilder` (so they carry the model dtype and are named
+        // `<prefix>.lora_a` / `<prefix>.lora_b`) and returns both the base and
+        // the adapters trainable. Freezing the wrapped base stays
+        // `LitGPT::new`'s job, via `FrozenParams`.
         Ok(Self {
-            gate_proj: Self::linear_no_bias(
+            gate_proj: CausalSelfAttention::<R>::projection(
                 vb.pp("gate_proj"),
+                "gate_proj",
                 &[intermediate_size, cfg.hidden_size],
                 dtype,
+                lora,
                 client,
             )?,
-            up_proj: Self::linear_no_bias(
+            up_proj: CausalSelfAttention::<R>::projection(
                 vb.pp("up_proj"),
+                "up_proj",
                 &[intermediate_size, cfg.hidden_size],
                 dtype,
+                lora,
                 client,
             )?,
-            down_proj: Self::linear_no_bias(
+            down_proj: CausalSelfAttention::<R>::projection(
                 vb.pp("down_proj"),
+                "down_proj",
                 &[cfg.hidden_size, intermediate_size],
                 dtype,
+                lora,
                 client,
             )?,
         })
@@ -1175,36 +1191,38 @@ where
 
     fn with_ids(
         cfg: &ModelConfig,
-        gate_proj: (Tensor<R>, boostr::autograd::TensorId),
-        up_proj: (Tensor<R>, boostr::autograd::TensorId),
-        down_proj: (Tensor<R>, boostr::autograd::TensorId),
+        gate_proj: AttnProjWithIds<R>,
+        up_proj: AttnProjWithIds<R>,
+        down_proj: AttnProjWithIds<R>,
         frozen: &FrozenParams,
     ) -> Result<Self> {
         let intermediate_size = cfg.intermediate_size.unwrap_or(cfg.hidden_size * 4);
 
         Ok(Self {
-            gate_proj: Self::linear_with_ids(
-                "gate_proj.weight",
-                gate_proj.0,
-                gate_proj.1,
+            gate_proj: CausalSelfAttention::<R>::projection_with_ids(
+                "gate_proj",
+                gate_proj,
                 &[intermediate_size, cfg.hidden_size],
                 frozen,
             )?,
-            up_proj: Self::linear_with_ids(
-                "up_proj.weight",
-                up_proj.0,
-                up_proj.1,
+            up_proj: CausalSelfAttention::<R>::projection_with_ids(
+                "up_proj",
+                up_proj,
                 &[intermediate_size, cfg.hidden_size],
                 frozen,
             )?,
-            down_proj: Self::linear_with_ids(
-                "down_proj.weight",
-                down_proj.0,
-                down_proj.1,
+            down_proj: CausalSelfAttention::<R>::projection_with_ids(
+                "down_proj",
+                down_proj,
                 &[cfg.hidden_size, intermediate_size],
                 frozen,
             )?,
         })
+    }
+
+    /// The three projections in `named_parameters` order.
+    fn projections(&self) -> [&MaybeLora<R>; 3] {
+        [&self.gate_proj, &self.up_proj, &self.down_proj]
     }
 
     fn forward<C>(
@@ -1213,11 +1231,19 @@ where
         x: &boostr::autograd::Var<R>,
     ) -> Result<boostr::autograd::Var<R>>
     where
+        // `BinaryOps` is `LoraLinear::forward`'s bound: an adapted projection
+        // scales and adds its low-rank branch. A plain `Linear` needs none of
+        // it, but the variant is a runtime choice, so the bound applies either
+        // way.
         C: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
+            + boostr::BinaryOps<R>
             + boostr::TypeConversionOps<R>,
-        R::Client: boostr::TensorOps<R> + boostr::ScalarOps<R> + boostr::TypeConversionOps<R>,
+        R::Client: boostr::TensorOps<R>
+            + boostr::ScalarOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::TypeConversionOps<R>,
     {
         // SwiGLU: silu(gate) * up, delegated to boostr/numr's fused Var op.
         let gate_linear = self.gate_proj.forward(client, x)?;
@@ -1296,70 +1322,6 @@ where
         params.extend(self.up_proj.trainable_parameters());
         params.extend(self.down_proj.trainable_parameters());
         params
-    }
-
-    fn linear_no_bias<C>(
-        mut vb: VarBuilder<'_, R>,
-        expected_shape: &[usize],
-        dtype: DType,
-        client: &C,
-    ) -> Result<boostr::nn::Linear<R>>
-    where
-        C: boostr::RuntimeClient<R>
-            + boostr::RandomOps<R>
-            + boostr::ScalarOps<R>
-            + boostr::BinaryOps<R>
-            + boostr::CompareOps<R>
-            + boostr::TensorOps<R>,
-    {
-        let param_name = if vb.prefix().is_empty() {
-            "weight".to_string()
-        } else {
-            format!("{}.weight", vb.prefix())
-        };
-        let weight = take_or_init_tensor(
-            &mut vb,
-            "weight",
-            expected_shape,
-            dtype,
-            Init::PyTorchLinear,
-            client,
-        )?;
-        Self::ensure_shape(&param_name, &weight, expected_shape)?;
-        let weight_id = weight.id();
-        Ok(boostr::nn::Linear::with_ids(
-            weight,
-            weight_id,
-            None,
-            INITIALIZED_TRAINABLE,
-        ))
-    }
-
-    fn linear_with_ids(
-        name: &str,
-        weight: Tensor<R>,
-        weight_id: boostr::autograd::TensorId,
-        expected_shape: &[usize],
-        frozen: &FrozenParams,
-    ) -> Result<boostr::nn::Linear<R>> {
-        Self::ensure_shape(name, &weight, expected_shape)?;
-        let trainable = frozen.trainable(weight_id);
-        Ok(boostr::nn::Linear::with_ids(
-            weight, weight_id, None, trainable,
-        ))
-    }
-
-    fn ensure_shape(name: &str, weight: &Tensor<R>, expected_shape: &[usize]) -> Result<()> {
-        if weight.shape() != expected_shape {
-            return Err(boostr::error::Error::ModelError {
-                reason: format!(
-                    "shape mismatch for '{name}': expected {:?}, got {:?}",
-                    expected_shape,
-                    weight.shape()
-                ),
-            });
-        }
-        Ok(())
     }
 
     fn tensor_to_f32_vec<C>(client: &C, tensor: &Tensor<R>) -> Result<Vec<f32>>
@@ -1842,7 +1804,13 @@ impl<R> FfnLayer<R>
 where
     R: boostr::Runtime<DType = DType>,
 {
-    fn new<C>(cfg: &ModelConfig, vb: VarBuilder<'_, R>, client: &C, dtype: DType) -> Result<Self>
+    fn new<C>(
+        cfg: &ModelConfig,
+        vb: VarBuilder<'_, R>,
+        client: &C,
+        dtype: DType,
+        lora: Option<&LoraConfig>,
+    ) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
             + boostr::RandomOps<R>
@@ -1852,24 +1820,49 @@ where
             + boostr::TensorOps<R>,
     {
         if cfg.moe.is_some() {
-            // MoE mode
+            // MoE mode. boostr's `nn::moe::expert::Expert` stores concrete
+            // `Linear` fields, so an expert projection cannot hold an adapter.
+            // `validate_lora` already rejects this pairing at config load; the
+            // check is repeated here so no other caller can build a model that
+            // claims adapters it does not have.
+            Self::reject_moe_lora(lora)?;
             Ok(FfnLayer::Moe(Box::new(MoeLayer::new(
                 cfg, vb, client, dtype,
             )?)))
         } else {
             // Simple MLP mode (no MoE)
-            Ok(FfnLayer::Mlp(Box::new(Mlp::new(cfg, vb, client, dtype)?)))
+            Ok(FfnLayer::Mlp(Box::new(Mlp::new(
+                cfg, vb, client, dtype, lora,
+            )?)))
         }
+    }
+
+    /// Refuse a `lora` block that names an MLP projection while this layer is
+    /// a MoE layer.
+    fn reject_moe_lora(lora: Option<&LoraConfig>) -> Result<()> {
+        let Some(lora) = lora else {
+            return Ok(());
+        };
+        let Some(target) = crate::config::MLP_LORA_TARGETS
+            .iter()
+            .find(|&&target| lora.targets(target))
+        else {
+            return Ok(());
+        };
+        Err(boostr::error::Error::ModelError {
+            reason: format!(
+                "lora.target_modules names '{target}' but this layer is a MoE layer, whose \
+                 experts are built from boostr's nn::moe::expert::Expert — it stores concrete \
+                 Linear fields and cannot hold a LoRA adapter. Remove '{target}' from \
+                 lora.target_modules, or remove num_experts from the model config."
+            ),
+        })
     }
 
     #[allow(clippy::type_complexity)]
     fn with_ids(
         cfg: &ModelConfig,
-        mlp: Option<(
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-        )>,
+        mlp: Option<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
         moe: Option<(
             Vec<(
                 (Tensor<R>, boostr::autograd::TensorId),
@@ -2141,7 +2134,7 @@ where
                     client,
                     dtype,
                 )?),
-                ffn: FfnLayer::new(cfg, vb.pp(ffn_prefix), client, dtype)?,
+                ffn: FfnLayer::new(cfg, vb.pp(ffn_prefix), client, dtype, lora)?,
                 input_layernorm: Self::take_rms_norm(
                     vb.pp("input_layernorm"),
                     cfg.hidden_size,
@@ -2167,7 +2160,7 @@ where
                     dtype,
                     lora,
                 )?),
-                mlp: Box::new(Mlp::new(cfg, vb.pp("mlp"), client, dtype)?),
+                mlp: Box::new(Mlp::new(cfg, vb.pp("mlp"), client, dtype, lora)?),
                 input_layernorm: Self::take_rms_norm(
                     vb.pp("input_layernorm"),
                     cfg.hidden_size,
@@ -2215,11 +2208,7 @@ where
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
-            Option<(
-                (Tensor<R>, boostr::autograd::TensorId),
-                (Tensor<R>, boostr::autograd::TensorId),
-                (Tensor<R>, boostr::autograd::TensorId),
-            )>,
+            Option<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
             Option<(
                 Vec<(
                     (Tensor<R>, boostr::autograd::TensorId),
@@ -2243,9 +2232,9 @@ where
             AttnProjWithIds<R>,
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
+            AttnProjWithIds<R>,
+            AttnProjWithIds<R>,
+            AttnProjWithIds<R>,
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
         )>,
@@ -3010,19 +2999,39 @@ where
         model.with_frozen_parameters(frozen)
     }
 
-    /// The base-weight ids of every LoRA-adapted attention projection.
+    /// The base-weight ids of every LoRA-adapted projection, attention and MLP
+    /// alike.
     ///
     /// Empty when no projection carries an adapter, which is what keeps a
     /// non-LoRA model's parameter set byte-identical to before LoRA existed.
     fn lora_frozen_base_ids(&self) -> FrozenParams {
         let mut frozen = FrozenParams::new();
+        let mut freeze_adapted = |proj: &MaybeLora<R>| {
+            if proj.adapters().is_some() {
+                frozen.freeze(proj.weight().id());
+            }
+        };
         for layer in &self.layers {
-            if let BlockType::LegacyAttention { attn, .. } = &layer.block_type {
-                for proj in [&attn.q_proj, &attn.k_proj, &attn.v_proj, &attn.o_proj] {
-                    if proj.adapters().is_some() {
-                        frozen.freeze(proj.weight().id());
+            match &layer.block_type {
+                BlockType::LegacyAttention { attn, mlp, .. } => {
+                    for proj in [&attn.q_proj, &attn.k_proj, &attn.v_proj, &attn.o_proj] {
+                        freeze_adapted(proj);
+                    }
+                    for proj in mlp.projections() {
+                        freeze_adapted(proj);
                     }
                 }
+                // The MLA path's MLP shares `Mlp`, so an adapter reaching it
+                // must freeze its base here too rather than train both halves.
+                BlockType::Attention {
+                    ffn: FfnLayer::Mlp(mlp),
+                    ..
+                } => {
+                    for proj in mlp.projections() {
+                        freeze_adapted(proj);
+                    }
+                }
+                _ => {}
             }
         }
         frozen
@@ -3407,7 +3416,9 @@ where
                 post_attention_layernorm,
             } => {
                 let (mlp, moe) = match ffn {
-                    FfnLayer::Mlp(mlp) => (Some(Self::mlp_weights_with_ids(mlp, params)?), None),
+                    FfnLayer::Mlp(mlp) => {
+                        (Some(Self::mlp_weights_with_ids(cfg, mlp, params)?), None)
+                    }
                     FfnLayer::Moe(moe) => (None, Some(Self::moe_weights_with_ids(moe, params)?)),
                 };
                 let attn_named = attn.mla.named_parameters();
@@ -3440,29 +3451,32 @@ where
                 mlp,
                 input_layernorm,
                 post_attention_layernorm,
-            } => Block::with_ids(
-                &bcfg,
-                layer_idx,
-                None,
-                None,
-                None,
-                None,
-                Some((
-                    Self::attn_proj_with_ids(cfg, "q_proj", &attn.q_proj, params)?,
-                    Self::attn_proj_with_ids(cfg, "k_proj", &attn.k_proj, params)?,
-                    Self::attn_proj_with_ids(cfg, "v_proj", &attn.v_proj, params)?,
-                    Self::attn_proj_with_ids(cfg, "o_proj", &attn.o_proj, params)?,
-                    Self::tensor_with_stable_id(&attn.rope.cos, params)?,
-                    Self::tensor_with_stable_id(&attn.rope.sin, params)?,
-                    Self::tensor_with_stable_id(mlp.gate_proj.weight(), params)?,
-                    Self::tensor_with_stable_id(mlp.up_proj.weight(), params)?,
-                    Self::tensor_with_stable_id(mlp.down_proj.weight(), params)?,
-                    Self::tensor_with_stable_id(input_layernorm.weight(), params)?,
-                    Self::tensor_with_stable_id(post_attention_layernorm.weight(), params)?,
-                )),
-                device,
-                frozen,
-            ),
+            } => {
+                let (gate_proj, up_proj, down_proj) = Self::mlp_weights_with_ids(cfg, mlp, params)?;
+                Block::with_ids(
+                    &bcfg,
+                    layer_idx,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some((
+                        Self::attn_proj_with_ids(cfg, "q_proj", &attn.q_proj, params)?,
+                        Self::attn_proj_with_ids(cfg, "k_proj", &attn.k_proj, params)?,
+                        Self::attn_proj_with_ids(cfg, "v_proj", &attn.v_proj, params)?,
+                        Self::attn_proj_with_ids(cfg, "o_proj", &attn.o_proj, params)?,
+                        Self::tensor_with_stable_id(&attn.rope.cos, params)?,
+                        Self::tensor_with_stable_id(&attn.rope.sin, params)?,
+                        gate_proj,
+                        up_proj,
+                        down_proj,
+                        Self::tensor_with_stable_id(input_layernorm.weight(), params)?,
+                        Self::tensor_with_stable_id(post_attention_layernorm.weight(), params)?,
+                    )),
+                    device,
+                    frozen,
+                )
+            }
         }
     }
 
@@ -3665,14 +3679,18 @@ where
         })
     }
 
+    /// Snapshot the MLP's three projections for the rebuild path, adapters
+    /// included. Routing through `attn_proj_with_ids` is what carries every
+    /// `lora_a`/`lora_b` id across a step instead of minting a fresh one.
     fn mlp_weights_with_ids(
+        cfg: &OxidizrModelConfig,
         mlp: &Mlp<R>,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
-    ) -> Result<(WeightWithId<R>, WeightWithId<R>, WeightWithId<R>)> {
+    ) -> Result<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)> {
         Ok((
-            Self::tensor_with_stable_id(mlp.gate_proj.weight(), params)?,
-            Self::tensor_with_stable_id(mlp.up_proj.weight(), params)?,
-            Self::tensor_with_stable_id(mlp.down_proj.weight(), params)?,
+            Self::attn_proj_with_ids(cfg, "gate_proj", &mlp.gate_proj, params)?,
+            Self::attn_proj_with_ids(cfg, "up_proj", &mlp.up_proj, params)?,
+            Self::attn_proj_with_ids(cfg, "down_proj", &mlp.down_proj, params)?,
         ))
     }
 
@@ -3833,7 +3851,7 @@ where
             .find_map(|(param_name, var)| (param_name == name).then_some(*var))
     }
 
-    /// Snapshot one attention projection for the rebuild path.
+    /// Snapshot one optionally-adapted projection for the rebuild path.
     ///
     /// The adapter factors go through `tensor_with_stable_id` exactly like
     /// every other parameter, so the rebuilt layer reuses their ids instead of
@@ -4025,7 +4043,7 @@ where
         params.push((name, var.id(), var));
     }
 
-    /// Name one attention projection's trainable parameters:
+    /// Name one projection's trainable parameters:
     /// `<prefix>.weight`, then `<prefix>.lora_a` / `<prefix>.lora_b` when it
     /// carries an adapter. `push_named_param` drops whichever of these is
     /// frozen, so a LoRA layer contributes only its factors.
@@ -4164,21 +4182,13 @@ where
                     format!("{prefix}.post_attention_layernorm.weight"),
                     post_attention_layernorm.weight(),
                 );
-                Self::push_named_param(
-                    params,
-                    format!("{prefix}.mlp.gate_proj.weight"),
-                    mlp.gate_proj.weight(),
-                );
-                Self::push_named_param(
-                    params,
-                    format!("{prefix}.mlp.up_proj.weight"),
-                    mlp.up_proj.weight(),
-                );
-                Self::push_named_param(
-                    params,
-                    format!("{prefix}.mlp.down_proj.weight"),
-                    mlp.down_proj.weight(),
-                );
+                for (name, proj) in [
+                    ("gate_proj", &mlp.gate_proj),
+                    ("up_proj", &mlp.up_proj),
+                    ("down_proj", &mlp.down_proj),
+                ] {
+                    Self::push_named_projection(params, &format!("{prefix}.mlp.{name}"), proj);
+                }
             }
         }
     }
@@ -4194,21 +4204,17 @@ where
     ) {
         match ffn {
             FfnLayer::Mlp(mlp) => {
-                Self::push_named_param(
-                    params,
-                    format!("{layer_prefix}.mlp.gate_proj.weight"),
-                    mlp.gate_proj.weight(),
-                );
-                Self::push_named_param(
-                    params,
-                    format!("{layer_prefix}.mlp.up_proj.weight"),
-                    mlp.up_proj.weight(),
-                );
-                Self::push_named_param(
-                    params,
-                    format!("{layer_prefix}.mlp.down_proj.weight"),
-                    mlp.down_proj.weight(),
-                );
+                for (name, proj) in [
+                    ("gate_proj", &mlp.gate_proj),
+                    ("up_proj", &mlp.up_proj),
+                    ("down_proj", &mlp.down_proj),
+                ] {
+                    Self::push_named_projection(
+                        params,
+                        &format!("{layer_prefix}.mlp.{name}"),
+                        proj,
+                    );
+                }
             }
             FfnLayer::Moe(moe) => {
                 Self::push_named_param(
@@ -4939,6 +4945,7 @@ mod lora_tests {
     use boostr::{CpuClient, CpuDevice, CpuRuntime};
 
     const TARGETS: [&str; 4] = ["q_proj", "k_proj", "v_proj", "o_proj"];
+    const MLP_TARGETS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
     fn cfg(lora: Option<LoraConfig>) -> OxidizrModelConfig {
         OxidizrModelConfig {
@@ -5031,6 +5038,35 @@ mod lora_tests {
             }
             _ => panic!("lora-test config must produce a LegacyAttention block"),
         }
+    }
+
+    /// The MLP's three projections, in `MLP_TARGETS` order.
+    fn mlp_projections(model: &LitGPT<CpuRuntime>) -> Vec<&MaybeLora<CpuRuntime>> {
+        match &model.layers[0].block_type {
+            BlockType::LegacyAttention { mlp, .. } => mlp.projections().to_vec(),
+            _ => panic!("lora-test config must produce a LegacyAttention block"),
+        }
+    }
+
+    fn lora_cfg_for(targets: &[&str]) -> LoraConfig {
+        LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: targets.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    /// Every adapted projection, paired with the dotted prefix its parameters
+    /// are named under.
+    fn adapted_with_prefixes(model: &LitGPT<CpuRuntime>) -> Vec<(String, &MaybeLora<CpuRuntime>)> {
+        let mut pairs = Vec::new();
+        for (name, proj) in TARGETS.iter().zip(projections(model)) {
+            pairs.push((format!("layers.0.self_attn.{name}"), proj));
+        }
+        for (name, proj) in MLP_TARGETS.iter().zip(mlp_projections(model)) {
+            pairs.push((format!("layers.0.mlp.{name}"), proj));
+        }
+        pairs
     }
 
     #[test]
@@ -5221,13 +5257,15 @@ mod lora_tests {
         let message = cfg(Some(LoraConfig {
             rank: 2,
             alpha: 4.0,
-            target_modules: vec!["q_proj".to_string(), "gate_proj".to_string()],
+            // MLA's `kv_b_proj` is real but unwrapped: naming it must fail
+            // rather than yield a model with one adapter fewer than asked.
+            target_modules: vec!["q_proj".to_string(), "kv_b_proj".to_string()],
         }))
         .to_boostr()
         .expect_err("an unsupported target must be rejected")
         .to_string();
         assert!(
-            message.contains("gate_proj"),
+            message.contains("kv_b_proj"),
             "the error must name the offending target: {message}"
         );
         for supported in TARGETS {
@@ -5282,6 +5320,172 @@ mod lora_tests {
             crate::config::compute_model_config_hash(&cfg(Some(lora_cfg()))),
             "a PRESENT lora block must change the hash — it changes which \
              parameters exist, so the two checkpoints are incompatible"
+        );
+    }
+
+    // --- MLP projections ---
+
+    #[test]
+    fn mlp_adapters_are_trainable_and_the_wrapped_bases_are_not() {
+        let model = build(Some(lora_cfg_for(&MLP_TARGETS)));
+        let listed = names(&model);
+        for target in MLP_TARGETS {
+            assert!(
+                listed.contains(&format!("layers.0.mlp.{target}.lora_a")),
+                "mlp.{target}.lora_a must be trainable: {listed:?}"
+            );
+            assert!(
+                listed.contains(&format!("layers.0.mlp.{target}.lora_b")),
+                "mlp.{target}.lora_b must be trainable: {listed:?}"
+            );
+            assert!(
+                !listed.contains(&format!("layers.0.mlp.{target}.weight")),
+                "mlp.{target}.weight is the wrapped base — LoRA must freeze it, not train it"
+            );
+        }
+        // The attention block is untargeted here and must stay untouched.
+        for untargeted in TARGETS {
+            assert!(
+                listed.contains(&format!("layers.0.self_attn.{untargeted}.weight")),
+                "an untargeted projection must stay a plain trainable Linear: {listed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mlp_base_weights_carry_requires_grad_false() {
+        let model = build(Some(lora_cfg_for(&MLP_TARGETS)));
+        for proj in mlp_projections(&model) {
+            assert!(
+                proj.adapters().is_some(),
+                "every targeted MLP projection must be adapted"
+            );
+            assert!(
+                !proj.weight().requires_grad(),
+                "a wrapped MLP base must be reconstructed with requires_grad = false"
+            );
+        }
+    }
+
+    #[test]
+    fn mlp_trainable_set_and_ids_are_identical_across_a_rebuild() {
+        let model = build(Some(lora_cfg_for(&MLP_TARGETS)));
+        let before_ids = trainable_ids(&model);
+        let before_names = names(&model);
+
+        let rebuilt = model
+            .rebuild_with_parameters(&optimizer_params(&model))
+            .expect("rebuild succeeds");
+
+        assert_eq!(before_ids, trainable_ids(&rebuilt));
+        assert_eq!(before_names, names(&rebuilt));
+
+        for (before, after) in mlp_projections(&model)
+            .into_iter()
+            .zip(mlp_projections(&rebuilt))
+        {
+            let (a_before, b_before) = before.adapters().expect("adapted before");
+            let (a_after, b_after) = after.adapters().expect("adapted after");
+            assert_eq!(a_before.id(), a_after.id(), "lora_a must keep its TensorId");
+            assert_eq!(b_before.id(), b_after.id(), "lora_b must keep its TensorId");
+            assert!(a_after.requires_grad(), "lora_a must stay trainable");
+            assert!(b_after.requires_grad(), "lora_b must stay trainable");
+            assert!(
+                !after.weight().requires_grad(),
+                "the wrapped MLP base must stay frozen"
+            );
+        }
+    }
+
+    #[test]
+    fn attention_and_mlp_can_be_targeted_together() {
+        let model = build(Some(lora_cfg_for(&["q_proj", "down_proj"])));
+        let listed = names(&model);
+        for adapted in ["layers.0.self_attn.q_proj", "layers.0.mlp.down_proj"] {
+            assert!(
+                listed.contains(&format!("{adapted}.lora_a")),
+                "{adapted} must be adapted: {listed:?}"
+            );
+            assert!(
+                !listed.contains(&format!("{adapted}.weight")),
+                "{adapted}.weight is a wrapped base and must be frozen"
+            );
+        }
+        for untouched in [
+            "layers.0.self_attn.k_proj",
+            "layers.0.mlp.gate_proj",
+            "layers.0.mlp.up_proj",
+        ] {
+            assert!(
+                !listed.contains(&format!("{untouched}.lora_a")),
+                "{untouched} was not targeted and must carry no adapter"
+            );
+            assert!(
+                listed.contains(&format!("{untouched}.weight")),
+                "{untouched}.weight must stay a plain trainable Linear"
+            );
+        }
+    }
+
+    /// The anti-severed-graph test with every supported target adapted at
+    /// once: an adapter the SwiGLU fusion or the residual path drops receives
+    /// no gradient and silently never trains.
+    #[test]
+    fn a_gradient_reaches_every_adapted_projections_lora_b() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut varmap = boostr::VarMap::<CpuRuntime>::new();
+        let mut vb = VarBuilder::new(&mut varmap, &device);
+        let targets: Vec<&str> = TARGETS.iter().chain(MLP_TARGETS.iter()).copied().collect();
+        let model = LitGPT::<CpuRuntime>::new(&cfg(Some(lora_cfg_for(&targets))), &mut vb, &client)
+            .expect("model builds");
+
+        // i64, matching what `data.rs` uploads (it casts the u32 stream first).
+        let input_ids = Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device);
+        let output = model.forward(&client, &input_ids).expect("forward");
+        let loss =
+            boostr::autograd::var_sum(&output.logits, &[0, 1, 2], false, &client).expect("reduce");
+        let grads = boostr::autograd::backward(&loss, &client).expect("backward");
+
+        for (name, proj) in adapted_with_prefixes(&model) {
+            let (lora_a, lora_b) = proj
+                .adapters()
+                .unwrap_or_else(|| panic!("{name} must be adapted"));
+            // lora_b is zero-initialised, so d(loss)/d(lora_a) is zero at step
+            // 0 by construction; lora_b is the factor that must receive signal
+            // immediately.
+            let grad = grads
+                .get(lora_b.id())
+                .unwrap_or_else(|| panic!("{name}.lora_b received no gradient"));
+            let values: Vec<f32> = grad.contiguous().expect("contiguous").to_vec();
+            let magnitude: f32 = values.iter().map(|v| v.abs()).sum();
+            assert!(
+                magnitude > 1e-8,
+                "{name}.lora_b gradient is all zeros ({magnitude}) — the LoRA graph is severed"
+            );
+            assert!(
+                grads.get(lora_a.id()).is_some(),
+                "{name}.lora_a must be reachable from the loss"
+            );
+        }
+    }
+
+    #[test]
+    fn an_mlp_target_is_rejected_for_a_moe_model() {
+        let mut moe_cfg = cfg(Some(lora_cfg_for(&["q_proj", "gate_proj"])));
+        moe_cfg.num_experts = Some(2);
+        moe_cfg.experts_per_tok = Some(1);
+        let message = moe_cfg
+            .to_boostr()
+            .expect_err("an MLP target must be rejected while num_experts is set")
+            .to_string();
+        assert!(
+            message.contains("gate_proj"),
+            "the error must name the offending target: {message}"
+        );
+        assert!(
+            message.contains("num_experts"),
+            "the error must name what to change: {message}"
         );
     }
 }
@@ -5457,6 +5661,36 @@ mod checkpoint_completeness_tests {
             saved_values,
             all_values(&restored),
             "every parameter must survive the round trip, frozen bases included"
+        );
+    }
+
+    #[test]
+    fn mlp_lora_checkpoint_round_trip_restores_every_parameter() {
+        const MLP_BASE: &str = "layers.0.mlp.gate_proj.weight";
+        let cfg = cfg(Some(crate::config::LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: vec![
+                "gate_proj".to_string(),
+                "up_proj".to_string(),
+                "down_proj".to_string(),
+            ],
+        }));
+        let (saved, restored) = round_trip(&cfg, "mlp-lora");
+
+        let saved_values = all_values(&saved);
+        assert!(
+            saved_values.contains_key(MLP_BASE),
+            "the frozen MLP base weight must be part of the saved parameter set"
+        );
+        assert!(
+            saved_values.contains_key("layers.0.mlp.gate_proj.lora_b"),
+            "the MLP adapter must be part of the saved parameter set"
+        );
+        assert_eq!(
+            saved_values,
+            all_values(&restored),
+            "every parameter must survive the round trip, frozen MLP bases included"
         );
     }
 

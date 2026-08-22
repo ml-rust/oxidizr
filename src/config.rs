@@ -183,13 +183,32 @@ pub struct RopeScalingSpec {
     pub beta_slow: Option<f32>,
 }
 
-/// Attention projections that can carry a LoRA adapter.
+/// Projections that can carry a LoRA adapter: the dense attention block and
+/// the SwiGLU MLP that follows it.
 ///
-/// Everything else (`gate_proj`/`up_proj`/`down_proj`, MoE experts, MLA's
-/// `q_a_proj`/`kv_b_proj`, the SSM projections) is NOT wrapped, so naming one
-/// is rejected rather than silently dropped — a config asking for four
-/// adapters must never yield three.
-pub const SUPPORTED_LORA_TARGETS: [&str; 4] = ["q_proj", "k_proj", "v_proj", "o_proj"];
+/// Everything else (MoE experts, MLA's `q_a_proj`/`kv_b_proj`, the SSM
+/// projections) is NOT wrapped, so naming one is rejected rather than silently
+/// dropped — a config asking for seven adapters must never yield four.
+///
+/// `gate_proj`/`up_proj`/`down_proj` name the MLP projections only. A MoE
+/// model reuses those names inside every expert, and boostr's
+/// `nn::moe::expert::Expert` stores concrete `Linear` fields that cannot hold
+/// an adapter, so `validate_lora` rejects the combination outright.
+pub const SUPPORTED_LORA_TARGETS: [&str; 7] = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+];
+
+/// The subset of [`SUPPORTED_LORA_TARGETS`] that names an MLP projection.
+///
+/// These are the names a MoE model would also match inside its experts, which
+/// is why they need a rejection of their own.
+pub const MLP_LORA_TARGETS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
 /// LoRA adapter parameters. See [`OxidizrModelConfig::lora`] for why this
 /// lives on the model config.
@@ -199,8 +218,8 @@ pub struct LoraConfig {
     pub rank: usize,
     /// Adapter scaling numerator; the layer applies `alpha / rank`.
     pub alpha: f32,
-    /// Which attention projections get an adapter. Must be a non-empty subset
-    /// of [`SUPPORTED_LORA_TARGETS`].
+    /// Which projections get an adapter. Must be a non-empty subset of
+    /// [`SUPPORTED_LORA_TARGETS`].
     pub target_modules: Vec<String>,
 }
 

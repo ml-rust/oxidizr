@@ -7,7 +7,9 @@
 //! place that bridges the two, so architecture features only need to be taught
 //! to boostr once instead of hand-ported into every oxidizr consumer.
 
-use crate::config::{OxidizrModelConfig, RopeScalingSpec, SUPPORTED_LORA_TARGETS};
+use crate::config::{
+    OxidizrModelConfig, RopeScalingSpec, MLP_LORA_TARGETS, SUPPORTED_LORA_TARGETS,
+};
 use crate::prelude::Result;
 use boostr::error::Error;
 use boostr::model::config::{
@@ -162,6 +164,26 @@ fn validate_lora(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Result<()> {
                 SUPPORTED_LORA_TARGETS.join(", ")
             )));
         }
+    }
+    // `gate_proj`/`up_proj`/`down_proj` name the MLP's projections, and a MoE
+    // model reuses those same names inside every expert. boostr's
+    // `nn::moe::expert::Expert` stores concrete `Linear` fields, so an expert
+    // projection cannot hold an adapter — the run would train nothing there
+    // while the config claims otherwise.
+    let moe_target = cfg.num_experts.and_then(|_| {
+        lora.target_modules
+            .iter()
+            .find(|target| MLP_LORA_TARGETS.contains(&target.as_str()))
+    });
+    if let Some(target) = moe_target {
+        return Err(model_error(format!(
+            "lora.target_modules names {target:?} while num_experts is set, so that name \
+             would also select the MoE experts' projections. boostr's \
+             nn::moe::expert::Expert stores concrete Linear fields and cannot hold a LoRA \
+             adapter, so the experts would train nothing while the config claims they are \
+             adapted. Remove {target:?} from lora.target_modules (the attention targets \
+             still work), or remove num_experts."
+        )));
     }
     if matches!(shape, LayerShape::SsmOnly) {
         return Err(model_error(
