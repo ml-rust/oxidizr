@@ -754,7 +754,7 @@ where
             "Saving final checkpoint to {}/{}_final.safetensors",
             self.config.checkpoint_dir, prefix
         );
-        self.save_checkpoint_named("final")?;
+        self.save_checkpoint_named(model, "final")?;
 
         println!("{{\"status\": \"complete\"}}");
 
@@ -908,7 +908,7 @@ where
             if step > self.start_step && step % self.config.save_interval == 0 {
                 mp.println(format!("💾 Checkpoint saved: step {}", step))
                     .ok();
-                self.save_checkpoint(step)?;
+                self.save_checkpoint(model, step)?;
             }
         }
 
@@ -924,7 +924,7 @@ where
             self.config.checkpoint_dir, prefix
         ))
         .ok();
-        self.save_checkpoint_named("final")?;
+        self.save_checkpoint_named(model, "final")?;
 
         mp.println(format!(
             "✅ Training complete | final loss: {:.4} | grad: {:.4}",
@@ -959,7 +959,10 @@ where
             .unwrap_or("<unnamed>")
     }
 
-    fn save_checkpoint(&self, step: usize) -> Result<()> {
+    /// Frozen parameters are absent from `self.params`, so the model is passed
+    /// through to `save_checkpoint_from_params` as their source. Without it a
+    /// LoRA run would write an adapter-only checkpoint.
+    fn save_checkpoint(&self, model: &crate::model::LitGPT<R>, step: usize) -> Result<()> {
         let prefix = self.model_config.checkpoint_prefix();
         let checkpoint_path = format!(
             "{}/{}_step_{}.safetensors",
@@ -969,11 +972,7 @@ where
             std::fs::create_dir_all(&self.config.checkpoint_dir)?;
         }
 
-        crate::model::save_checkpoint_from_params(
-            &checkpoint_path,
-            self.params,
-            &self.parameter_names,
-        )?;
+        crate::model::save_checkpoint_from_params(&checkpoint_path, model, self.params)?;
 
         // Save metadata for auto-resume validation
         if let Some(ref data_path) = self.data_file_path {
@@ -1041,7 +1040,7 @@ where
         Ok(())
     }
 
-    fn save_checkpoint_named(&self, name: &str) -> Result<()> {
+    fn save_checkpoint_named(&self, model: &crate::model::LitGPT<R>, name: &str) -> Result<()> {
         let prefix = self.model_config.checkpoint_prefix();
         let path = format!(
             "{}/{}_{}.safetensors",
@@ -1050,7 +1049,7 @@ where
         if !Path::new(&self.config.checkpoint_dir).exists() {
             std::fs::create_dir_all(&self.config.checkpoint_dir)?;
         }
-        crate::model::save_checkpoint_from_params(&path, self.params, &self.parameter_names)?;
+        crate::model::save_checkpoint_from_params(&path, model, self.params)?;
         Ok(())
     }
 

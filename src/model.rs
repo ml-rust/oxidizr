@@ -3295,7 +3295,14 @@ where
         params
     }
 
-    pub fn named_trainable_parameters(
+    /// Every parameter a checkpoint must carry to reconstruct this model,
+    /// frozen ones included.
+    ///
+    /// This is the completeness contract for both save and load. It cannot be
+    /// narrowed to the trainable set: `VarBuilder::take_or_init_tensor`
+    /// random-initializes any name the varmap lacks, so a checkpoint missing a
+    /// frozen base weight would "load" into numerical garbage.
+    pub fn named_parameters(
         &self,
     ) -> Vec<(
         String,
@@ -3324,6 +3331,20 @@ where
             );
         }
         params
+    }
+
+    /// The subset of [`LitGPT::named_parameters`] the optimizer owns.
+    pub fn named_trainable_parameters(
+        &self,
+    ) -> Vec<(
+        String,
+        boostr::autograd::TensorId,
+        &boostr::autograd::Var<R>,
+    )> {
+        self.named_parameters()
+            .into_iter()
+            .filter(|(_, _, var)| var.requires_grad())
+            .collect()
     }
 
     fn rebuild_block_with_parameters(
@@ -4001,9 +4022,7 @@ where
         name: String,
         var: &'a boostr::autograd::Var<R>,
     ) {
-        if var.requires_grad() {
-            params.push((name, var.id(), var));
-        }
+        params.push((name, var.id(), var));
     }
 
     /// Name one attention projection's trainable parameters:
@@ -4260,24 +4279,41 @@ where
     }
 }
 
+/// Write every parameter the model needs to reconstruct itself.
+///
+/// `params` is the optimizer's map, so it holds only trainable tensors. A
+/// frozen parameter (a LoRA-adapted base weight) is never updated, so the
+/// model's own `Var` still carries its current value and is the source here.
+/// Saving only `params` would emit an adapter-only checkpoint that no load can
+/// repair.
 pub fn save_checkpoint_from_params<R>(
     path: &str,
+    model: &LitGPT<R>,
     params: &HashMap<TensorId, Tensor<R>>,
-    parameter_names: &[(String, TensorId)],
 ) -> Result<()>
 where
     R: boostr::Runtime<DType = DType>,
     R::Client: boostr::RuntimeClient<R> + boostr::TensorOps<R> + boostr::TypeConversionOps<R>,
 {
     let cpu_device = boostr::CpuDevice::new();
-    let mut tensors = HashMap::with_capacity(parameter_names.len());
+    let parameters = model.named_parameters();
+    let mut tensors = HashMap::with_capacity(parameters.len());
 
-    for (name, id) in parameter_names {
-        let tensor = params
-            .get(id)
-            .ok_or_else(|| boostr::error::Error::ModelError {
-                reason: format!("missing parameter '{name}' ({id}) while saving checkpoint"),
-            })?;
+    for (name, id, var) in &parameters {
+        let tensor = match params.get(id) {
+            Some(tensor) => tensor,
+            None if !var.requires_grad() => var.tensor(),
+            None => {
+                return Err(boostr::error::Error::ModelError {
+                    reason: format!(
+                        "trainable parameter '{name}' ({id}) is absent from the optimizer \
+                         parameter map while saving checkpoint '{path}'. The optimizer \
+                         lost track of it; rebuild the model and optimizer from the \
+                         same parameter set before saving."
+                    ),
+                });
+            }
+        };
         let cpu_tensor = stage_tensor_for_safetensors::<R>(tensor, &cpu_device)?;
         tensors.insert(name.clone(), cpu_tensor);
     }
@@ -4326,8 +4362,12 @@ where
         }
     }
 
+    // Every expected name, not just the trainable ones: `LitGPT::new` below
+    // routes through `VarBuilder::take_or_init_tensor`, which silently
+    // random-initializes any tensor the varmap lacks. Without this check an
+    // incomplete checkpoint loads "successfully" and produces garbage.
     let mut missing = model
-        .named_trainable_parameters()
+        .named_parameters()
         .into_iter()
         .map(|(name, _, _)| name)
         .filter(|name| !loaded.contains_key(name))
@@ -4336,7 +4376,10 @@ where
         missing.sort();
         return Err(boostr::error::Error::ModelError {
             reason: format!(
-                "checkpoint '{path}' is missing {} trainable tensor(s): {}",
+                "checkpoint '{path}' is missing {} tensor(s) the model requires: {}. \
+                 Loading it would random-initialize them. Re-save the checkpoint from a \
+                 run whose config matches this one, or point --resume at a complete \
+                 checkpoint.",
                 missing.len(),
                 missing.join(", ")
             ),
@@ -5240,5 +5283,285 @@ mod lora_tests {
             "a PRESENT lora block must change the hash — it changes which \
              parameters exist, so the two checkpoints are incompatible"
         );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_completeness_tests {
+    use super::*;
+    use boostr::{CpuClient, CpuDevice, CpuRuntime};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A LoRA-adapted base weight: frozen, so absent from the optimizer's
+    /// parameter map, and therefore the tensor a trainable-only save drops.
+    const FROZEN_BASE: &str = "layers.0.self_attn.q_proj.weight";
+
+    fn cfg(lora: Option<crate::config::LoraConfig>) -> OxidizrModelConfig {
+        OxidizrModelConfig {
+            name: "checkpoint-test".to_string(),
+            hidden_size: 8,
+            num_layers: 1,
+            num_heads: 2,
+            kv_heads: None,
+            kv_latent_dim: None,
+            q_latent_dim: None,
+            d_rope: None,
+            num_experts: None,
+            experts_per_tok: None,
+            shared_expert_enabled: None,
+            intermediate_size: Some(16),
+            mamba_layers: None,
+            mamba2_num_heads: None,
+            mamba2_head_dim: None,
+            mamba2_state_size: None,
+            mamba2_chunk_size: None,
+            mamba2_n_groups: None,
+            mamba2_conv_kernel: None,
+            mamba2_expand: None,
+            mamba3_enabled: None,
+            mamba3_complex_rope: None,
+            mamba3_mimo_rank: None,
+            mamba3_use_conv: None,
+            vocab_size: 12,
+            grow_vocab: false,
+            tie_word_embeddings: false,
+            tokenizer_vocab: "custom".to_string(),
+            max_seq_len: 8,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            sliding_window: None,
+            speech_vocab: None,
+            lora,
+            dtype: crate::config::DTypePrecision::F32,
+        }
+    }
+
+    fn lora_cfg() -> crate::config::LoraConfig {
+        crate::config::LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+        }
+    }
+
+    fn build(cfg: &OxidizrModelConfig) -> LitGPT<CpuRuntime> {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut varmap = boostr::VarMap::<CpuRuntime>::new();
+        let mut vb = VarBuilder::new(&mut varmap, &device);
+        LitGPT::<CpuRuntime>::new(cfg, &mut vb, &client).expect("model builds")
+    }
+
+    /// The map the trainer owns: optimizer-tracked (trainable) tensors only.
+    fn optimizer_params(
+        model: &LitGPT<CpuRuntime>,
+    ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
+        model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, var)| (id, var.tensor().clone()))
+            .collect()
+    }
+
+    fn values(tensor: &Tensor<CpuRuntime>) -> Vec<f32> {
+        tensor.contiguous().expect("contiguous").to_vec::<f32>()
+    }
+
+    fn all_values(model: &LitGPT<CpuRuntime>) -> BTreeMap<String, Vec<f32>> {
+        model
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _, var)| (name, values(var.tensor())))
+            .collect()
+    }
+
+    fn temp_path(tag: &str) -> String {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!(
+                "oxidizr-checkpoint-{tag}-{}-{unique}.safetensors",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Rewrite `path` without `drop_name`, emulating a truncated or
+    /// hand-edited checkpoint.
+    fn rewrite_without(path: &str, drop_name: &str) {
+        let device = CpuDevice::new();
+        let mut safetensors = boostr::format::SafeTensors::open(path).expect("open checkpoint");
+        let mut tensors = safetensors
+            .load_all::<CpuRuntime>(&device)
+            .expect("load checkpoint");
+        assert!(
+            tensors.remove(drop_name).is_some(),
+            "'{drop_name}' must be present before it can be removed"
+        );
+        boostr::format::safetensors::save_safetensors(path, &tensors, None).expect("rewrite");
+    }
+
+    /// Write only the trainable parameters — exactly what the checkpoint
+    /// writer produced before frozen tensors were included.
+    fn save_trainable_only(path: &str, model: &LitGPT<CpuRuntime>) {
+        let cpu_device = CpuDevice::new();
+        let tensors: HashMap<String, Tensor<CpuRuntime>> = model
+            .named_trainable_parameters()
+            .into_iter()
+            .map(|(name, _, var)| {
+                (
+                    name,
+                    stage_tensor_for_safetensors::<CpuRuntime>(var.tensor(), &cpu_device)
+                        .expect("stage tensor"),
+                )
+            })
+            .collect();
+        boostr::format::safetensors::save_safetensors(path, &tensors, None).expect("save");
+    }
+
+    fn checkpoint_names(path: &str) -> BTreeMap<String, Vec<f32>> {
+        let device = CpuDevice::new();
+        let mut safetensors = boostr::format::SafeTensors::open(path).expect("open checkpoint");
+        safetensors
+            .load_all::<CpuRuntime>(&device)
+            .expect("load checkpoint")
+            .into_iter()
+            .map(|(name, tensor)| (name, values(&tensor)))
+            .collect()
+    }
+
+    fn round_trip(cfg: &OxidizrModelConfig, tag: &str) -> (LitGPT<CpuRuntime>, LitGPT<CpuRuntime>) {
+        let saved = build(cfg);
+        let path = temp_path(tag);
+        save_checkpoint_from_params(&path, &saved, &optimizer_params(&saved)).expect("save");
+
+        let mut restored = build(cfg);
+        load_checkpoint_into_model(&mut restored, &path).expect("load");
+        let _ = std::fs::remove_file(&path);
+        (saved, restored)
+    }
+
+    #[test]
+    fn lora_checkpoint_round_trip_restores_frozen_bases() {
+        let cfg = cfg(Some(lora_cfg()));
+        let (saved, restored) = round_trip(&cfg, "lora");
+
+        let saved_values = all_values(&saved);
+        assert!(
+            saved_values.contains_key(FROZEN_BASE),
+            "the frozen base weight must be part of the saved parameter set"
+        );
+        assert_eq!(
+            saved_values,
+            all_values(&restored),
+            "every parameter must survive the round trip, frozen bases included"
+        );
+    }
+
+    #[test]
+    fn round_trip_without_lora_is_unchanged() {
+        let cfg = cfg(None);
+        let (saved, restored) = round_trip(&cfg, "plain");
+        assert_eq!(all_values(&saved), all_values(&restored));
+    }
+
+    #[test]
+    fn frozen_parameters_stay_frozen_after_load() {
+        let cfg = cfg(Some(lora_cfg()));
+        let (saved, restored) = round_trip(&cfg, "frozen");
+
+        let frozen_names = |model: &LitGPT<CpuRuntime>| {
+            model
+                .named_parameters()
+                .into_iter()
+                .filter(|(_, _, var)| !var.requires_grad())
+                .map(|(name, _, _)| name)
+                .collect::<Vec<_>>()
+        };
+        let saved_frozen = frozen_names(&saved);
+        assert!(
+            saved_frozen.contains(&FROZEN_BASE.to_string()),
+            "LoRA must freeze '{FROZEN_BASE}'; got {saved_frozen:?}"
+        );
+        assert_eq!(
+            saved_frozen,
+            frozen_names(&restored),
+            "the frozen set must be reconstructed by the load, not lost"
+        );
+        assert!(!restored.frozen_parameters().is_empty());
+    }
+
+    #[test]
+    fn incomplete_checkpoint_is_rejected() {
+        let cfg = cfg(None);
+        let saved = build(&cfg);
+        let path = temp_path("incomplete");
+        save_checkpoint_from_params(&path, &saved, &optimizer_params(&saved)).expect("save");
+
+        const DROPPED: &str = "layers.0.mlp.up_proj.weight";
+        rewrite_without(&path, DROPPED);
+
+        let mut restored = build(&cfg);
+        let result = load_checkpoint_into_model(&mut restored, &path);
+        let _ = std::fs::remove_file(&path);
+
+        let error = match result {
+            Ok(()) => panic!("an incomplete checkpoint must not load silently"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(DROPPED),
+            "the error must name the missing tensor; got: {error}"
+        );
+        assert!(
+            error.contains(&path),
+            "the error must name the checkpoint file; got: {error}"
+        );
+    }
+
+    #[test]
+    fn lora_checkpoint_missing_its_frozen_base_is_rejected() {
+        let cfg = cfg(Some(lora_cfg()));
+        let saved = build(&cfg);
+        let path = temp_path("adapter-only");
+        // The pre-fix writer's output: adapters only, every frozen base absent.
+        save_trainable_only(&path, &saved);
+
+        let mut restored = build(&cfg);
+        let result = load_checkpoint_into_model(&mut restored, &path);
+        let _ = std::fs::remove_file(&path);
+
+        let error = match result {
+            Ok(()) => panic!("an adapter-only checkpoint must not load silently"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(FROZEN_BASE),
+            "the error must name the missing base weight; got: {error}"
+        );
+    }
+
+    #[test]
+    fn full_fine_tune_checkpoint_still_loads() {
+        let cfg = cfg(None);
+        let saved = build(&cfg);
+        let path = temp_path("legacy");
+        // Nothing is frozen without LoRA, so this is byte-for-byte the
+        // parameter set every existing checkpoint carries.
+        save_trainable_only(&path, &saved);
+
+        let expected = all_values(&saved);
+        assert_eq!(
+            checkpoint_names(&path).keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>(),
+            "a full fine-tune checkpoint must carry exactly the model's parameter set"
+        );
+
+        let mut restored = build(&cfg);
+        load_checkpoint_into_model(&mut restored, &path).expect("legacy checkpoint must load");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(expected, all_values(&restored));
     }
 }
