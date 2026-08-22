@@ -2457,6 +2457,7 @@ where
             cfg.vocab_size,
             cfg.hidden_size,
             compute_dtype,
+            bcfg.tie_word_embeddings,
             client,
         )?;
 
@@ -2485,19 +2486,28 @@ where
 
         let norm =
             Self::take_rms_norm(vb.pp("norm"), cfg.hidden_size, 1e-5, compute_dtype, client)?;
-        let lm_head = Self::take_linear_no_bias(
-            vb.pp("lm_head"),
-            &[cfg.vocab_size, cfg.hidden_size],
-            compute_dtype,
-            client,
-        )?;
+        // A tied checkpoint (e.g. Qwen3-1.7B) has no separate `lm_head.weight`
+        // tensor, so loading one here would hard-error. `with_ids` re-derives
+        // the tuple from `embed_tokens` when `cfg.tie_word_embeddings` is set,
+        // so this one is a placeholder that gets discarded there.
+        let lm_head_tuple = if cfg.tie_word_embeddings {
+            (embed.weight().tensor().clone(), embed.weight().id())
+        } else {
+            let lm_head = Self::take_linear_no_bias(
+                vb.pp("lm_head"),
+                &[cfg.vocab_size, cfg.hidden_size],
+                compute_dtype,
+                client,
+            )?;
+            (lm_head.weight().tensor().clone(), lm_head.weight().id())
+        };
 
         Self::with_ids(
             cfg,
             (embed.weight().tensor().clone(), embed.weight().id()),
             layers,
             (norm.weight().tensor().clone(), norm.weight().id()),
-            (lm_head.weight().tensor().clone(), lm_head.weight().id()),
+            lm_head_tuple,
         )
     }
 
@@ -2508,6 +2518,21 @@ where
         norm: (Tensor<R>, boostr::autograd::TensorId),
         lm_head: (Tensor<R>, boostr::autograd::TensorId),
     ) -> Result<Self> {
+        // Tied checkpoints (e.g. Qwen3-1.7B) have no independent
+        // `lm_head.weight`: re-derive the tuple from `embed_tokens` here,
+        // on every call, not just at init. `rebuild_with_parameters` also
+        // routes through this, so a rebuild re-aliases lm_head from the
+        // optimizer-updated embedding rather than reading a stale separate
+        // entry — both share the same `TensorId` across steps, which is what
+        // keeps `assert_stable_parameter_ids` happy and the gradient tied
+        // (`dL/dW = dL/dW_embed + dL/dW_lm_head` accumulates into one bucket,
+        // and the optimizer's `TensorId`-keyed state sees one parameter).
+        let lm_head = if cfg.tie_word_embeddings {
+            (embed_tokens.0.clone(), embed_tokens.1)
+        } else {
+            lm_head
+        };
+
         Self::ensure_shape(
             "embed_tokens.weight",
             &embed_tokens.0,
@@ -2687,7 +2712,11 @@ where
             params.extend(layer.trainable_parameters());
         }
         params.extend(self.norm.trainable_parameters());
-        params.extend(self.lm_head.trainable_parameters());
+        // Tied: lm_head shares embed_tokens's TensorId, so listing it again
+        // here would double-count one parameter under two entries.
+        if !self.cfg.tie_word_embeddings {
+            params.extend(self.lm_head.trainable_parameters());
+        }
         params
     }
 
@@ -2708,11 +2737,17 @@ where
             Self::extend_block_named_trainable(&mut params, layer_idx, layer);
         }
         Self::push_named_param(&mut params, "norm.weight".to_string(), self.norm.weight());
-        Self::push_named_param(
-            &mut params,
-            "lm_head.weight".to_string(),
-            self.lm_head.weight(),
-        );
+        // Tied: lm_head shares embed_tokens's weight/TensorId, so it has no
+        // independent entry. This also fixes save (no duplicate copy
+        // written) and load (a tied checkpoint lacking `lm_head.weight`
+        // no longer trips the missing-tensor check).
+        if !self.cfg.tie_word_embeddings {
+            Self::push_named_param(
+                &mut params,
+                "lm_head.weight".to_string(),
+                self.lm_head.weight(),
+            );
+        }
         params
     }
 
@@ -3118,6 +3153,7 @@ where
         vocab_size: usize,
         hidden_size: usize,
         dtype: DType,
+        tied: bool,
         client: &C,
     ) -> Result<Embedding<R>>
     where
@@ -3129,12 +3165,25 @@ where
             + boostr::TensorOps<R>,
     {
         let param_name = Self::param_name(&vb, "weight");
+        // A tied matrix is also the output projection, so `nn.Embedding`'s
+        // N(0, 1) default is far too wide: logits come out enormous and the
+        // first loss lands near 126 instead of ln(vocab) ~ 11.5. The
+        // GPT-2/BERT truncated normal is the standard init for a matrix that
+        // has to serve both roles. Untied embeddings keep PyTorch's default.
+        let init = if tied {
+            Init::TruncatedNormal {
+                mean: 0.0,
+                stdev: 0.02,
+            }
+        } else {
+            Init::PyTorchEmbedding
+        };
         let weight = take_or_init_tensor(
             &mut vb,
             "weight",
             &[vocab_size, hidden_size],
             dtype,
-            Init::PyTorchEmbedding,
+            init,
             client,
         )?;
         let weight_id = weight.id();
@@ -3596,4 +3645,126 @@ where
 
     Tensor::<boostr::CpuRuntime>::try_from_slice(&values, &shape, cpu_device)
         .map_err(boostr::error::Error::Numr)
+}
+
+#[cfg(test)]
+mod tie_word_embeddings_tests {
+    use super::*;
+    use boostr::{CpuDevice, CpuRuntime};
+
+    fn tiny_cfg(tie_word_embeddings: bool) -> OxidizrModelConfig {
+        OxidizrModelConfig {
+            name: "tie-test".to_string(),
+            hidden_size: 8,
+            num_layers: 0,
+            num_heads: 2,
+            kv_heads: None,
+            kv_latent_dim: None,
+            q_latent_dim: None,
+            d_rope: None,
+            num_experts: None,
+            experts_per_tok: None,
+            shared_expert_enabled: None,
+            intermediate_size: Some(16),
+            mamba_layers: None,
+            mamba2_num_heads: None,
+            mamba2_head_dim: None,
+            mamba2_state_size: None,
+            mamba2_chunk_size: None,
+            mamba2_n_groups: None,
+            mamba2_conv_kernel: None,
+            mamba2_expand: None,
+            mamba3_enabled: None,
+            mamba3_complex_rope: None,
+            mamba3_mimo_rank: None,
+            mamba3_use_conv: None,
+            vocab_size: 12,
+            grow_vocab: false,
+            tie_word_embeddings,
+            tokenizer_vocab: "custom".to_string(),
+            max_seq_len: 8,
+            rope_theta: 10000.0,
+            dtype: crate::config::DTypePrecision::F32,
+        }
+    }
+
+    /// Build a `LitGPT` via `with_ids` with zero transformer layers, so the
+    /// tying invariant can be checked without exercising attention/RoPE/MLP
+    /// construction — those are unrelated to this mechanism.
+    fn tiny_model(tie_word_embeddings: bool) -> LitGPT<CpuRuntime> {
+        let cfg = tiny_cfg(tie_word_embeddings);
+        let device = CpuDevice::new();
+        let embed =
+            Tensor::<CpuRuntime>::zeros(&[cfg.vocab_size, cfg.hidden_size], DType::F32, &device);
+        let norm = Tensor::<CpuRuntime>::zeros(&[cfg.hidden_size], DType::F32, &device);
+        // A distinct tensor/id from embed_tokens, standing in for whatever a
+        // checkpoint load would produce for an UNTIED model. When tied,
+        // `with_ids` must discard this and re-alias from embed_tokens instead.
+        let lm_head =
+            Tensor::<CpuRuntime>::zeros(&[cfg.vocab_size, cfg.hidden_size], DType::F32, &device);
+
+        LitGPT::with_ids(
+            &cfg,
+            (embed, TensorId::new()),
+            Vec::new(),
+            (norm, TensorId::new()),
+            (lm_head, TensorId::new()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tied_lm_head_shares_embed_tokens_tensor_id() {
+        let model = tiny_model(true);
+        assert_eq!(
+            model.embed_tokens.weight().id(),
+            model.lm_head.weight().id(),
+            "tied lm_head must alias embed_tokens's TensorId, not mint its own"
+        );
+    }
+
+    #[test]
+    fn untied_lm_head_has_a_distinct_tensor_id() {
+        let model = tiny_model(false);
+        assert_ne!(
+            model.embed_tokens.weight().id(),
+            model.lm_head.weight().id(),
+            "untied lm_head keeps its own independent TensorId"
+        );
+    }
+
+    #[test]
+    fn tied_named_trainable_parameters_omits_lm_head_weight() {
+        let model = tiny_model(true);
+        let names: Vec<String> = model
+            .named_trainable_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(names.contains(&"embed_tokens.weight".to_string()));
+        assert!(!names.contains(&"lm_head.weight".to_string()));
+    }
+
+    #[test]
+    fn untied_named_trainable_parameters_includes_lm_head_weight() {
+        let model = tiny_model(false);
+        let names: Vec<String> = model
+            .named_trainable_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(names.contains(&"lm_head.weight".to_string()));
+    }
+
+    #[test]
+    fn tied_trainable_parameters_has_one_entry_for_the_shared_weight() {
+        let model = tiny_model(true);
+        let map: HashMap<boostr::autograd::TensorId, &boostr::autograd::Var<CpuRuntime>> =
+            model.trainable_parameters().into_iter().collect();
+        // embed_tokens.weight (shared with lm_head) + norm.weight: two
+        // distinct TensorIds, not three — the optimizer's TensorId-keyed
+        // HashMap must see the tied parameter exactly once.
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(&model.embed_tokens.weight().id()));
+    }
 }

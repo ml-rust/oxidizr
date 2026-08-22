@@ -162,3 +162,21 @@ fn mamba3_without_mamba2_dims_is_rejected() {
     };
     assert!(cfg.to_boostr().is_err());
 }
+
+/// `tie_word_embeddings` must carry through to boostr's `ModelConfig`
+/// unchanged in both directions — a tied checkpoint has no independent
+/// `lm_head.weight`, so silently dropping this would break loading it.
+#[test]
+fn tie_word_embeddings_round_trips_both_ways() {
+    let untied = OxidizrModelConfig {
+        tie_word_embeddings: false,
+        ..dense_baseline()
+    };
+    assert!(!untied.to_boostr().unwrap().tie_word_embeddings);
+
+    let tied = OxidizrModelConfig {
+        tie_word_embeddings: true,
+        ..dense_baseline()
+    };
+    assert!(tied.to_boostr().unwrap().tie_word_embeddings);
+}

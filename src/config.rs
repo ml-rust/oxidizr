@@ -108,6 +108,10 @@ pub struct OxidizrModelConfig {
     /// reinterpretation of the checkpoint.
     #[serde(default)]
     pub grow_vocab: bool,
+    /// Share one weight matrix between `embed_tokens` and `lm_head`. Must match
+    /// the checkpoint: a tied checkpoint has no separate `lm_head.weight`.
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
     /// Tokenizer vocabulary name (cl100k_base, o200k_base, llama3, deepseek_v3, custom)
     /// REQUIRED: Must match the vocabulary used to tokenize your training data
     /// Use "custom" if you have a custom tokenizer not listed above
@@ -206,8 +210,15 @@ impl OxidizrModelConfig {
         // Per layer total
         let layer = attn + mlp + 2 * self.hidden_size;
 
-        // LM head + final norm
-        let head = self.hidden_size * self.vocab_size + self.hidden_size;
+        // LM head + final norm. A tied head is the embedding matrix, already
+        // counted above, so counting it again would overstate the size by a
+        // whole vocab-sized matrix — and this figure names the checkpoint file.
+        let lm_head = if self.tie_word_embeddings {
+            0
+        } else {
+            self.hidden_size * self.vocab_size
+        };
+        let head = lm_head + self.hidden_size;
 
         let total = embed + self.num_layers * layer + head;
 
@@ -407,6 +418,7 @@ impl LitConfig {
                 mamba3_use_conv: None,
                 vocab_size: 128354, // Llama 3 + splintr agent tokens
                 grow_vocab: false,
+                tie_word_embeddings: false,
                 tokenizer_vocab: "llama3".to_string(),
                 max_seq_len: 512,
                 rope_theta: 10000.0,
@@ -487,6 +499,7 @@ impl LitConfig {
 
                 vocab_size: 128354, // Llama 3 + splintr agent tokens
                 grow_vocab: false,
+                tie_word_embeddings: false,
                 tokenizer_vocab: "llama3".to_string(),
                 max_seq_len: 512, // Can handle longer context with MLA
                 rope_theta: 10000.0,
@@ -639,6 +652,11 @@ impl CheckpointValidation {
 ///   models are the same model whether or not growth was permitted, and
 ///   `vocab_size` — which does describe the weights — is hashed already)
 ///
+/// `tie_word_embeddings` is deliberately NOT stripped: unlike `grow_vocab` it
+/// changes the parameter set (a tied model has no independent
+/// `lm_head.weight`), so checkpoints across the two settings are genuinely
+/// incompatible and the hash must reflect that.
+///
 /// Anything added to `OxidizrModelConfig` that is not architecture MUST be stripped
 /// here. A new field that reaches the hash changes it for every existing
 /// checkpoint, so resume validation reports a model mismatch on weights that
@@ -683,6 +701,11 @@ pub struct BlazrConfig {
     pub hidden_size: usize,
     pub num_layers: usize,
     pub vocab_size: usize,
+    /// Whether `lm_head` shares the embedding matrix. Must be recorded here:
+    /// a tied checkpoint has no `lm_head.weight`, so an inference server that
+    /// assumed untied would look for a tensor the file does not contain.
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
     /// Tokenizer vocabulary name (cl100k_base, o200k_base, llama3, deepseek_v3)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokenizer_vocab: Option<String>,
@@ -749,6 +772,7 @@ impl BlazrConfig {
             hidden_size: cfg.hidden_size,
             num_layers: cfg.num_layers,
             vocab_size: cfg.vocab_size,
+            tie_word_embeddings: cfg.tie_word_embeddings,
             tokenizer_vocab: Some(cfg.tokenizer_vocab.clone()),
 
             // Mamba2 parameters

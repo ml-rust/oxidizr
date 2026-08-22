@@ -208,8 +208,14 @@ pub fn estimate_params(cfg: &OxidizrModelConfig) -> String {
 
     let layer_params = cfg.num_layers * (attention_params + mlp_params + layernorm_params);
 
-    // LM Head: hidden_size * vocab_size
-    let lm_head_params = cfg.hidden_size * cfg.vocab_size;
+    // LM Head: hidden_size * vocab_size, but zero when tied — a tied model
+    // reuses the embedding matrix rather than holding a second one, so
+    // counting it again overstates the model by a whole vocab-sized matrix.
+    let lm_head_params = if cfg.tie_word_embeddings {
+        0
+    } else {
+        cfg.hidden_size * cfg.vocab_size
+    };
 
     // Final norm
     let final_norm_params = cfg.hidden_size;

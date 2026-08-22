@@ -242,8 +242,7 @@ impl OxidizrModelConfig {
             ssm: to_ssm(self, has_mamba)?,
             moe,
             hybrid_layers: to_hybrid_layers(&shape, &ssm_layers, self.num_layers),
-            // No oxidizr source yet; a later unit adds it.
-            tie_word_embeddings: false,
+            tie_word_embeddings: self.tie_word_embeddings,
             grow_vocab: self.grow_vocab,
             // Not mapped: oxidizr-only fields (`name`, `tokenizer_vocab`, `dtype`)
             // have no boostr equivalent.
