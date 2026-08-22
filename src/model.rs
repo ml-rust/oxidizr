@@ -602,25 +602,22 @@ where
 // --- Optionally LoRA-adapted projection ---
 
 /// A projection that is either a plain `Linear` or that same `Linear` wrapped
-/// in a LoRA adapter. Used by both the attention block and the MLP.
+/// in a LoRA adapter. Used by the attention block, the MLP, and every MoE
+/// expert.
 ///
-/// `LoraLinear::forward` is signature-compatible with `Linear::forward`, so the
-/// forward path treats the two identically. Everything else on this type exists
-/// so an adapted projection enumerates, names, and rebuilds through the SAME
-/// paths a plain one does — a LoRA parameter that skips those paths is a
-/// parameter the optimizer, the checkpoint, and `assert_stable_parameter_ids`
-/// never see.
-enum MaybeLora<R: boostr::Runtime> {
-    Plain(boostr::nn::Linear<R>),
-    Lora(boostr::nn::LoraLinear<R>),
-}
+/// This is boostr's `MaybeLoraLinear` under oxidizr's older name: it carries
+/// the same variants and the same bounds, and `nn::moe::expert::Expert` stores
+/// its projections as one, so the expert path and the oxidizr path share a
+/// single type instead of converting between two.
+type MaybeLora<R> = boostr::nn::MaybeLoraLinear<R>;
 
 /// One projection's tensors paired with their stable parameter ids, for the
 /// `*_with_ids` rebuild path. The adapter pair is present exactly when the
 /// projection being rebuilt carries one.
 ///
-/// Shared by the attention projections and the MLP's `gate_proj`/`up_proj`/
-/// `down_proj`: both rebuild through the same `projection_with_ids`.
+/// Shared by the attention projections, the MLP's `gate_proj`/`up_proj`/
+/// `down_proj`, and every MoE expert's three projections: all of them rebuild
+/// through the same `projection_with_ids`.
 struct AttnProjWithIds<R: boostr::Runtime> {
     weight: WeightWithId<R>,
     lora: Option<LoraWithIds<R>>,
@@ -634,77 +631,26 @@ struct LoraWithIds<R: boostr::Runtime> {
     alpha: f32,
 }
 
-impl<R> MaybeLora<R>
+/// Fold one projection's adapter into its base weight, in place, turning it
+/// into a `Plain` projection whose `<prefix>.weight` already carries
+/// `W + scaling * (B @ A)`.
+///
+/// Returns whether a merge happened. A `Plain` projection is left untouched,
+/// so a partially-adapted model merges through the same call.
+fn merge_projection<R, C>(proj: &mut MaybeLora<R>, client: &C) -> Result<bool>
 where
     R: boostr::Runtime<DType = DType>,
+    C: boostr::RuntimeClient<R>
+        + boostr::TensorOps<R>
+        + boostr::BinaryOps<R>
+        + boostr::ScalarOps<R>,
+    R::Client: boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R>,
 {
-    /// The base projection weight, under either variant. This is the
-    /// `<prefix>.weight` every existing caller already expects.
-    fn weight(&self) -> &boostr::autograd::Var<R> {
-        match self {
-            MaybeLora::Plain(linear) => linear.weight(),
-            MaybeLora::Lora(lora) => lora.base().weight(),
-        }
+    if !proj.is_adapted() {
+        return Ok(false);
     }
-
-    /// `(lora_a, lora_b)` when this projection carries an adapter.
-    fn adapters(&self) -> Option<(&boostr::autograd::Var<R>, &boostr::autograd::Var<R>)> {
-        match self {
-            MaybeLora::Plain(_) => None,
-            MaybeLora::Lora(lora) => Some((lora.lora_a(), lora.lora_b())),
-        }
-    }
-
-    /// Fold this projection's adapter into its base weight, turning it into a
-    /// `Plain` projection whose `<prefix>.weight` already carries
-    /// `W + scaling * (B @ A)`.
-    ///
-    /// Returns whether a merge happened. A `Plain` projection is left
-    /// untouched, so a partially-adapted model merges through the same call.
-    fn merge_adapter<C>(&mut self, client: &C) -> Result<bool>
-    where
-        C: boostr::RuntimeClient<R>
-            + boostr::TensorOps<R>
-            + boostr::BinaryOps<R>
-            + boostr::ScalarOps<R>,
-        R::Client: boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R>,
-    {
-        let MaybeLora::Lora(lora) = self else {
-            return Ok(false);
-        };
-        let merged = lora.merge_into_base(client)?;
-        *self = MaybeLora::Plain(merged);
-        Ok(true)
-    }
-
-    fn forward<C>(
-        &self,
-        client: &C,
-        input: &boostr::autograd::Var<R>,
-    ) -> Result<boostr::autograd::Var<R>>
-    where
-        C: boostr::RuntimeClient<R>
-            + boostr::TensorOps<R>
-            + boostr::BinaryOps<R>
-            + boostr::ScalarOps<R>,
-        R::Client: boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R>,
-    {
-        match self {
-            MaybeLora::Plain(linear) => linear.forward(client, input),
-            MaybeLora::Lora(lora) => lora.forward(client, input),
-        }
-    }
-
-    /// Trainable parameters in `named_parameters` order: base weight first (it
-    /// is absent once frozen), then `lora_a`, then `lora_b`.
-    fn trainable_parameters(&self) -> Vec<(boostr::autograd::TensorId, &boostr::autograd::Var<R>)> {
-        match self {
-            MaybeLora::Plain(linear) => linear.trainable_parameters(),
-            MaybeLora::Lora(lora) => {
-                <boostr::nn::LoraLinear<R> as boostr::nn::Module<R>>::trainable_parameters(lora)
-            }
-        }
-    }
+    *proj = MaybeLora::Plain(proj.merge_into_base(client)?);
+    Ok(true)
 }
 
 // --- Causal Self Attention with Grouped Query Attention ---
@@ -1372,12 +1318,21 @@ impl<R> Expert<R>
 where
     R: boostr::Runtime<DType = DType>,
 {
+    /// Build one expert, wrapping each of its three projections in a LoRA
+    /// adapter when `lora` targets that projection's name.
+    ///
+    /// `CausalSelfAttention::projection` is the single builder for an
+    /// optionally-adapted no-bias projection, so an expert's factors are taken
+    /// from the same `VarBuilder` as every other parameter — model dtype,
+    /// `<prefix>.lora_a` / `<prefix>.lora_b` names, and both halves trainable.
+    /// Freezing the wrapped base stays `LitGPT::new`'s job, via `FrozenParams`.
     fn new<C>(
         hidden: usize,
         intermediate: usize,
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
+        lora: Option<&LoraConfig>,
     ) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
@@ -1387,51 +1342,75 @@ where
             + boostr::CompareOps<R>
             + boostr::TensorOps<R>,
     {
-        let gate_proj =
-            Self::linear_no_bias(vb.pp("gate_proj"), &[intermediate, hidden], dtype, client)?;
-        let up_proj =
-            Self::linear_no_bias(vb.pp("up_proj"), &[intermediate, hidden], dtype, client)?;
-        let down_proj =
-            Self::linear_no_bias(vb.pp("down_proj"), &[hidden, intermediate], dtype, client)?;
+        let gate_proj = CausalSelfAttention::<R>::projection(
+            vb.pp("gate_proj"),
+            "gate_proj",
+            &[intermediate, hidden],
+            dtype,
+            lora,
+            client,
+        )?;
+        let up_proj = CausalSelfAttention::<R>::projection(
+            vb.pp("up_proj"),
+            "up_proj",
+            &[intermediate, hidden],
+            dtype,
+            lora,
+            client,
+        )?;
+        let down_proj = CausalSelfAttention::<R>::projection(
+            vb.pp("down_proj"),
+            "down_proj",
+            &[hidden, intermediate],
+            dtype,
+            lora,
+            client,
+        )?;
 
         Ok(Self {
-            expert: boostr::nn::moe::expert::Expert::new(gate_proj, up_proj, down_proj),
+            expert: boostr::nn::moe::expert::Expert::new_adapted(gate_proj, up_proj, down_proj),
         })
     }
 
     fn with_ids(
         hidden: usize,
         intermediate: usize,
-        gate_proj: (Tensor<R>, boostr::autograd::TensorId),
-        up_proj: (Tensor<R>, boostr::autograd::TensorId),
-        down_proj: (Tensor<R>, boostr::autograd::TensorId),
+        gate_proj: AttnProjWithIds<R>,
+        up_proj: AttnProjWithIds<R>,
+        down_proj: AttnProjWithIds<R>,
         frozen: &FrozenParams,
     ) -> Result<Self> {
-        let gate_proj = Self::linear_with_ids(
-            "gate_proj.weight",
-            gate_proj.0,
-            gate_proj.1,
+        let gate_proj = CausalSelfAttention::<R>::projection_with_ids(
+            "gate_proj",
+            gate_proj,
             &[intermediate, hidden],
             frozen,
         )?;
-        let up_proj = Self::linear_with_ids(
-            "up_proj.weight",
-            up_proj.0,
-            up_proj.1,
+        let up_proj = CausalSelfAttention::<R>::projection_with_ids(
+            "up_proj",
+            up_proj,
             &[intermediate, hidden],
             frozen,
         )?;
-        let down_proj = Self::linear_with_ids(
-            "down_proj.weight",
-            down_proj.0,
-            down_proj.1,
+        let down_proj = CausalSelfAttention::<R>::projection_with_ids(
+            "down_proj",
+            down_proj,
             &[hidden, intermediate],
             frozen,
         )?;
 
         Ok(Self {
-            expert: boostr::nn::moe::expert::Expert::new(gate_proj, up_proj, down_proj),
+            expert: boostr::nn::moe::expert::Expert::new_adapted(gate_proj, up_proj, down_proj),
         })
+    }
+
+    /// How many of this expert's projections carry an adapter. `merge_adapters`
+    /// reports a count, and boostr's `Expert::merge_adapters` does not.
+    fn adapted_projection_count(expert: &boostr::nn::moe::expert::Expert<R>) -> usize {
+        [expert.gate_proj(), expert.up_proj(), expert.down_proj()]
+            .into_iter()
+            .filter(|proj| proj.is_adapted())
+            .count()
     }
 
     fn into_inner(self) -> boostr::nn::moe::expert::Expert<R> {
@@ -1586,6 +1565,7 @@ where
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
+        lora: Option<&LoraConfig>,
     ) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
@@ -1597,6 +1577,10 @@ where
     {
         let (num_experts, experts_per_tok, intermediate) = Self::required_moe_dims(cfg)?;
 
+        // `gate_proj`/`up_proj`/`down_proj` name an expert's projections just
+        // as they name the MLP's, so a MoE model adapts EVERY expert — routed
+        // and shared alike. Adapting only some of them would train fewer
+        // adapters than the config asks for, with nothing at runtime to say so.
         let mut experts = Vec::with_capacity(num_experts);
         for expert_idx in 0..num_experts {
             let expert = Expert::new(
@@ -1605,6 +1589,7 @@ where
                 vb.pp(&format!("experts.{expert_idx}")),
                 client,
                 dtype,
+                lora,
             )?;
             experts.push(expert.into_inner());
         }
@@ -1615,6 +1600,7 @@ where
             vb.pp("shared_expert"),
             client,
             dtype,
+            lora,
         )?
         .into_inner();
         let router = Router::new(
@@ -1635,16 +1621,8 @@ where
     #[allow(clippy::type_complexity)]
     fn with_ids(
         cfg: &ModelConfig,
-        experts: Vec<(
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-        )>,
-        shared_expert: (
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-        ),
+        experts: Vec<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
+        shared_expert: (AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>),
         router_gate: (Tensor<R>, boostr::autograd::TensorId),
         frozen: &FrozenParams,
     ) -> Result<Self> {
@@ -1693,6 +1671,57 @@ where
                 .with_shared_expert_scale(Self::shared_expert_scale(experts_per_tok))?;
 
         Ok(Self { moe })
+    }
+
+    /// Fold every expert adapter into the base weight it wraps, routed and
+    /// shared experts alike. Returns how many projections were merged.
+    ///
+    /// boostr's `MoeLayer` hands out its experts by shared reference only, so
+    /// the merged experts go into a REBUILT layer rather than being written in
+    /// place. Every part carried across keeps its parameter identity:
+    /// `Expert::merge_adapters` goes through `LoraLinear::merge_into_base`,
+    /// and the router gate is rebuilt with `Linear::with_ids` from its own
+    /// `Var`, so no `TensorId` is minted here.
+    fn merge_adapters<C>(&mut self, client: &C) -> Result<usize>
+    where
+        C: boostr::RuntimeClient<R>
+            + boostr::TensorOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::ScalarOps<R>,
+        R::Client: boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R>,
+    {
+        let mut merged = 0usize;
+        let mut experts = Vec::with_capacity(self.moe.experts().len());
+        for expert in self.moe.experts() {
+            merged += Expert::<R>::adapted_projection_count(expert);
+            experts.push(expert.merge_adapters(client)?);
+        }
+        let shared_expert = match self.moe.shared_expert() {
+            Some(shared) => {
+                merged += Expert::<R>::adapted_projection_count(shared);
+                Some(shared.merge_adapters(client)?)
+            }
+            None => None,
+        };
+        if merged == 0 {
+            return Ok(0);
+        }
+
+        let gate = self.moe.router().gate();
+        let gate_weight = gate.weight();
+        let router = boostr::nn::moe::router::MoeRouter::new(
+            boostr::nn::Linear::with_ids(
+                gate_weight.tensor().clone(),
+                gate_weight.id(),
+                gate.bias().map(|bias| (bias.tensor().clone(), bias.id())),
+                gate_weight.requires_grad(),
+            ),
+            *self.moe.router().config(),
+        );
+        let scale = self.moe.shared_expert_scale();
+        self.moe = boostr::nn::moe::layer::MoeLayer::new(router, experts, shared_expert)
+            .with_shared_expert_scale(scale)?;
+        Ok(merged)
     }
 
     /// Forward pass for MoE layer.
@@ -1842,14 +1871,11 @@ where
             + boostr::TensorOps<R>,
     {
         if cfg.moe.is_some() {
-            // MoE mode. boostr's `nn::moe::expert::Expert` stores concrete
-            // `Linear` fields, so an expert projection cannot hold an adapter.
-            // `validate_lora` already rejects this pairing at config load; the
-            // check is repeated here so no other caller can build a model that
-            // claims adapters it does not have.
-            Self::reject_moe_lora(lora)?;
+            // MoE mode. An MLP target (`gate_proj`/`up_proj`/`down_proj`) names
+            // the same projection inside every expert, so `lora` flows through
+            // to each of them.
             Ok(FfnLayer::Moe(Box::new(MoeLayer::new(
-                cfg, vb, client, dtype,
+                cfg, vb, client, dtype, lora,
             )?)))
         } else {
             // Simple MLP mode (no MoE)
@@ -1859,43 +1885,13 @@ where
         }
     }
 
-    /// Refuse a `lora` block that names an MLP projection while this layer is
-    /// a MoE layer.
-    fn reject_moe_lora(lora: Option<&LoraConfig>) -> Result<()> {
-        let Some(lora) = lora else {
-            return Ok(());
-        };
-        let Some(target) = crate::config::MLP_LORA_TARGETS
-            .iter()
-            .find(|&&target| lora.targets(target))
-        else {
-            return Ok(());
-        };
-        Err(boostr::error::Error::ModelError {
-            reason: format!(
-                "lora.target_modules names '{target}' but this layer is a MoE layer, whose \
-                 experts are built from boostr's nn::moe::expert::Expert — it stores concrete \
-                 Linear fields and cannot hold a LoRA adapter. Remove '{target}' from \
-                 lora.target_modules, or remove num_experts from the model config."
-            ),
-        })
-    }
-
     #[allow(clippy::type_complexity)]
     fn with_ids(
         cfg: &ModelConfig,
         mlp: Option<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
         moe: Option<(
-            Vec<(
-                (Tensor<R>, boostr::autograd::TensorId),
-                (Tensor<R>, boostr::autograd::TensorId),
-                (Tensor<R>, boostr::autograd::TensorId),
-            )>,
-            (
-                (Tensor<R>, boostr::autograd::TensorId),
-                (Tensor<R>, boostr::autograd::TensorId),
-                (Tensor<R>, boostr::autograd::TensorId),
-            ),
+            Vec<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
+            (AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>),
             (Tensor<R>, boostr::autograd::TensorId),
         )>,
         frozen: &FrozenParams,
@@ -2232,16 +2228,8 @@ where
             (Tensor<R>, boostr::autograd::TensorId),
             Option<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
             Option<(
-                Vec<(
-                    (Tensor<R>, boostr::autograd::TensorId),
-                    (Tensor<R>, boostr::autograd::TensorId),
-                    (Tensor<R>, boostr::autograd::TensorId),
-                )>,
-                (
-                    (Tensor<R>, boostr::autograd::TensorId),
-                    (Tensor<R>, boostr::autograd::TensorId),
-                    (Tensor<R>, boostr::autograd::TensorId),
-                ),
+                Vec<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
+                (AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>),
                 (Tensor<R>, boostr::autograd::TensorId),
             )>,
             (Tensor<R>, boostr::autograd::TensorId),
@@ -3021,8 +3009,8 @@ where
         model.with_frozen_parameters(frozen)
     }
 
-    /// The base-weight ids of every LoRA-adapted projection, attention and MLP
-    /// alike.
+    /// The base-weight ids of every LoRA-adapted projection: attention, MLP,
+    /// and every MoE expert alike.
     ///
     /// Empty when no projection carries an adapter, which is what keeps a
     /// non-LoRA model's parameter set byte-identical to before LoRA existed.
@@ -3051,6 +3039,20 @@ where
                 } => {
                     for proj in mlp.projections() {
                         freeze_adapted(proj);
+                    }
+                }
+                // Every expert's three projections, routed and shared alike:
+                // an MLP target on a MoE model adapts all of them, so all of
+                // their bases must be frozen.
+                BlockType::Attention {
+                    ffn: FfnLayer::Moe(moe),
+                    ..
+                } => {
+                    let experts = moe.moe.experts().iter().chain(moe.moe.shared_expert());
+                    for expert in experts {
+                        for proj in [expert.gate_proj(), expert.up_proj(), expert.down_proj()] {
+                            freeze_adapted(proj);
+                        }
                     }
                 }
                 _ => {}
@@ -3345,9 +3347,11 @@ where
     {
         let mut merged = 0usize;
         for layer in &mut self.layers {
-            // Only the dense-attention block and the SwiGLU MLP hold a
-            // `MaybeLora`; MLA, MoE, and the SSM blocks carry plain `Linear`
-            // fields that never had an adapter to merge.
+            // The dense-attention block and the SwiGLU MLP hold their
+            // `MaybeLora` projections directly; a MoE layer holds one per
+            // expert and merges them through `MoeLayer::merge_adapters`. MLA
+            // and the SSM blocks carry plain `Linear` fields that never had an
+            // adapter to merge.
             let projections: Vec<&mut MaybeLora<R>> = match &mut layer.block_type {
                 BlockType::LegacyAttention { attn, mlp, .. } => {
                     let attn: &mut CausalSelfAttention<R> = attn;
@@ -3369,10 +3373,17 @@ where
                     let mlp: &mut Mlp<R> = mlp;
                     vec![&mut mlp.gate_proj, &mut mlp.up_proj, &mut mlp.down_proj]
                 }
+                BlockType::Attention {
+                    ffn: FfnLayer::Moe(moe),
+                    ..
+                } => {
+                    merged += moe.merge_adapters(client)?;
+                    Vec::new()
+                }
                 _ => Vec::new(),
             };
             for projection in projections {
-                if projection.merge_adapter(client)? {
+                if merge_projection(projection, client)? {
                     merged += 1;
                 }
             }
@@ -3497,7 +3508,9 @@ where
                     FfnLayer::Mlp(mlp) => {
                         (Some(Self::mlp_weights_with_ids(cfg, mlp, params)?), None)
                     }
-                    FfnLayer::Moe(moe) => (None, Some(Self::moe_weights_with_ids(moe, params)?)),
+                    FfnLayer::Moe(moe) => {
+                        (None, Some(Self::moe_weights_with_ids(cfg, moe, params)?))
+                    }
                 };
                 let attn_named = attn.mla.named_parameters();
                 Block::with_ids(
@@ -3772,30 +3785,28 @@ where
         ))
     }
 
+    /// Snapshot every expert's three projections for the rebuild path, adapters
+    /// included. Routing through `attn_proj_with_ids` is what carries each
+    /// expert's `lora_a`/`lora_b` id across a step instead of minting a fresh
+    /// one.
     #[allow(clippy::type_complexity)]
     fn moe_weights_with_ids(
+        cfg: &OxidizrModelConfig,
         moe: &MoeLayer<R>,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
     ) -> Result<(
-        Vec<(
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-        )>,
-        (
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-        ),
+        Vec<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
+        (AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>),
         (Tensor<R>, boostr::autograd::TensorId),
     )> {
         let mut experts = Vec::new();
-        for expert in moe.moe.experts() {
-            experts.push((
-                Self::tensor_with_stable_id(expert.gate_proj().weight(), params)?,
-                Self::tensor_with_stable_id(expert.up_proj().weight(), params)?,
-                Self::tensor_with_stable_id(expert.down_proj().weight(), params)?,
-            ));
+        for (expert_idx, expert) in moe.moe.experts().iter().enumerate() {
+            experts.push(Self::expert_weights_with_ids(
+                cfg,
+                &format!("moe.experts.{expert_idx}"),
+                expert,
+                params,
+            )?);
         }
         let shared_expert =
             moe.moe
@@ -3803,13 +3814,37 @@ where
                 .ok_or_else(|| boostr::error::Error::ModelError {
                     reason: "MoE layer is missing the shared expert required by oxidizr".into(),
                 })?;
-        let shared_expert = (
-            Self::tensor_with_stable_id(shared_expert.gate_proj().weight(), params)?,
-            Self::tensor_with_stable_id(shared_expert.up_proj().weight(), params)?,
-            Self::tensor_with_stable_id(shared_expert.down_proj().weight(), params)?,
-        );
+        let shared_expert =
+            Self::expert_weights_with_ids(cfg, "moe.shared_expert", shared_expert, params)?;
         let router_gate = Self::tensor_with_stable_id(moe.moe.router().gate().weight(), params)?;
         Ok((experts, shared_expert, router_gate))
+    }
+
+    /// Snapshot one expert's `gate_proj`/`up_proj`/`down_proj`, adapters
+    /// included. `prefix` names the expert in any error, so a shape or alpha
+    /// problem points at the expert it came from rather than at "an expert".
+    #[allow(clippy::type_complexity)]
+    fn expert_weights_with_ids(
+        cfg: &OxidizrModelConfig,
+        prefix: &str,
+        expert: &boostr::nn::moe::expert::Expert<R>,
+        params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
+    ) -> Result<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)> {
+        Ok((
+            Self::attn_proj_with_ids(
+                cfg,
+                &format!("{prefix}.gate_proj"),
+                expert.gate_proj(),
+                params,
+            )?,
+            Self::attn_proj_with_ids(cfg, &format!("{prefix}.up_proj"), expert.up_proj(), params)?,
+            Self::attn_proj_with_ids(
+                cfg,
+                &format!("{prefix}.down_proj"),
+                expert.down_proj(),
+                params,
+            )?,
+        ))
     }
 
     fn conv1d_hyperparams_for(config_d_conv: usize, conv_channels: usize) -> Conv1dHyperParams {
@@ -4141,6 +4176,28 @@ where
         }
     }
 
+    /// Name one MoE expert's three projections under `prefix`, e.g.
+    /// `layers.0.moe.experts.3.gate_proj.weight` and, when adapted, that
+    /// projection's `.lora_a` / `.lora_b`. The expert index is already in
+    /// `prefix`, which is what keeps each expert's adapter names unique.
+    fn extend_named_expert<'a>(
+        params: &mut Vec<(
+            String,
+            boostr::autograd::TensorId,
+            &'a boostr::autograd::Var<R>,
+        )>,
+        prefix: &str,
+        expert: &'a boostr::nn::moe::expert::Expert<R>,
+    ) {
+        for (name, proj) in [
+            ("gate_proj", expert.gate_proj()),
+            ("up_proj", expert.up_proj()),
+            ("down_proj", expert.down_proj()),
+        ] {
+            Self::push_named_projection(params, &format!("{prefix}.{name}"), proj);
+        }
+    }
+
     fn extend_named_from_module<'a>(
         params: &mut Vec<(
             String,
@@ -4301,37 +4358,17 @@ where
                     moe.moe.router().gate().weight(),
                 );
                 for (expert_idx, expert) in moe.moe.experts().iter().enumerate() {
-                    Self::push_named_param(
+                    Self::extend_named_expert(
                         params,
-                        format!("{layer_prefix}.moe.experts.{expert_idx}.gate_proj.weight"),
-                        expert.gate_proj().weight(),
-                    );
-                    Self::push_named_param(
-                        params,
-                        format!("{layer_prefix}.moe.experts.{expert_idx}.up_proj.weight"),
-                        expert.up_proj().weight(),
-                    );
-                    Self::push_named_param(
-                        params,
-                        format!("{layer_prefix}.moe.experts.{expert_idx}.down_proj.weight"),
-                        expert.down_proj().weight(),
+                        &format!("{layer_prefix}.moe.experts.{expert_idx}"),
+                        expert,
                     );
                 }
                 if let Some(shared_expert) = moe.moe.shared_expert() {
-                    Self::push_named_param(
+                    Self::extend_named_expert(
                         params,
-                        format!("{layer_prefix}.moe.shared_expert.gate_proj.weight"),
-                        shared_expert.gate_proj().weight(),
-                    );
-                    Self::push_named_param(
-                        params,
-                        format!("{layer_prefix}.moe.shared_expert.up_proj.weight"),
-                        shared_expert.up_proj().weight(),
-                    );
-                    Self::push_named_param(
-                        params,
-                        format!("{layer_prefix}.moe.shared_expert.down_proj.weight"),
-                        shared_expert.down_proj().weight(),
+                        &format!("{layer_prefix}.moe.shared_expert"),
+                        shared_expert,
                     );
                 }
             }
@@ -5555,25 +5592,6 @@ mod lora_tests {
         }
     }
 
-    #[test]
-    fn an_mlp_target_is_rejected_for_a_moe_model() {
-        let mut moe_cfg = cfg(Some(lora_cfg_for(&["q_proj", "gate_proj"])));
-        moe_cfg.num_experts = Some(2);
-        moe_cfg.experts_per_tok = Some(1);
-        let message = moe_cfg
-            .to_boostr()
-            .expect_err("an MLP target must be rejected while num_experts is set")
-            .to_string();
-        assert!(
-            message.contains("gate_proj"),
-            "the error must name the offending target: {message}"
-        );
-        assert!(
-            message.contains("num_experts"),
-            "the error must name what to change: {message}"
-        );
-    }
-
     /// A model whose `lora_b` factors are all NON-zero.
     ///
     /// `lora_b` is zero-initialized, so a freshly built model's adapters
@@ -5735,6 +5753,462 @@ mod lora_tests {
                 "logit {index} moved through merge and reload: {lhs} -> {rhs}"
             );
         }
+    }
+}
+
+/// LoRA on MoE expert projections.
+///
+/// `gate_proj`/`up_proj`/`down_proj` name a projection inside every expert, so
+/// on a MoE model those targets must adapt each expert — routed and shared —
+/// and keep doing so across a rebuild, a checkpoint round trip, and a merge.
+/// Adapting only some of them, or losing an adapter id on a rebuild, trains
+/// less than the config asks for with nothing at runtime to say so.
+#[cfg(test)]
+mod moe_lora_tests {
+    use super::*;
+    use boostr::{CpuClient, CpuDevice, CpuRuntime};
+
+    const MLP_TARGETS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
+    const NUM_EXPERTS: usize = 2;
+
+    /// A MoE model is only reachable through the MLA attention path —
+    /// `Block::new` builds an `FfnLayer` there and nowhere else — so a MoE test
+    /// config carries `kv_latent_dim`/`q_latent_dim`/`d_rope` too.
+    ///
+    /// `experts_per_tok == num_experts` so every expert receives every token:
+    /// the gradient test asserts a NONZERO adapter gradient, and an expert no
+    /// token routed to would legitimately get zero.
+    fn cfg(lora: Option<LoraConfig>) -> OxidizrModelConfig {
+        OxidizrModelConfig {
+            name: "moe-lora-test".to_string(),
+            hidden_size: 8,
+            num_layers: 1,
+            num_heads: 2,
+            kv_heads: None,
+            kv_latent_dim: Some(4),
+            q_latent_dim: Some(4),
+            d_rope: Some(2),
+            num_experts: Some(NUM_EXPERTS),
+            experts_per_tok: Some(NUM_EXPERTS),
+            shared_expert_enabled: Some(true),
+            intermediate_size: Some(16),
+            mamba_layers: None,
+            mamba2_num_heads: None,
+            mamba2_head_dim: None,
+            mamba2_state_size: None,
+            mamba2_chunk_size: None,
+            mamba2_n_groups: None,
+            mamba2_conv_kernel: None,
+            mamba2_expand: None,
+            mamba3_enabled: None,
+            mamba3_complex_rope: None,
+            mamba3_mimo_rank: None,
+            mamba3_use_conv: None,
+            vocab_size: 12,
+            grow_vocab: false,
+            tie_word_embeddings: false,
+            tokenizer_vocab: "custom".to_string(),
+            max_seq_len: 8,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            sliding_window: None,
+            speech_vocab: None,
+            lora,
+            dtype: crate::config::DTypePrecision::F32,
+        }
+    }
+
+    fn lora_cfg() -> LoraConfig {
+        LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: MLP_TARGETS.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    fn build(lora: Option<LoraConfig>) -> LitGPT<CpuRuntime> {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut varmap = boostr::VarMap::<CpuRuntime>::new();
+        let mut vb = VarBuilder::new(&mut varmap, &device);
+        LitGPT::<CpuRuntime>::new(&cfg(lora), &mut vb, &client).expect("moe model builds")
+    }
+
+    fn names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
+        model
+            .named_trainable_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    fn trainable_ids(
+        model: &LitGPT<CpuRuntime>,
+    ) -> std::collections::HashSet<boostr::autograd::TensorId> {
+        model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn optimizer_params(
+        model: &LitGPT<CpuRuntime>,
+    ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
+        model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, var)| (id, var.tensor().clone()))
+            .collect()
+    }
+
+    /// The dotted prefix of every expert, routed then shared — the same
+    /// prefixes `named_parameters` builds its names from.
+    fn expert_prefixes() -> Vec<String> {
+        let mut prefixes: Vec<String> = (0..NUM_EXPERTS)
+            .map(|index| format!("layers.0.moe.experts.{index}"))
+            .collect();
+        prefixes.push("layers.0.moe.shared_expert".to_string());
+        prefixes
+    }
+
+    /// Every expert projection paired with the prefix its parameters are named
+    /// under, in `named_parameters` order.
+    fn expert_projections(model: &LitGPT<CpuRuntime>) -> Vec<(String, &MaybeLora<CpuRuntime>)> {
+        let moe = match &model.layers[0].block_type {
+            BlockType::Attention {
+                ffn: FfnLayer::Moe(moe),
+                ..
+            } => moe,
+            _ => panic!("the moe-lora-test config must produce an MoE FfnLayer"),
+        };
+        let experts = moe.moe.experts().iter().chain(moe.moe.shared_expert());
+        let mut pairs = Vec::new();
+        for (prefix, expert) in expert_prefixes().into_iter().zip(experts) {
+            for (name, proj) in [
+                ("gate_proj", expert.gate_proj()),
+                ("up_proj", expert.up_proj()),
+                ("down_proj", expert.down_proj()),
+            ] {
+                pairs.push((format!("{prefix}.{name}"), proj));
+            }
+        }
+        pairs
+    }
+
+    fn logits(model: &LitGPT<CpuRuntime>, client: &CpuClient, device: &CpuDevice) -> Vec<f32> {
+        // i64, matching what `data.rs` uploads (it casts the u32 stream first).
+        let input_ids = Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], device);
+        let output = model.forward(client, &input_ids).expect("forward");
+        output
+            .logits
+            .tensor()
+            .contiguous()
+            .expect("contiguous")
+            .to_vec::<f32>()
+    }
+
+    fn all_params(
+        model: &LitGPT<CpuRuntime>,
+    ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
+        model
+            .named_parameters()
+            .into_iter()
+            .map(|(_, id, var)| (id, var.tensor().clone()))
+            .collect()
+    }
+
+    fn temp_path(tag: &str) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!(
+                "oxidizr-moe-lora-{tag}-{}-{unique}.safetensors",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A model whose expert `lora_b` factors are all NON-zero.
+    ///
+    /// `lora_b` is zero-initialized, so a merge of a freshly built model proves
+    /// nothing: merged and unmerged outputs would agree even if the merge
+    /// dropped `scaling * (B @ A)` entirely. Rewriting the factors through
+    /// `rebuild_with_parameters` is the same path the trainer takes after an
+    /// optimizer step.
+    fn with_nonzero_adapters(model: LitGPT<CpuRuntime>, device: &CpuDevice) -> LitGPT<CpuRuntime> {
+        let mut params = optimizer_params(&model);
+        for (index, (prefix, proj)) in expert_projections(&model).into_iter().enumerate() {
+            let (_, lora_b) = proj
+                .adapters()
+                .unwrap_or_else(|| panic!("{prefix} must be adapted"));
+            let shape = lora_b.tensor().shape().to_vec();
+            let count: usize = shape.iter().product();
+            let values: Vec<f32> = (0..count)
+                .map(|i| 0.05 + 0.01 * ((index + i) % 7) as f32)
+                .collect();
+            params.insert(
+                lora_b.id(),
+                Tensor::<CpuRuntime>::from_slice(&values, &shape, device),
+            );
+        }
+        model.rebuild_with_parameters(&params).expect("rebuild")
+    }
+
+    #[test]
+    fn every_expert_projection_is_adapted_and_its_base_is_frozen() {
+        let model = build(Some(lora_cfg()));
+        let listed = names(&model);
+        for prefix in expert_prefixes() {
+            for target in MLP_TARGETS {
+                assert!(
+                    listed.contains(&format!("{prefix}.{target}.lora_a")),
+                    "{prefix}.{target}.lora_a must be trainable: {listed:?}"
+                );
+                assert!(
+                    listed.contains(&format!("{prefix}.{target}.lora_b")),
+                    "{prefix}.{target}.lora_b must be trainable: {listed:?}"
+                );
+                assert!(
+                    !listed.contains(&format!("{prefix}.{target}.weight")),
+                    "{prefix}.{target}.weight is the wrapped base — LoRA must freeze it"
+                );
+            }
+        }
+        // The router is untargeted and must stay a plain trainable Linear.
+        assert!(listed.contains(&"layers.0.moe.router.gate.weight".to_string()));
+    }
+
+    #[test]
+    fn expert_base_weights_carry_requires_grad_false() {
+        let model = build(Some(lora_cfg()));
+        for (prefix, proj) in expert_projections(&model) {
+            assert!(proj.adapters().is_some(), "{prefix} must be adapted");
+            assert!(
+                !proj.weight().requires_grad(),
+                "{prefix}.weight is a wrapped base and must be frozen"
+            );
+        }
+    }
+
+    #[test]
+    fn trainable_set_and_ids_are_identical_across_a_rebuild() {
+        let model = build(Some(lora_cfg()));
+        let before_ids = trainable_ids(&model);
+        let before_names = names(&model);
+
+        let rebuilt = model
+            .rebuild_with_parameters(&optimizer_params(&model))
+            .expect("rebuild succeeds");
+
+        assert_eq!(before_ids, trainable_ids(&rebuilt));
+        assert_eq!(before_names, names(&rebuilt));
+
+        for ((prefix, before), (_, after)) in expert_projections(&model)
+            .into_iter()
+            .zip(expert_projections(&rebuilt))
+        {
+            let (a_before, b_before) = before.adapters().expect("adapted before");
+            let (a_after, b_after) = after.adapters().expect("adapted after");
+            assert_eq!(
+                a_before.id(),
+                a_after.id(),
+                "{prefix}.lora_a must keep its TensorId"
+            );
+            assert_eq!(
+                b_before.id(),
+                b_after.id(),
+                "{prefix}.lora_b must keep its TensorId"
+            );
+            assert!(
+                a_after.requires_grad(),
+                "{prefix}.lora_a must stay trainable"
+            );
+            assert!(
+                b_after.requires_grad(),
+                "{prefix}.lora_b must stay trainable"
+            );
+            assert!(
+                !after.weight().requires_grad(),
+                "{prefix}.weight must stay frozen"
+            );
+        }
+    }
+
+    /// The anti-severed-graph test at expert granularity: an adapter the MoE
+    /// routing, masking, or SwiGLU fusion drops receives no gradient and
+    /// silently never trains.
+    #[test]
+    fn a_gradient_reaches_every_expert_adapter() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let model = build(Some(lora_cfg()));
+
+        // i64, matching what `data.rs` uploads (it casts the u32 stream first).
+        let input_ids = Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device);
+        let output = model.forward(&client, &input_ids).expect("forward");
+        let loss =
+            boostr::autograd::var_sum(&output.logits, &[0, 1, 2], false, &client).expect("reduce");
+        let grads = boostr::autograd::backward(&loss, &client).expect("backward");
+
+        for (prefix, proj) in expert_projections(&model) {
+            let (lora_a, lora_b) = proj
+                .adapters()
+                .unwrap_or_else(|| panic!("{prefix} must be adapted"));
+            // lora_b is zero-initialised, so d(loss)/d(lora_a) is zero at step
+            // 0 by construction; lora_b is the factor that must receive signal
+            // immediately.
+            let grad = grads
+                .get(lora_b.id())
+                .unwrap_or_else(|| panic!("{prefix}.lora_b received no gradient"));
+            let values: Vec<f32> = grad.contiguous().expect("contiguous").to_vec();
+            let magnitude: f32 = values.iter().map(|v| v.abs()).sum();
+            assert!(
+                magnitude > 1e-8,
+                "{prefix}.lora_b gradient is all zeros ({magnitude}) — the LoRA graph is severed"
+            );
+            assert!(
+                grads.get(lora_a.id()).is_some(),
+                "{prefix}.lora_a must be reachable from the loss"
+            );
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_round_trip_restores_every_parameter() {
+        let device = CpuDevice::new();
+        let model = with_nonzero_adapters(build(Some(lora_cfg())), &device);
+        let saved: Vec<(String, Vec<f32>)> = model
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _, var)| {
+                (
+                    name,
+                    var.tensor()
+                        .contiguous()
+                        .expect("contiguous")
+                        .to_vec::<f32>(),
+                )
+            })
+            .collect();
+        assert!(
+            saved.iter().any(|(name, _)| name.contains(".lora_a")),
+            "the saved set must include the expert adapters"
+        );
+        assert!(
+            saved
+                .iter()
+                .any(|(name, _)| name == "layers.0.moe.experts.0.gate_proj.weight"),
+            "the saved set must include the FROZEN expert bases: a trainable-only \
+             checkpoint reloads into random weights"
+        );
+
+        let path = temp_path("roundtrip");
+        save_checkpoint_from_params(&path, &model, &all_params(&model)).expect("save");
+        let mut reloaded = build(Some(lora_cfg()));
+        load_checkpoint_into_model(&mut reloaded, &path)
+            .expect("a MoE LoRA checkpoint must load under the config that wrote it");
+        let _ = std::fs::remove_file(&path);
+
+        let restored: Vec<(String, Vec<f32>)> = reloaded
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _, var)| {
+                (
+                    name,
+                    var.tensor()
+                        .contiguous()
+                        .expect("contiguous")
+                        .to_vec::<f32>(),
+                )
+            })
+            .collect();
+        assert_eq!(saved.len(), restored.len());
+        for ((name, before), (reloaded_name, after)) in saved.iter().zip(&restored) {
+            assert_eq!(name, reloaded_name, "parameter order must be stable");
+            assert_eq!(before, after, "'{name}' did not survive the round trip");
+        }
+    }
+
+    #[test]
+    fn merging_expert_adapters_leaves_the_output_where_it_was() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut model = with_nonzero_adapters(build(Some(lora_cfg())), &device);
+        let before = logits(&model, &client, &device);
+
+        let merged = model.merge_lora_adapters(&client).expect("merge");
+        assert_eq!(
+            merged,
+            (NUM_EXPERTS + 1) * MLP_TARGETS.len(),
+            "every routed and shared expert projection must merge"
+        );
+
+        let after = logits(&model, &client, &device);
+        assert_eq!(before.len(), after.len());
+        for (index, (lhs, rhs)) in before.iter().zip(&after).enumerate() {
+            assert!(
+                (lhs - rhs).abs() < 1e-5,
+                "logit {index} moved on merge: {lhs} -> {rhs}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_merged_moe_checkpoint_carries_no_adapter_tensor() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut model = with_nonzero_adapters(build(Some(lora_cfg())), &device);
+        model.merge_lora_adapters(&client).expect("merge");
+
+        let path = temp_path("names");
+        save_checkpoint_from_params(&path, &model, &all_params(&model)).expect("save");
+        let mut safetensors = boostr::format::SafeTensors::open(&path).expect("open checkpoint");
+        let mut written: Vec<String> = safetensors
+            .load_all::<CpuRuntime>(&device)
+            .expect("load checkpoint")
+            .into_keys()
+            .collect();
+        written.sort();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !written.iter().any(|name| name.contains("lora_")),
+            "a merged MoE checkpoint must carry no adapter tensor: {written:?}"
+        );
+        let mut plain: Vec<String> = build(None)
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        plain.sort();
+        assert_eq!(
+            written, plain,
+            "a merged checkpoint must carry exactly the parameter set of the same config \
+             without its lora block"
+        );
+    }
+
+    #[test]
+    fn an_attention_target_is_still_rejected_on_the_mla_path() {
+        let message = cfg(Some(LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: vec!["gate_proj".to_string(), "q_proj".to_string()],
+        }))
+        .to_boostr()
+        .expect_err("an attention target must be rejected while kv_latent_dim is set")
+        .to_string();
+        assert!(
+            message.contains("q_proj"),
+            "the error must name the offending target: {message}"
+        );
+        assert!(
+            message.contains("kv_latent_dim"),
+            "the error must name what to change: {message}"
+        );
     }
 }
 

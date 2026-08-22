@@ -183,17 +183,16 @@ pub struct RopeScalingSpec {
     pub beta_slow: Option<f32>,
 }
 
-/// Projections that can carry a LoRA adapter: the dense attention block and
-/// the SwiGLU MLP that follows it.
+/// Projections that can carry a LoRA adapter: the dense attention block, the
+/// SwiGLU MLP that follows it, and every MoE expert's SwiGLU projections.
 ///
-/// Everything else (MoE experts, MLA's `q_a_proj`/`kv_b_proj`, the SSM
-/// projections) is NOT wrapped, so naming one is rejected rather than silently
-/// dropped — a config asking for seven adapters must never yield four.
+/// Everything else (MLA's `q_a_proj`/`kv_b_proj`, the SSM projections) is NOT
+/// wrapped, so naming one is rejected rather than silently dropped — a config
+/// asking for seven adapters must never yield four.
 ///
-/// `gate_proj`/`up_proj`/`down_proj` name the MLP projections only. A MoE
-/// model reuses those names inside every expert, and boostr's
-/// `nn::moe::expert::Expert` stores concrete `Linear` fields that cannot hold
-/// an adapter, so `validate_lora` rejects the combination outright.
+/// `gate_proj`/`up_proj`/`down_proj` name the MLP projections, and a MoE model
+/// reuses those same names inside every expert (routed and shared alike), so
+/// on a MoE model they adapt each expert instead.
 pub const SUPPORTED_LORA_TARGETS: [&str; 7] = [
     "q_proj",
     "k_proj",
@@ -204,10 +203,11 @@ pub const SUPPORTED_LORA_TARGETS: [&str; 7] = [
     "down_proj",
 ];
 
-/// The subset of [`SUPPORTED_LORA_TARGETS`] that names an MLP projection.
+/// The subset of [`SUPPORTED_LORA_TARGETS`] that names a SwiGLU projection —
+/// the MLP's, and every MoE expert's.
 ///
-/// These are the names a MoE model would also match inside its experts, which
-/// is why they need a rejection of their own.
+/// These are the only targets the MLA attention path can honor, since MLA
+/// carries no `q_proj`/`k_proj`/`v_proj`/`o_proj` to wrap.
 pub const MLP_LORA_TARGETS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 
 /// LoRA adapter parameters. See [`OxidizrModelConfig::lora`] for why this

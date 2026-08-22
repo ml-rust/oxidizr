@@ -165,26 +165,6 @@ fn validate_lora(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Result<()> {
             )));
         }
     }
-    // `gate_proj`/`up_proj`/`down_proj` name the MLP's projections, and a MoE
-    // model reuses those same names inside every expert. boostr's
-    // `nn::moe::expert::Expert` stores concrete `Linear` fields, so an expert
-    // projection cannot hold an adapter — the run would train nothing there
-    // while the config claims otherwise.
-    let moe_target = cfg.num_experts.and_then(|_| {
-        lora.target_modules
-            .iter()
-            .find(|target| MLP_LORA_TARGETS.contains(&target.as_str()))
-    });
-    if let Some(target) = moe_target {
-        return Err(model_error(format!(
-            "lora.target_modules names {target:?} while num_experts is set, so that name \
-             would also select the MoE experts' projections. boostr's \
-             nn::moe::expert::Expert stores concrete Linear fields and cannot hold a LoRA \
-             adapter, so the experts would train nothing while the config claims they are \
-             adapted. Remove {target:?} from lora.target_modules (the attention targets \
-             still work), or remove num_experts."
-        )));
-    }
     if matches!(shape, LayerShape::SsmOnly) {
         return Err(model_error(
             "lora is set but mamba_layers covers every layer (SsmOnly): there is no \
@@ -192,13 +172,27 @@ fn validate_lora(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Result<()> {
              at least one attention layer.",
         ));
     }
+    // MLA replaces the dense q/k/v/o projections with q_a_proj / q_b_proj /
+    // kv_a_proj_with_mqa / kv_b_proj, none of which is wrapped, so an
+    // attention target under kv_latent_dim would yield no adapter at all. The
+    // SwiGLU targets DO reach an MLA model — its FFN is an ordinary MLP, or a
+    // MoE whose experts are adapted per projection — so they stay accepted.
     if cfg.kv_latent_dim.is_some() {
-        return Err(model_error(
-            "lora is set together with kv_latent_dim, which selects the MLA attention \
-             path (q_a_proj / q_b_proj / kv_a_proj_with_mqa / kv_b_proj). LoRA adapters \
-             are wired to the dense q_proj/k_proj/v_proj/o_proj path only, so no adapter \
-             would be created. Remove kv_latent_dim, or remove the lora block.",
-        ));
+        if let Some(target) = lora
+            .target_modules
+            .iter()
+            .find(|target| !MLP_LORA_TARGETS.contains(&target.as_str()))
+        {
+            return Err(model_error(format!(
+                "lora.target_modules names {target:?} while kv_latent_dim is set, which \
+                 selects the MLA attention path (q_a_proj / q_b_proj / \
+                 kv_a_proj_with_mqa / kv_b_proj). LoRA adapters are wired to the dense \
+                 q_proj/k_proj/v_proj/o_proj path only, so no adapter would be created \
+                 for {target:?}. Remove {target:?} from lora.target_modules (the \
+                 gate_proj/up_proj/down_proj targets still work), or remove \
+                 kv_latent_dim."
+            )));
+        }
     }
     Ok(())
 }
