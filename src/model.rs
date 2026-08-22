@@ -1,7 +1,7 @@
 use crate::prelude::{DType, Embedding, Init, Linear, Result, RmsNorm, Tensor, VarBuilder};
 
 use crate::config::OxidizrModelConfig;
-use boostr::model::config::ModelConfig;
+use boostr::model::config::{default_rms_norm_eps, ModelConfig};
 use boostr::tensor::TensorId;
 // `cast` is a TypeConversionOps method; the trait must be in scope to call it.
 use boostr::TypeConversionOps;
@@ -1656,7 +1656,11 @@ where
             + boostr::CompareOps<R>
             + boostr::TensorOps<R>,
     {
-        let eps = 1e-5;
+        // The config's value, not a literal: boostr's `ModelConfig` carries
+        // `rms_norm_eps`, and hardcoding it here would silently ignore a
+        // config that asks for anything else. (Mamba pre-norms deliberately
+        // keep MAMBA_PRENORM_EPS — see its doc comment.)
+        let eps = cfg.rms_norm_eps as f32;
 
         // Determine if this should be a Mamba layer. `is_ssm_layer` handles
         // all three config shapes (pure attention, pure SSM, hybrid) — a raw
@@ -1857,7 +1861,11 @@ where
         )>,
         device: &R::Device,
     ) -> Result<Self> {
-        let eps = 1e-5;
+        // The config's value, not a literal: boostr's `ModelConfig` carries
+        // `rms_norm_eps`, and hardcoding it here would silently ignore a
+        // config that asks for anything else. (Mamba pre-norms deliberately
+        // keep MAMBA_PRENORM_EPS — see its doc comment.)
+        let eps = cfg.rms_norm_eps as f32;
 
         // Determine if this should be a Mamba layer. `is_ssm_layer` handles
         // all three config shapes (pure attention, pure SSM, hybrid) — a raw
@@ -2484,8 +2492,13 @@ where
             )?);
         }
 
-        let norm =
-            Self::take_rms_norm(vb.pp("norm"), cfg.hidden_size, 1e-5, compute_dtype, client)?;
+        let norm = Self::take_rms_norm(
+            vb.pp("norm"),
+            cfg.hidden_size,
+            bcfg.rms_norm_eps as f32,
+            compute_dtype,
+            client,
+        )?;
         // A tied checkpoint (e.g. Qwen3-1.7B) has no separate `lm_head.weight`
         // tensor, so loading one here would hard-error. `with_ids` re-derives
         // the tuple from `embed_tokens` when `cfg.tie_word_embeddings` is set,
@@ -2558,7 +2571,12 @@ where
             cfg: cfg.clone(),
             embed_tokens: Embedding::with_id(embed_tokens.0, embed_tokens.1, true),
             layers,
-            norm: RmsNorm::with_id(norm.0, norm.1, 1e-5, true),
+            // boostr's default rather than a bare literal. oxidizr's YAML has no
+            // `rms_norm_eps` field yet, so `to_boostr()` always yields the default
+            // here — calling it keeps this in step with boostr if that default
+            // ever changes, and marks the one place to read the config instead
+            // once the field is surfaced.
+            norm: RmsNorm::with_id(norm.0, norm.1, default_rms_norm_eps() as f32, true),
             lm_head: Linear::with_ids(lm_head.0, lm_head.1, None, true),
             compute_dtype: cfg.dtype.to_dtype(),
         })
