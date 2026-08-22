@@ -635,12 +635,21 @@ impl CheckpointValidation {
 /// Only hashes architecture-affecting fields, excluding metadata like:
 /// - name (cosmetic)
 /// - tokenizer_vocab (inference metadata, doesn't affect weights)
+/// - grow_vocab (a load-time policy, not architecture: two otherwise-identical
+///   models are the same model whether or not growth was permitted, and
+///   `vocab_size` — which does describe the weights — is hashed already)
+///
+/// Anything added to `ModelConfig` that is not architecture MUST be stripped
+/// here. A new field that reaches the hash changes it for every existing
+/// checkpoint, so resume validation reports a model mismatch on weights that
+/// are in fact compatible.
 pub fn compute_model_config_hash(config: &ModelConfig) -> String {
     // Create a JSON Value and remove non-architecture fields before hashing
     let mut value = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(ref mut map) = value {
         map.remove("name");
         map.remove("tokenizer_vocab");
+        map.remove("grow_vocab");
     }
     let json = serde_json::to_string(&value).unwrap_or_default();
     let mut hasher = DefaultHasher::new();
@@ -839,5 +848,39 @@ pub fn find_latest_checkpoint(
     match (latest_checkpoint, latest_meta) {
         (Some(ckpt), Some(meta)) => Ok(Some((ckpt, meta, latest_step))),
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config hash identifies the *architecture*, so a load-time policy
+    /// flag must not enter it. If it did, every checkpoint written before that
+    /// field existed would fail `CheckpointValidation::model_matches` and
+    /// resume would refuse weights that are perfectly compatible.
+    #[test]
+    fn grow_vocab_does_not_change_the_config_hash() {
+        let mut cfg = LitConfig::nano().model;
+        cfg.grow_vocab = false;
+        let without = compute_model_config_hash(&cfg);
+        cfg.grow_vocab = true;
+        let with = compute_model_config_hash(&cfg);
+        assert_eq!(
+            without, with,
+            "grow_vocab is a load-time policy, not architecture — it must be \
+             stripped in compute_model_config_hash"
+        );
+    }
+
+    /// The complement of the above: a field that genuinely describes the
+    /// weights must still move the hash, so this test cannot pass by the hash
+    /// having become insensitive to everything.
+    #[test]
+    fn vocab_size_does_change_the_config_hash() {
+        let mut cfg = LitConfig::nano().model;
+        let before = compute_model_config_hash(&cfg);
+        cfg.vocab_size += 1;
+        assert_ne!(before, compute_model_config_hash(&cfg));
     }
 }
