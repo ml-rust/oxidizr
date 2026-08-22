@@ -1,10 +1,10 @@
 //! Policy for reconciling a checkpoint's embedding/head row count with
-//! `ModelConfig::vocab_size`.
+//! `OxidizrModelConfig::vocab_size`.
 //!
 //! The math (mean-init row growth) lives in boostr's
 //! `nn::resize_rows_mean_init`, which stays architecture-agnostic. This
 //! module owns only the decision of when growth is allowed, keyed off
-//! `ModelConfig::grow_vocab`.
+//! `OxidizrModelConfig::grow_vocab`.
 
 use crate::prelude::{DType, Error, Result, Tensor};
 use boostr::{ReduceOps, Runtime, ShapeOps};

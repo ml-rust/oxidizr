@@ -1,6 +1,6 @@
 use crate::prelude::{DType, Embedding, Init, Linear, Result, RmsNorm, Tensor, VarBuilder};
 
-use crate::config::ModelConfig;
+use crate::config::OxidizrModelConfig;
 use boostr::tensor::TensorId;
 // `cast` is a TypeConversionOps method; the trait must be in scope to call it.
 use boostr::TypeConversionOps;
@@ -115,7 +115,7 @@ where
     R: boostr::Runtime<DType = DType>,
 {
     fn new<C>(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
@@ -136,7 +136,7 @@ where
 
     #[allow(clippy::too_many_arguments)]
     fn with_ids(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         q_a_proj: (Tensor<R>, boostr::autograd::TensorId),
         q_b_proj: (Tensor<R>, boostr::autograd::TensorId),
         q_a_layernorm: (Tensor<R>, boostr::autograd::TensorId),
@@ -230,7 +230,7 @@ where
         self.mla.trainable_parameters()
     }
 
-    fn mla_config(cfg: &ModelConfig) -> Result<boostr::nn::MlaConfig> {
+    fn mla_config(cfg: &OxidizrModelConfig) -> Result<boostr::nn::MlaConfig> {
         let head_dim = Self::head_dim(cfg)?;
         let kv_latent_dim = Self::required_dim("kv_latent_dim", cfg.kv_latent_dim)?;
         let q_latent_dim = Self::required_dim("q_latent_dim", cfg.q_latent_dim)?;
@@ -405,7 +405,7 @@ where
         Ok(boostr::nn::RmsNorm::with_id(weight, weight_id, eps, true))
     }
 
-    fn head_dim(cfg: &ModelConfig) -> Result<usize> {
+    fn head_dim(cfg: &OxidizrModelConfig) -> Result<usize> {
         if cfg.num_heads == 0 {
             return Err(boostr::error::Error::ModelError {
                 reason: "MLA num_heads must be non-zero".into(),
@@ -474,7 +474,7 @@ where
     R: boostr::Runtime<DType = DType>,
 {
     fn new<C>(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
@@ -531,7 +531,7 @@ where
     }
 
     fn with_ids(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         q_proj: (Tensor<R>, boostr::autograd::TensorId),
         k_proj: (Tensor<R>, boostr::autograd::TensorId),
         v_proj: (Tensor<R>, boostr::autograd::TensorId),
@@ -650,7 +650,7 @@ where
         params
     }
 
-    fn head_dim(cfg: &ModelConfig) -> Result<usize> {
+    fn head_dim(cfg: &OxidizrModelConfig) -> Result<usize> {
         if cfg.num_heads == 0 {
             return Err(boostr::error::Error::ModelError {
                 reason: "attention num_heads must be non-zero".into(),
@@ -752,7 +752,7 @@ where
     R: boostr::Runtime<DType = DType>,
 {
     fn new<C>(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
@@ -790,7 +790,7 @@ where
     }
 
     fn with_ids(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         gate_proj: (Tensor<R>, boostr::autograd::TensorId),
         up_proj: (Tensor<R>, boostr::autograd::TensorId),
         down_proj: (Tensor<R>, boostr::autograd::TensorId),
@@ -1186,7 +1186,7 @@ where
     R: boostr::Runtime<DType = DType>,
 {
     fn new<C>(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
@@ -1238,7 +1238,7 @@ where
 
     #[allow(clippy::type_complexity)]
     fn with_ids(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         experts: Vec<(
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
@@ -1374,7 +1374,7 @@ where
         1.0 / (experts_per_tok as f32 + 1.0)
     }
 
-    fn required_moe_dims(cfg: &ModelConfig) -> Result<(usize, usize, usize)> {
+    fn required_moe_dims(cfg: &OxidizrModelConfig) -> Result<(usize, usize, usize)> {
         let num_experts = Self::required_positive("num_experts", cfg.num_experts)?;
         let experts_per_tok = Self::required_positive("experts_per_tok", cfg.experts_per_tok)?;
         let intermediate = Self::required_positive("intermediate_size", cfg.intermediate_size)?;
@@ -1415,7 +1415,12 @@ impl<R> FfnLayer<R>
 where
     R: boostr::Runtime<DType = DType>,
 {
-    fn new<C>(cfg: &ModelConfig, vb: VarBuilder<'_, R>, client: &C, dtype: DType) -> Result<Self>
+    fn new<C>(
+        cfg: &OxidizrModelConfig,
+        vb: VarBuilder<'_, R>,
+        client: &C,
+        dtype: DType,
+    ) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
             + boostr::RandomOps<R>
@@ -1437,7 +1442,7 @@ where
 
     #[allow(clippy::type_complexity)]
     fn with_ids(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         mlp: Option<(
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
@@ -1603,7 +1608,7 @@ where
 {
     // Create appropriate block type based on configuration
     fn new<C>(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         layer_idx: usize,
         mut vb: VarBuilder<'_, R>,
         client: &C,
@@ -1753,7 +1758,7 @@ where
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn with_ids(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         layer_idx: usize,
         mamba1: Option<(
             boostr::model::mamba::Mamba1WeightsWithIds<R>,
@@ -2148,7 +2153,7 @@ where
         params
     }
 
-    fn mamba1_config(cfg: &ModelConfig) -> Result<boostr::model::Mamba1Config> {
+    fn mamba1_config(cfg: &OxidizrModelConfig) -> Result<boostr::model::Mamba1Config> {
         Self::reject_unexpressed_mamba1_value("mamba2_num_heads", cfg.mamba2_num_heads)?;
         Self::reject_unexpressed_mamba1_value("mamba2_head_dim", cfg.mamba2_head_dim)?;
         Self::reject_unexpressed_mamba1_value("mamba2_n_groups", cfg.mamba2_n_groups)?;
@@ -2178,7 +2183,7 @@ where
         Ok(config)
     }
 
-    fn mamba2_config(cfg: &ModelConfig) -> Result<boostr::model::Mamba2Config> {
+    fn mamba2_config(cfg: &OxidizrModelConfig) -> Result<boostr::model::Mamba2Config> {
         let config = boostr::model::Mamba2Config {
             d_model: cfg.hidden_size,
             d_state: Self::required_mamba_value("mamba2_state_size", cfg.mamba2_state_size)?,
@@ -2196,7 +2201,7 @@ where
         Ok(config)
     }
 
-    fn mamba3_config(cfg: &ModelConfig) -> Result<boostr::model::Mamba3Config> {
+    fn mamba3_config(cfg: &OxidizrModelConfig) -> Result<boostr::model::Mamba3Config> {
         let config = boostr::model::Mamba3Config {
             d_model: cfg.hidden_size,
             d_state: Self::required_mamba_value("mamba2_state_size", cfg.mamba2_state_size)?,
@@ -2375,7 +2380,7 @@ pub struct ModelOutput<R: boostr::Runtime> {
 }
 
 pub struct LitGPT<R: boostr::Runtime> {
-    cfg: ModelConfig,
+    cfg: OxidizrModelConfig,
     embed_tokens: Embedding<R>,
     layers: Vec<Block<R>>,
     norm: RmsNorm<R>,
@@ -2400,7 +2405,7 @@ impl<R> LitGPT<R>
 where
     R: boostr::Runtime<DType = DType>,
 {
-    pub fn new<C>(cfg: &ModelConfig, vb: &mut VarBuilder<'_, R>, client: &C) -> Result<Self>
+    pub fn new<C>(cfg: &OxidizrModelConfig, vb: &mut VarBuilder<'_, R>, client: &C) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
             + boostr::RandomOps<R>
@@ -2460,7 +2465,7 @@ where
     }
 
     fn with_ids(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         embed_tokens: (Tensor<R>, boostr::autograd::TensorId),
         layers: Vec<Block<R>>,
         norm: (Tensor<R>, boostr::autograd::TensorId),
@@ -2675,7 +2680,7 @@ where
     }
 
     fn rebuild_block_with_parameters(
-        cfg: &ModelConfig,
+        cfg: &OxidizrModelConfig,
         layer_idx: usize,
         layer: &Block<R>,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,

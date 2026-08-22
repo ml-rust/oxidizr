@@ -1,4 +1,4 @@
-use crate::config::{BlazrConfig, CheckpointMeta, ModelConfig, TrainerConfig};
+use crate::config::{BlazrConfig, CheckpointMeta, OxidizrModelConfig, TrainerConfig};
 use crate::data::DataLoader;
 use crate::distributed::{
     create_synchronizer, AdamWConfig as DistAdamWConfig, DistributedAdamW, GradientSynchronizer,
@@ -28,7 +28,7 @@ pub struct TrainerRunConfig {
     pub steps_json_path: String,
     pub headless: bool,
     pub start_step: usize,
-    pub model_config: ModelConfig,
+    pub model_config: OxidizrModelConfig,
     pub data_file_path: Option<String>,
 }
 
@@ -58,7 +58,7 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     // Resume support
     start_step: usize,
     // Checkpoint metadata
-    model_config: ModelConfig,
+    model_config: OxidizrModelConfig,
     data_file_path: Option<String>,
     // Distributed training support
     synchronizer: Option<Box<dyn GradientSynchronizer<R>>>,

@@ -54,12 +54,12 @@ pub use crate::distributed::sync::DistributedConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LitConfig {
-    pub model: ModelConfig,
+    pub model: OxidizrModelConfig,
     pub trainer: TrainerConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ModelConfig {
+pub struct OxidizrModelConfig {
     /// Model name (e.g., "nano", "small", "base") - used in checkpoint filenames
     #[serde(default = "default_model_name")]
     pub name: String,
@@ -170,7 +170,7 @@ impl std::fmt::Display for DTypePrecision {
     }
 }
 
-impl ModelConfig {
+impl OxidizrModelConfig {
     /// Generate checkpoint filename prefix: {name}_{seq_len}_{params}_{dtype}
     /// Example: nano_512_117m_bf16
     pub fn checkpoint_prefix(&self) -> String {
@@ -380,7 +380,7 @@ impl LitConfig {
     #[allow(dead_code)] // Baseline config for comparison - use models/nano.yaml instead
     pub fn nano_baseline() -> Self {
         Self {
-            model: ModelConfig {
+            model: OxidizrModelConfig {
                 name: "nano-baseline".to_string(),
                 hidden_size: 512,
                 num_layers: 8,
@@ -448,7 +448,7 @@ impl LitConfig {
     #[allow(dead_code)] // Hardcoded config for reference - use models/nano.yaml instead
     pub fn nano() -> Self {
         Self {
-            model: ModelConfig {
+            model: OxidizrModelConfig {
                 name: "nano".to_string(),
                 hidden_size: 384,
                 num_layers: 8,
@@ -546,7 +546,7 @@ impl CheckpointMeta {
     /// Create new checkpoint metadata
     pub fn new(
         step: usize,
-        model_config: &ModelConfig,
+        model_config: &OxidizrModelConfig,
         data_file_path: &str,
         checkpoint_file: &str,
     ) -> anyhow::Result<Self> {
@@ -583,7 +583,7 @@ impl CheckpointMeta {
     /// Validate that this checkpoint matches the current config and data
     pub fn validate(
         &self,
-        model_config: &ModelConfig,
+        model_config: &OxidizrModelConfig,
         data_file_path: &str,
     ) -> anyhow::Result<CheckpointValidation> {
         let current_model_hash = compute_model_config_hash(model_config);
@@ -630,7 +630,7 @@ impl CheckpointValidation {
     }
 }
 
-/// Compute hash of ModelConfig for validation
+/// Compute hash of OxidizrModelConfig for validation
 ///
 /// Only hashes architecture-affecting fields, excluding metadata like:
 /// - name (cosmetic)
@@ -639,11 +639,11 @@ impl CheckpointValidation {
 ///   models are the same model whether or not growth was permitted, and
 ///   `vocab_size` — which does describe the weights — is hashed already)
 ///
-/// Anything added to `ModelConfig` that is not architecture MUST be stripped
+/// Anything added to `OxidizrModelConfig` that is not architecture MUST be stripped
 /// here. A new field that reaches the hash changes it for every existing
 /// checkpoint, so resume validation reports a model mismatch on weights that
 /// are in fact compatible.
-pub fn compute_model_config_hash(config: &ModelConfig) -> String {
+pub fn compute_model_config_hash(config: &OxidizrModelConfig) -> String {
     // Create a JSON Value and remove non-architecture fields before hashing
     let mut value = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(ref mut map) = value {
@@ -743,8 +743,8 @@ pub struct BlazrConfig {
 }
 
 impl BlazrConfig {
-    /// Create a BlazrConfig from a ModelConfig
-    pub fn from_model_config(cfg: &ModelConfig) -> Self {
+    /// Create a BlazrConfig from an OxidizrModelConfig
+    pub fn from_model_config(cfg: &OxidizrModelConfig) -> Self {
         Self {
             hidden_size: cfg.hidden_size,
             num_layers: cfg.num_layers,

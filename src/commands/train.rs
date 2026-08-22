@@ -12,7 +12,7 @@ use clap::Args;
 use std::collections::HashMap;
 
 use crate::config::{
-    find_latest_checkpoint, CheckpointMeta, DTypePrecision, LitConfig, ModelConfig,
+    find_latest_checkpoint, CheckpointMeta, DTypePrecision, LitConfig, OxidizrModelConfig,
 };
 use crate::data::{create_dummy_data, LitDataLoader, PrefetchDataLoader};
 use crate::model::LitGPT;
@@ -175,7 +175,7 @@ fn get_cuda_memory_info<R: Runtime>(_device: &R::Device) -> Result<String> {
 }
 
 /// Estimate the number of parameters in the model
-pub fn estimate_params(cfg: &ModelConfig) -> String {
+pub fn estimate_params(cfg: &OxidizrModelConfig) -> String {
     // Embedding: vocab_size * hidden_size
     let embed_params = cfg.vocab_size * cfg.hidden_size;
 
