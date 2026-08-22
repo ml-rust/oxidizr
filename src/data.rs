@@ -1,16 +1,60 @@
 use crate::prelude::{DType, Error, Result, Tensor};
+use boostr::model::SpeechVocab;
 use boostr::runtime::Runtime;
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 // ============================================================================
 // Data Loader Trait
 // ============================================================================
+
+/// One training batch: inputs, next-token targets, and an optional loss mask.
+pub struct Batch<R: Runtime<DType = DType>> {
+    /// Token ids `[batch_size, seq_len]`, I64.
+    pub inputs: Tensor<R>,
+    /// Next-token ids `[batch_size, seq_len]`, I64 (`inputs` shifted by one).
+    pub targets: Tensor<R>,
+    /// `1.0` at positions whose TARGET is an audio token, else `0.0`.
+    /// Shape `[batch_size, seq_len]`, F32. `None` when audio-only masking is off.
+    pub loss_mask: Option<Tensor<R>>,
+}
+
+/// Build the audio-only loss mask over a raw `[batch_size, seq_len + 1]` token
+/// window.
+///
+/// The mask is derived from the POST-SHIFT targets (`slice[row_start + s + 1]`),
+/// never from the inputs (`slice[row_start + s]`). Masking on inputs would ask
+/// "is the current token audio" instead of "is the token being predicted audio",
+/// shifting every masked-in span by exactly one position on every row.
+///
+/// Rows are GPT-style packed, so one row can hold several concatenated
+/// text->audio examples; the mask is therefore per-token, never a single
+/// boundary index per row.
+///
+/// Shared by `LitDataLoader::next_batch` and `PrefetchDataLoader::prefetch_worker`
+/// so the two shift paths cannot diverge.
+fn audio_target_mask(
+    vocab: &SpeechVocab,
+    slice: &[u32],
+    batch_size: usize,
+    seq_len: usize,
+) -> Vec<f32> {
+    let mut mask = Vec::with_capacity(batch_size * seq_len);
+    for b in 0..batch_size {
+        let row_start = b * (seq_len + 1);
+        for s in 0..seq_len {
+            let target = slice[row_start + s + 1];
+            mask.push(if vocab.is_audio(target) { 1.0 } else { 0.0 });
+        }
+    }
+    mask
+}
 
 /// Common interface for all data loaders
 ///
@@ -22,8 +66,8 @@ pub trait DataLoader<R>
 where
     R: Runtime<DType = DType>,
 {
-    /// Fetch the next batch of (inputs, targets)
-    fn next_batch(&mut self) -> Result<(Tensor<R>, Tensor<R>)>;
+    /// Fetch the next batch
+    fn next_batch(&mut self) -> Result<Batch<R>>;
 
     /// Total number of tokens in the dataset
     fn dataset_size(&self) -> usize;
@@ -59,6 +103,8 @@ where
     // Sharding support for multi-GPU training
     shard_start: usize,
     shard_end: usize,
+    /// Speech id layout. `Some` turns on audio-only loss masking.
+    speech_vocab: Option<SpeechVocab>,
 }
 
 enum DataSource {
@@ -89,6 +135,7 @@ where
             device,
             shard_start: 0,
             shard_end: len,
+            speech_vocab: None,
         }
     }
 
@@ -157,7 +204,17 @@ where
             device,
             shard_start: 0,
             shard_end: len,
+            speech_vocab: None,
         })
+    }
+
+    /// Enable audio-only loss masking with this speech id layout.
+    ///
+    /// Without it the loader emits `loss_mask: None` and training scores every
+    /// position, as it did before speech support existed.
+    pub fn with_speech_vocab(mut self, vocab: SpeechVocab) -> Self {
+        self.speech_vocab = Some(vocab);
+        self
     }
 
     /// Configure data sharding for multi-GPU training
@@ -213,11 +270,11 @@ where
     }
 
     /// Fetches the next batch.
-    /// Returns (Input, Target) where Target is Input shifted by 1.
+    /// Returns a [`Batch`] whose `targets` are `inputs` shifted by 1.
     ///
     /// When sharding is enabled, the cursor wraps within the shard boundaries
     /// rather than the full dataset.
-    pub fn next_batch(&mut self) -> Result<(Tensor<R>, Tensor<R>)> {
+    pub fn next_batch(&mut self) -> Result<Batch<R>> {
         let n_tokens_needed = self.batch_size * (self.seq_len + 1);
 
         // Check shard boundaries (for multi-GPU training)
@@ -248,7 +305,25 @@ where
         let inputs = raw_tensor.narrow(1, 0, self.seq_len)?.contiguous()?;
         let targets = raw_tensor.narrow(1, 1, self.seq_len)?.contiguous()?;
 
-        Ok((inputs, targets))
+        // Built from the same `slice`, over the post-shift target window, so it
+        // lines up element-for-element with `targets` above.
+        let loss_mask = match &self.speech_vocab {
+            Some(vocab) => {
+                let mask = audio_target_mask(vocab, slice, self.batch_size, self.seq_len);
+                Some(Tensor::<R>::try_from_slice(
+                    &mask,
+                    &[self.batch_size, self.seq_len],
+                    &self.device,
+                )?)
+            }
+            None => None,
+        };
+
+        Ok(Batch {
+            inputs,
+            targets,
+            loss_mask,
+        })
     }
 
     /// Returns the shard size for this data loader
@@ -265,7 +340,7 @@ impl<R> DataLoader<R> for LitDataLoader<R>
 where
     R: Runtime<DType = DType>,
 {
-    fn next_batch(&mut self) -> Result<(Tensor<R>, Tensor<R>)> {
+    fn next_batch(&mut self) -> Result<Batch<R>> {
         LitDataLoader::next_batch(self)
     }
 
@@ -313,13 +388,15 @@ pub fn write_tokens_to_file<P: AsRef<Path>>(tokens: &[u32], path: P) -> std::io:
 // Async Prefetching Data Pipeline
 // ============================================================================
 
-/// A batch ready for training: (inputs, targets) on CPU
+/// A batch ready for training: (inputs, targets, loss mask) on CPU
 /// Will be transferred to GPU when consumed
 struct PrefetchedBatch {
     /// Input token IDs as raw u32 vec (before GPU transfer)
     inputs: Vec<u32>,
     /// Target token IDs as raw u32 vec
     targets: Vec<u32>,
+    /// Audio-only loss mask over the target positions, `None` when masking is off
+    loss_mask: Option<Vec<f32>>,
     /// Batch dimensions
     batch_size: usize,
     seq_len: usize,
@@ -353,8 +430,8 @@ struct PrefetchedBatch {
 /// let mut prefetch_loader = PrefetchDataLoader::new(base_loader, 2)?; // prefetch 2 batches
 ///
 /// for step in 0..max_steps {
-///     let (inputs, targets) = prefetch_loader.next_batch()?;
-///     // GPU training on inputs/targets while next batch is being loaded
+///     let batch = prefetch_loader.next_batch()?;
+///     // GPU training on batch.inputs/batch.targets while next batch is being loaded
 /// }
 ///
 /// // Background thread is joined automatically when `prefetch_loader` is dropped.
@@ -447,6 +524,13 @@ where
             // Get raw token slice
             let slice = loader.get_tokens(current_cursor, n_tokens_needed);
 
+            // Same helper as the synchronous path, over the same post-shift
+            // target window, so the two loaders cannot produce different masks.
+            let loss_mask = loader
+                .speech_vocab
+                .as_ref()
+                .map(|vocab| audio_target_mask(vocab, slice, loader.batch_size, loader.seq_len));
+
             // Prepare inputs and targets (still on CPU as Vec<u32>)
             let mut inputs = Vec::with_capacity(loader.batch_size * loader.seq_len);
             let mut targets = Vec::with_capacity(loader.batch_size * loader.seq_len);
@@ -462,6 +546,7 @@ where
             let batch = PrefetchedBatch {
                 inputs,
                 targets,
+                loss_mask,
                 batch_size: loader.batch_size,
                 seq_len: loader.seq_len,
             };
@@ -478,7 +563,7 @@ where
     /// This is the main method called in the training loop.
     /// It receives a prefetched batch from the background thread and
     /// transfers it to the target device (GPU).
-    pub fn next_batch(&mut self) -> Result<(Tensor<R>, Tensor<R>)> {
+    pub fn next_batch(&mut self) -> Result<Batch<R>> {
         // Receive prefetched batch (blocks if none available)
         let batch = self.receiver.recv().map_err(|_| Error::DataError {
             reason: "prefetch thread stopped".to_string(),
@@ -501,7 +586,20 @@ where
             &self.device,
         )?;
 
-        Ok((inputs, targets))
+        let loss_mask = match &batch.loss_mask {
+            Some(mask) => Some(Tensor::<R>::try_from_slice(
+                mask,
+                &[batch.batch_size, batch.seq_len],
+                &self.device,
+            )?),
+            None => None,
+        };
+
+        Ok(Batch {
+            inputs,
+            targets,
+            loss_mask,
+        })
     }
 
     /// Get batch size
@@ -527,7 +625,7 @@ impl<R> DataLoader<R> for PrefetchDataLoader<R>
 where
     R: Runtime<DType = DType>,
 {
-    fn next_batch(&mut self) -> Result<(Tensor<R>, Tensor<R>)> {
+    fn next_batch(&mut self) -> Result<Batch<R>> {
         PrefetchDataLoader::next_batch(self)
     }
 
@@ -545,8 +643,18 @@ where
 
         // Take ownership of the thread handle and join
         if let Some(handle) = self.prefetch_thread.take() {
-            // Drop the receiver first to unblock the sender
-            // (handled automatically when self is dropped)
+            // The worker parks in `sender.send` once the bounded channel is
+            // full, and the receiver is still alive here (it is dropped only
+            // after this function returns), so joining straight away
+            // deadlocks. Drain buffered batches until the worker observes the
+            // stop signal and exits.
+            while !handle.is_finished() {
+                match self.receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(_) => {}
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
             let _ = handle.join();
         }
     }
@@ -579,4 +687,128 @@ where
 {
     let base_loader = LitDataLoader::<R>::from_file(path, batch_size, seq_len, device)?;
     PrefetchDataLoader::new(base_loader, prefetch_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boostr::model::{CodecVocab, SpeechVocab, ALL_SPECIAL_TOKENS};
+    use boostr::{CpuDevice, CpuRuntime};
+
+    const TEXT_VOCAB: usize = 16;
+    /// Must hold all 13 control tokens.
+    const CONTROL_REGION: usize = 16;
+
+    /// Toy layout: text ids [0, 16), control ids [16, 32), audio ids [32, 40).
+    fn toy_vocab() -> SpeechVocab {
+        let codec = CodecVocab::new(2, 4).expect("valid codec");
+        SpeechVocab::with_sequential_specials(
+            TEXT_VOCAB,
+            CONTROL_REGION,
+            &ALL_SPECIAL_TOKENS,
+            codec,
+        )
+        .expect("valid vocab")
+    }
+
+    fn audio_base() -> u32 {
+        (TEXT_VOCAB + CONTROL_REGION) as u32
+    }
+
+    fn mask_of(batch: &Batch<CpuRuntime>) -> Vec<f32> {
+        batch
+            .loss_mask
+            .as_ref()
+            .expect("loss mask present")
+            .contiguous()
+            .expect("contiguous mask")
+            .to_vec()
+    }
+
+    fn loader(tokens: Vec<u32>, batch_size: usize, seq_len: usize) -> LitDataLoader<CpuRuntime> {
+        LitDataLoader::<CpuRuntime>::new(tokens, batch_size, seq_len, CpuDevice::new())
+            .with_speech_vocab(toy_vocab())
+    }
+
+    /// The mask must answer "is the token being PREDICTED audio", so it is built
+    /// from the post-shift targets. Building it from `inputs` instead would move
+    /// the first `1.0` one position later, which is what this asserts against.
+    #[test]
+    fn mask_is_derived_from_targets_not_inputs() {
+        let base = audio_base();
+        // inputs  = [0, 1, 2, base+0, base+1]
+        // targets = [1, 2, base+0, base+1, base+2]
+        let tokens = vec![0, 1, 2, base, base + 1, base + 2];
+        let batch = loader(tokens, 1, 5).next_batch().expect("batch");
+
+        let mask = mask_of(&batch);
+        assert_eq!(mask, vec![0.0, 0.0, 1.0, 1.0, 1.0]);
+
+        let first_one = mask
+            .iter()
+            .position(|v| *v == 1.0)
+            .expect("a masked-in position");
+        assert_eq!(
+            first_one, 2,
+            "mask must start where the TARGET is the first audio token (index 2), \
+             not where the INPUT is (index 3)"
+        );
+
+        // Sanity: the target at that index really is the first audio token.
+        let targets: Vec<i64> = batch.targets.contiguous().expect("contiguous").to_vec();
+        assert_eq!(targets[first_one], base as i64);
+    }
+
+    /// GPT-style packing puts several text->audio examples in one row, so the
+    /// mask must be per-token and produce one span per example.
+    #[test]
+    fn packed_row_with_two_segments_produces_two_mask_spans() {
+        let base = audio_base();
+        // targets = [1, base, base, 3, 4, base, base, 5]
+        let tokens = vec![0, 1, base, base, 3, 4, base, base, 5];
+        let batch = loader(tokens, 1, 8).next_batch().expect("batch");
+
+        assert_eq!(
+            mask_of(&batch),
+            vec![0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn no_speech_vocab_means_no_loss_mask() {
+        let base = audio_base();
+        let tokens = vec![0, 1, base, base + 1, 2, 3];
+        let mut l = LitDataLoader::<CpuRuntime>::new(tokens, 1, 5, CpuDevice::new());
+        let batch = l.next_batch().expect("batch");
+        assert!(batch.loss_mask.is_none());
+        assert_eq!(batch.inputs.shape(), [1usize, 5]);
+        assert_eq!(batch.targets.shape(), [1usize, 5]);
+    }
+
+    #[test]
+    fn prefetch_loader_mask_matches_sync_loader() {
+        let base = audio_base();
+        let tokens: Vec<u32> = (0..64)
+            .map(|i| {
+                if i % 3 == 0 {
+                    base + (i % 8) as u32
+                } else {
+                    (i % 16) as u32
+                }
+            })
+            .collect();
+
+        let sync_batch = loader(tokens.clone(), 2, 6)
+            .next_batch()
+            .expect("sync batch");
+
+        let mut prefetch = PrefetchDataLoader::<CpuRuntime>::new(loader(tokens, 2, 6), 1)
+            .expect("prefetch loader");
+        let prefetch_batch = prefetch.next_batch().expect("prefetch batch");
+
+        assert_eq!(mask_of(&sync_batch), mask_of(&prefetch_batch));
+        let sync_targets: Vec<i64> = sync_batch.targets.contiguous().expect("c").to_vec();
+        let prefetch_targets: Vec<i64> = prefetch_batch.targets.contiguous().expect("c").to_vec();
+        assert_eq!(sync_targets, prefetch_targets);
+    }
 }

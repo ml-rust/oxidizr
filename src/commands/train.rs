@@ -613,6 +613,13 @@ where
         LitDataLoader::<R>::new(dummy_tokens, batch_size, seq_len, device.clone())
     };
 
+    // Audio-only loss masking is opt-in: without `speech_vocab` the loader emits
+    // no mask and every position is scored, exactly as before.
+    let base_loader = match &config.model.speech_vocab {
+        Some(vocab) => base_loader.with_speech_vocab(vocab.clone()),
+        None => base_loader,
+    };
+
     // Get dataset size before potentially wrapping in prefetch
     let dataset_size = base_loader.dataset_size();
 

@@ -107,6 +107,29 @@ fn to_rope_scaling(spec: &RopeScalingSpec) -> RopeScalingConfig {
 /// every model type but only the `llama` (`AttentionOnly`) path actually
 /// reads `sliding_window`, and only `llama`/`hybrid` read `rope_scaling` —
 /// the rest would silently do nothing.
+/// `speech_vocab` must describe exactly the id space the embedding table covers.
+///
+/// A mismatch means the audio range the loss mask selects and the row count the
+/// model allocates disagree, which masks the wrong positions without ever
+/// erroring at runtime.
+fn validate_speech_vocab(cfg: &OxidizrModelConfig) -> Result<()> {
+    let Some(vocab) = &cfg.speech_vocab else {
+        return Ok(());
+    };
+    let total = vocab.total_size();
+    if total != cfg.vocab_size {
+        return Err(model_error(format!(
+            "speech_vocab.total_size() is {total} but vocab_size is {}: the audio id \
+             range and the embedding table disagree, so audio-only loss masking \
+             would score the wrong positions. Set vocab_size to {total}, or fix \
+             speech_vocab (text_vocab_size + control_region_size + codec tokens) \
+             to total {}.",
+            cfg.vocab_size, cfg.vocab_size
+        )));
+    }
+    Ok(())
+}
+
 fn validate_attention_extras(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Result<()> {
     if matches!(shape, LayerShape::SsmOnly) {
         if cfg.rope_scaling.is_some() {
@@ -297,6 +320,7 @@ impl OxidizrModelConfig {
         let has_mamba = !ssm_layers.is_empty();
         let mamba3 = self.mamba3_enabled.unwrap_or(false);
         validate_attention_extras(self, &shape)?;
+        validate_speech_vocab(self)?;
 
         let moe = to_moe(self)?;
         let intermediate_size = if moe.is_some() {

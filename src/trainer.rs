@@ -3,7 +3,9 @@ use crate::data::DataLoader;
 use crate::distributed::{
     create_synchronizer, AdamWConfig as DistAdamWConfig, DistributedAdamW, GradientSynchronizer,
 };
-use crate::prelude::{cross_entropy, DType, Error, FusedAdamW, Result, Tensor};
+use crate::prelude::{
+    cross_entropy, cross_entropy_masked, DType, Error, FusedAdamW, Result, Tensor,
+};
 use boostr::autograd::{backward, var_add, var_mul_scalar, var_reshape, GradStore, Var};
 use boostr::ops::{FusedOptimizerOps, TensorOps};
 use boostr::optimizer::AdamWConfig;
@@ -66,6 +68,9 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     // Learning rate warmup (critical for Mamba SSM parameter alignment)
     warmup_steps: usize,     // Effective warmup steps (0 = disabled)
     base_learning_rate: f64, // Base LR to warmup towards
+    /// Guard against a silently all-ones or nearly-all-zeros audio loss mask:
+    /// the masked-in fraction is reported once per run, not once per step.
+    mask_stats_logged: bool,
 }
 
 impl<'a, R> LitTrainer<'a, R>
@@ -167,6 +172,7 @@ where
             distributed_optimizer,
             warmup_steps,
             base_learning_rate,
+            mask_stats_logged: false,
         })
     }
 
@@ -221,7 +227,8 @@ where
         // Gradient Accumulation Loop - only forward passes, accumulate losses
         for _micro_batch_idx in 0..accum_steps {
             let data_start = if profile { Some(Instant::now()) } else { None };
-            let (input, target) = data_loader.next_batch()?;
+            let batch = data_loader.next_batch()?;
+            let (input, target, loss_mask) = (batch.inputs, batch.targets, batch.loss_mask);
             if let Some(start) = data_start {
                 eprintln!(
                     "[PROFILE] data_load: {:.3}ms",
@@ -320,7 +327,25 @@ where
             let logits_flat = var_reshape(&logits, &[b * s, v])?;
             let target_flat = target.reshape(&[b * s])?;
 
-            let ce_loss = cross_entropy(&self.client, &logits_flat, &target_flat)?;
+            let ce_loss = match &loss_mask {
+                Some(mask) => {
+                    let mask_flat = mask.reshape(&[b * s])?;
+                    if !self.mask_stats_logged {
+                        self.mask_stats_logged = true;
+                        let values: Vec<f32> = mask_flat.contiguous()?.to_vec();
+                        let masked_in = values.iter().filter(|v| **v != 0.0).count();
+                        let total = values.len().max(1);
+                        eprintln!(
+                            "[loss-mask] audio-only masking on: {masked_in}/{} positions \
+                             masked in ({:.2}%) in the first batch",
+                            values.len(),
+                            masked_in as f64 * 100.0 / total as f64
+                        );
+                    }
+                    cross_entropy_masked(&self.client, &logits_flat, &target_flat, &mask_flat)?
+                }
+                None => cross_entropy(&self.client, &logits_flat, &target_flat)?,
+            };
 
             // NaN checking is expensive (GPU->CPU sync) - only do on first step or when DEBUG_NAN is set
             let check_nan = self.global_step == 0 || std::env::var("DEBUG_NAN").is_ok();

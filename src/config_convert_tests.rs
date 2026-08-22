@@ -294,3 +294,33 @@ fn zero_sliding_window_is_rejected() {
         "error must name sliding_window: {err}"
     );
 }
+
+/// A toy speech layout: text ids [0, 16), control ids [16, 32), audio ids
+/// [32, 40), so `total_size() == 40`.
+fn toy_speech_vocab() -> boostr::model::SpeechVocab {
+    use boostr::model::{CodecVocab, SpeechVocab, ALL_SPECIAL_TOKENS};
+    let codec = CodecVocab::new(2, 4).expect("valid codec");
+    SpeechVocab::with_sequential_specials(16, 16, &ALL_SPECIAL_TOKENS, codec).expect("valid vocab")
+}
+
+#[test]
+fn speech_vocab_matching_vocab_size_is_accepted() {
+    let cfg = OxidizrModelConfig {
+        vocab_size: 40,
+        speech_vocab: Some(toy_speech_vocab()),
+        ..dense_baseline()
+    };
+    cfg.to_boostr().unwrap();
+}
+
+#[test]
+fn speech_vocab_total_size_mismatch_is_rejected() {
+    let cfg = OxidizrModelConfig {
+        vocab_size: 41,
+        speech_vocab: Some(toy_speech_vocab()),
+        ..dense_baseline()
+    };
+    let err = cfg.to_boostr().unwrap_err().to_string();
+    assert!(err.contains("40"), "error must name total_size(): {err}");
+    assert!(err.contains("41"), "error must name vocab_size: {err}");
+}

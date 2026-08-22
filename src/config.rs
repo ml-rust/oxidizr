@@ -1,3 +1,4 @@
+use boostr::model::SpeechVocab;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -126,6 +127,18 @@ pub struct OxidizrModelConfig {
     /// dense-attention path; boostr's hybrid path never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sliding_window: Option<usize>,
+    /// Speech-LM id layout (text | control | audio regions).
+    ///
+    /// Present turns ON audio-only loss masking: the data loader emits a
+    /// per-token mask and the trainer scores only positions whose target is an
+    /// audio id, judged by `SpeechVocab::is_audio`. Absent leaves text-only
+    /// training byte-identical.
+    ///
+    /// `skip_serializing_if` keeps the key out of the JSON that
+    /// `compute_model_config_hash` hashes, so every pre-existing checkpoint
+    /// keeps its hash and still passes resume validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_vocab: Option<SpeechVocab>,
 
     /// Model precision (f32/f16/bf16) - default F32
     /// Mixed precision: SSM (Mamba/Mamba2) and RMSNorm always use F32 internally
@@ -453,6 +466,7 @@ impl LitConfig {
                 rope_theta: 10000.0,
                 rope_scaling: None,
                 sliding_window: None,
+                speech_vocab: None,
                 dtype: DTypePrecision::F32,
             },
             trainer: TrainerConfig {
@@ -536,6 +550,7 @@ impl LitConfig {
                 rope_theta: 10000.0,
                 rope_scaling: None,
                 sliding_window: None,
+                speech_vocab: None,
                 dtype: DTypePrecision::F32,
             },
             trainer: TrainerConfig {
@@ -969,6 +984,39 @@ mod tests {
         let mut cfg = LitConfig::nano_baseline().model;
         let before = compute_model_config_hash(&cfg);
         cfg.sliding_window = Some(4096);
+        assert_ne!(before, compute_model_config_hash(&cfg));
+    }
+
+    /// A toy speech layout: text ids [0, 16), control ids [16, 32),
+    /// audio ids [32, 40), so `total_size() == 40`.
+    fn toy_speech_vocab() -> SpeechVocab {
+        use boostr::model::{CodecVocab, ALL_SPECIAL_TOKENS};
+        let codec = CodecVocab::new(2, 4).expect("valid codec");
+        SpeechVocab::with_sequential_specials(16, 16, &ALL_SPECIAL_TOKENS, codec)
+            .expect("valid vocab")
+    }
+
+    /// `speech_vocab` is a new field on an existing struct, so an unset value
+    /// must be omitted from the hashed JSON entirely; serializing it as `null`
+    /// would change the hash of every pre-existing checkpoint's config.
+    #[test]
+    fn speech_vocab_unset_does_not_change_the_config_hash() {
+        let cfg = LitConfig::nano_baseline().model;
+        assert!(cfg.speech_vocab.is_none());
+
+        let value = serde_json::to_value(&cfg).unwrap();
+        let map = value.as_object().unwrap();
+        assert!(
+            !map.contains_key("speech_vocab"),
+            "speech_vocab must be omitted from JSON when unset"
+        );
+    }
+
+    #[test]
+    fn speech_vocab_set_changes_the_config_hash() {
+        let mut cfg = LitConfig::nano_baseline().model;
+        let before = compute_model_config_hash(&cfg);
+        cfg.speech_vocab = Some(toy_speech_vocab());
         assert_ne!(before, compute_model_config_hash(&cfg));
     }
 

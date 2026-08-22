@@ -3721,6 +3721,7 @@ mod tie_word_embeddings_tests {
             rope_theta: 10000.0,
             rope_scaling: None,
             sliding_window: None,
+            speech_vocab: None,
             dtype: crate::config::DTypePrecision::F32,
         }
     }
