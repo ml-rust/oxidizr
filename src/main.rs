@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod config_convert;
 mod data;
 mod distributed;
 mod model;
