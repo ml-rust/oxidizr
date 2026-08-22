@@ -13,6 +13,110 @@ use std::collections::HashMap;
 /// keys without re-running initialization.
 type WeightWithId<R> = (Tensor<R>, boostr::autograd::TensorId);
 
+/// Trainability for a parameter being initialized for the very first time.
+///
+/// The `new`/`take_*` helpers mint the [`boostr::autograd::TensorId`] in
+/// place, so the id cannot yet appear in a [`FrozenParams`] set — nothing is
+/// freezable at initialization. Freezing is expressed on the reconstruction
+/// path instead, via [`LitGPT::with_frozen_parameters`], which routes through
+/// the `*_with_ids` constructors where `FrozenParams` decides every flag.
+const INITIALIZED_TRAINABLE: bool = true;
+
+/// The set of parameters that must be reconstructed frozen.
+///
+/// This is the SINGLE source of truth for trainability on every
+/// reconstruction path. `LitGPT` carries one of these and hands the same
+/// instance to every `*_with_ids` constructor, so the flag a parameter is
+/// built with on step 1 is the flag it is rebuilt with on step N. Deriving
+/// trainability per-call-site from a literal is what let
+/// `rebuild_with_parameters` silently un-freeze a frozen weight.
+///
+/// Keyed by [`boostr::autograd::TensorId`] because that is the identity the
+/// optimizer, the gradient store, and `assert_stable_parameter_ids` all use.
+/// A parameter's id is stable across rebuilds, so a set captured once stays
+/// valid for the life of the model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrozenParams {
+    ids: std::collections::HashSet<boostr::autograd::TensorId>,
+}
+
+// The constructors below are the freeze API. Nothing inside `model.rs`
+// populates a non-empty set yet, so they read as dead to a binary-crate build.
+#[allow(dead_code)]
+impl FrozenParams {
+    /// An empty set: every parameter is trainable. This is what
+    /// `LitGPT::new` uses, so default behavior is unchanged.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_ids<I>(ids: I) -> Self
+    where
+        I: IntoIterator<Item = boostr::autograd::TensorId>,
+    {
+        Self {
+            ids: ids.into_iter().collect(),
+        }
+    }
+
+    pub fn freeze(&mut self, id: boostr::autograd::TensorId) {
+        self.ids.insert(id);
+    }
+
+    pub fn is_frozen(&self, id: boostr::autograd::TensorId) -> bool {
+        self.ids.contains(&id)
+    }
+
+    /// The trainability flag for `id`. Every construction site derives its
+    /// `trainable` argument from this one call, never from a literal.
+    pub fn trainable(&self, id: boostr::autograd::TensorId) -> bool {
+        !self.is_frozen(id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Trainability for a group of parameters that share ONE flag.
+    ///
+    /// boostr's `Mamba1/2/3::with_ids` take a single `trainable` bool for all
+    /// their raw (non-`Linear`) parameters, so those cannot be frozen
+    /// individually. Freezing part of such a group is rejected rather than
+    /// silently rounded up or down.
+    fn group_trainable(
+        &self,
+        group: &str,
+        members: &[(&str, boostr::autograd::TensorId)],
+    ) -> Result<bool> {
+        let frozen: Vec<&str> = members
+            .iter()
+            .filter(|(_, id)| self.is_frozen(*id))
+            .map(|(name, _)| *name)
+            .collect();
+        if frozen.is_empty() {
+            return Ok(true);
+        }
+        if frozen.len() == members.len() {
+            return Ok(false);
+        }
+        let trainable: Vec<&str> = members
+            .iter()
+            .filter(|(_, id)| !self.is_frozen(*id))
+            .map(|(name, _)| *name)
+            .collect();
+        Err(boostr::error::Error::ModelError {
+            reason: format!(
+                "'{group}' shares one trainability flag across all of its raw parameters, \
+                 but only part of the group is frozen: frozen [{}], still trainable [{}]. \
+                 Add the still-trainable ids to FrozenParams, or remove the frozen ones, \
+                 so the whole group is frozen or none of it is.",
+                frozen.join(", "),
+                trainable.join(", ")
+            ),
+        })
+    }
+}
+
 /// Take a tensor from the VarBuilder, or initialize it when absent.
 ///
 /// Delegates to boostr's `VarBuilder::take_or_init_tensor` — the initializer
@@ -153,6 +257,7 @@ where
         kv_b_proj: (Tensor<R>, boostr::autograd::TensorId),
         o_proj: (Tensor<R>, boostr::autograd::TensorId),
         device: &R::Device,
+        frozen: &FrozenParams,
     ) -> Result<Self> {
         let mla_config = Self::mla_config(cfg)?;
         let qk_dim = mla_config.qk_head_dim();
@@ -163,12 +268,14 @@ where
                 q_a_proj.0,
                 q_a_proj.1,
                 &[mla_config.q_lora_rank, mla_config.hidden_size],
+                frozen,
             )?),
             q_up: Self::linear_with_ids(
                 "q_b_proj.weight",
                 q_b_proj.0,
                 q_b_proj.1,
                 &[mla_config.num_heads * qk_dim, mla_config.q_lora_rank],
+                frozen,
             )?,
             q_norm: Some(Self::rms_norm_with_id(
                 "q_a_layernorm.weight",
@@ -176,6 +283,7 @@ where
                 q_a_layernorm.1,
                 mla_config.q_lora_rank,
                 mla_config.norm_eps,
+                frozen,
             )?),
             kv_compress: Self::linear_with_ids(
                 "kv_a_proj_with_mqa.weight",
@@ -185,6 +293,7 @@ where
                     mla_config.kv_lora_rank + mla_config.rope_head_dim,
                     mla_config.hidden_size,
                 ],
+                frozen,
             )?,
             kv_norm: Some(Self::rms_norm_with_id(
                 "kv_a_layernorm.weight",
@@ -192,6 +301,7 @@ where
                 kv_a_layernorm.1,
                 mla_config.kv_lora_rank,
                 mla_config.norm_eps,
+                frozen,
             )?),
             kv_decompress: Self::linear_with_ids(
                 "kv_b_proj.weight",
@@ -201,6 +311,7 @@ where
                     mla_config.num_heads * (mla_config.head_dim + mla_config.head_dim_v),
                     mla_config.kv_lora_rank,
                 ],
+                frozen,
             )?,
             o_proj: Self::linear_with_ids(
                 "o_proj.weight",
@@ -210,6 +321,7 @@ where
                     mla_config.hidden_size,
                     mla_config.num_heads * mla_config.head_dim_v,
                 ],
+                frozen,
             )?,
         };
 
@@ -363,7 +475,7 @@ where
         let weight_id = weight.id();
         Self::ensure_shape(&param_name, &weight, expected_shape)?;
         Ok(boostr::nn::MaybeQuantLinear::Standard(
-            boostr::nn::Linear::with_ids(weight, weight_id, None, true),
+            boostr::nn::Linear::with_ids(weight, weight_id, None, INITIALIZED_TRAINABLE),
         ))
     }
 
@@ -393,7 +505,12 @@ where
         )?;
         let weight_id = weight.id();
         Self::ensure_shape(&param_name, &weight, &[expected_len])?;
-        Ok(boostr::nn::RmsNorm::with_id(weight, weight_id, eps, true))
+        Ok(boostr::nn::RmsNorm::with_id(
+            weight,
+            weight_id,
+            eps,
+            INITIALIZED_TRAINABLE,
+        ))
     }
 
     fn linear_with_ids(
@@ -401,10 +518,12 @@ where
         weight: Tensor<R>,
         weight_id: boostr::autograd::TensorId,
         expected_shape: &[usize],
+        frozen: &FrozenParams,
     ) -> Result<boostr::nn::MaybeQuantLinear<R>> {
         Self::ensure_shape(name, &weight, expected_shape)?;
+        let trainable = frozen.trainable(weight_id);
         Ok(boostr::nn::MaybeQuantLinear::Standard(
-            boostr::nn::Linear::with_ids(weight, weight_id, None, true),
+            boostr::nn::Linear::with_ids(weight, weight_id, None, trainable),
         ))
     }
 
@@ -414,9 +533,13 @@ where
         weight_id: boostr::autograd::TensorId,
         expected_len: usize,
         eps: f32,
+        frozen: &FrozenParams,
     ) -> Result<boostr::nn::RmsNorm<R>> {
         Self::ensure_shape(name, &weight, &[expected_len])?;
-        Ok(boostr::nn::RmsNorm::with_id(weight, weight_id, eps, true))
+        let trainable = frozen.trainable(weight_id);
+        Ok(boostr::nn::RmsNorm::with_id(
+            weight, weight_id, eps, trainable,
+        ))
     }
 
     fn head_dim(cfg: &ModelConfig) -> Result<usize> {
@@ -575,6 +698,7 @@ where
         o_proj: (Tensor<R>, boostr::autograd::TensorId),
         rope_cos: (Tensor<R>, boostr::autograd::TensorId),
         rope_sin: (Tensor<R>, boostr::autograd::TensorId),
+        frozen: &FrozenParams,
     ) -> Result<Self> {
         let attn_cfg = cfg
             .attention
@@ -594,24 +718,28 @@ where
                 q_proj.0,
                 q_proj.1,
                 &[cfg.hidden_size, cfg.hidden_size],
+                frozen,
             )?,
             k_proj: Self::linear_with_ids(
                 "k_proj.weight",
                 k_proj.0,
                 k_proj.1,
                 &[kv_hidden, cfg.hidden_size],
+                frozen,
             )?,
             v_proj: Self::linear_with_ids(
                 "v_proj.weight",
                 v_proj.0,
                 v_proj.1,
                 &[kv_hidden, cfg.hidden_size],
+                frozen,
             )?,
             o_proj: Self::linear_with_ids(
                 "o_proj.weight",
                 o_proj.0,
                 o_proj.1,
                 &[cfg.hidden_size, cfg.hidden_size],
+                frozen,
             )?,
             num_heads: attn_cfg.num_heads,
             num_kv_heads: kv_heads,
@@ -764,7 +892,12 @@ where
         )?;
         Self::ensure_shape(&param_name, &weight, expected_shape)?;
         let weight_id = weight.id();
-        Ok(boostr::nn::Linear::with_ids(weight, weight_id, None, true))
+        Ok(boostr::nn::Linear::with_ids(
+            weight,
+            weight_id,
+            None,
+            INITIALIZED_TRAINABLE,
+        ))
     }
 
     fn linear_with_ids(
@@ -772,9 +905,13 @@ where
         weight: Tensor<R>,
         weight_id: boostr::autograd::TensorId,
         expected_shape: &[usize],
+        frozen: &FrozenParams,
     ) -> Result<boostr::nn::Linear<R>> {
         Self::ensure_shape(name, &weight, expected_shape)?;
-        Ok(boostr::nn::Linear::with_ids(weight, weight_id, None, true))
+        let trainable = frozen.trainable(weight_id);
+        Ok(boostr::nn::Linear::with_ids(
+            weight, weight_id, None, trainable,
+        ))
     }
 
     fn ensure_shape(name: &str, weight: &Tensor<R>, expected_shape: &[usize]) -> Result<()> {
@@ -846,6 +983,7 @@ where
         gate_proj: (Tensor<R>, boostr::autograd::TensorId),
         up_proj: (Tensor<R>, boostr::autograd::TensorId),
         down_proj: (Tensor<R>, boostr::autograd::TensorId),
+        frozen: &FrozenParams,
     ) -> Result<Self> {
         let intermediate_size = cfg.intermediate_size.unwrap_or(cfg.hidden_size * 4);
 
@@ -855,18 +993,21 @@ where
                 gate_proj.0,
                 gate_proj.1,
                 &[intermediate_size, cfg.hidden_size],
+                frozen,
             )?,
             up_proj: Self::linear_with_ids(
                 "up_proj.weight",
                 up_proj.0,
                 up_proj.1,
                 &[intermediate_size, cfg.hidden_size],
+                frozen,
             )?,
             down_proj: Self::linear_with_ids(
                 "down_proj.weight",
                 down_proj.0,
                 down_proj.1,
                 &[cfg.hidden_size, intermediate_size],
+                frozen,
             )?,
         })
     }
@@ -991,7 +1132,12 @@ where
         )?;
         Self::ensure_shape(&param_name, &weight, expected_shape)?;
         let weight_id = weight.id();
-        Ok(boostr::nn::Linear::with_ids(weight, weight_id, None, true))
+        Ok(boostr::nn::Linear::with_ids(
+            weight,
+            weight_id,
+            None,
+            INITIALIZED_TRAINABLE,
+        ))
     }
 
     fn linear_with_ids(
@@ -999,9 +1145,13 @@ where
         weight: Tensor<R>,
         weight_id: boostr::autograd::TensorId,
         expected_shape: &[usize],
+        frozen: &FrozenParams,
     ) -> Result<boostr::nn::Linear<R>> {
         Self::ensure_shape(name, &weight, expected_shape)?;
-        Ok(boostr::nn::Linear::with_ids(weight, weight_id, None, true))
+        let trainable = frozen.trainable(weight_id);
+        Ok(boostr::nn::Linear::with_ids(
+            weight, weight_id, None, trainable,
+        ))
     }
 
     fn ensure_shape(name: &str, weight: &Tensor<R>, expected_shape: &[usize]) -> Result<()> {
@@ -1076,24 +1226,28 @@ where
         gate_proj: (Tensor<R>, boostr::autograd::TensorId),
         up_proj: (Tensor<R>, boostr::autograd::TensorId),
         down_proj: (Tensor<R>, boostr::autograd::TensorId),
+        frozen: &FrozenParams,
     ) -> Result<Self> {
         let gate_proj = Self::linear_with_ids(
             "gate_proj.weight",
             gate_proj.0,
             gate_proj.1,
             &[intermediate, hidden],
+            frozen,
         )?;
         let up_proj = Self::linear_with_ids(
             "up_proj.weight",
             up_proj.0,
             up_proj.1,
             &[intermediate, hidden],
+            frozen,
         )?;
         let down_proj = Self::linear_with_ids(
             "down_proj.weight",
             down_proj.0,
             down_proj.1,
             &[hidden, intermediate],
+            frozen,
         )?;
 
         Ok(Self {
@@ -1139,7 +1293,12 @@ where
         )?;
         let weight_id = weight.id();
         Self::ensure_shape(&param_name, &weight, expected_shape)?;
-        Ok(boostr::nn::Linear::with_ids(weight, weight_id, None, true))
+        Ok(boostr::nn::Linear::with_ids(
+            weight,
+            weight_id,
+            None,
+            INITIALIZED_TRAINABLE,
+        ))
     }
 
     fn linear_with_ids(
@@ -1147,9 +1306,13 @@ where
         weight: Tensor<R>,
         weight_id: boostr::autograd::TensorId,
         expected_shape: &[usize],
+        frozen: &FrozenParams,
     ) -> Result<boostr::nn::Linear<R>> {
         Self::ensure_shape(name, &weight, expected_shape)?;
-        Ok(boostr::nn::Linear::with_ids(weight, weight_id, None, true))
+        let trainable = frozen.trainable(weight_id);
+        Ok(boostr::nn::Linear::with_ids(
+            weight, weight_id, None, trainable,
+        ))
     }
 
     fn ensure_shape(name: &str, weight: &Tensor<R>, expected_shape: &[usize]) -> Result<()> {
@@ -1212,12 +1375,14 @@ where
         hidden: usize,
         config: boostr::nn::moe::router::MoeRouterConfig,
         gate: (Tensor<R>, boostr::autograd::TensorId),
+        frozen: &FrozenParams,
     ) -> Result<Self> {
         let gate = Expert::<R>::linear_with_ids(
             "gate.weight",
             gate.0,
             gate.1,
             &[config.num_experts, hidden],
+            frozen,
         )?;
         Ok(Self {
             router: boostr::nn::moe::router::MoeRouter::new(gate, config),
@@ -1302,6 +1467,7 @@ where
             (Tensor<R>, boostr::autograd::TensorId),
         ),
         router_gate: (Tensor<R>, boostr::autograd::TensorId),
+        frozen: &FrozenParams,
     ) -> Result<Self> {
         let (num_experts, experts_per_tok, intermediate) = Self::required_moe_dims(cfg)?;
         if experts.len() != num_experts {
@@ -1315,8 +1481,14 @@ where
 
         let mut boostr_experts = Vec::with_capacity(num_experts);
         for (gate_proj, up_proj, down_proj) in experts {
-            let expert =
-                Expert::with_ids(cfg.hidden_size, intermediate, gate_proj, up_proj, down_proj)?;
+            let expert = Expert::with_ids(
+                cfg.hidden_size,
+                intermediate,
+                gate_proj,
+                up_proj,
+                down_proj,
+                frozen,
+            )?;
             boostr_experts.push(expert.into_inner());
         }
 
@@ -1326,12 +1498,14 @@ where
             shared_expert.0,
             shared_expert.1,
             shared_expert.2,
+            frozen,
         )?
         .into_inner();
         let router = Router::with_ids(
             cfg.hidden_size,
             Self::router_config(num_experts, experts_per_tok),
             router_gate,
+            frozen,
         )?
         .into_inner();
 
@@ -1514,6 +1688,7 @@ where
             ),
             (Tensor<R>, boostr::autograd::TensorId),
         )>,
+        frozen: &FrozenParams,
     ) -> Result<Self> {
         if cfg.moe.is_some() {
             let (experts, shared_expert, router_gate) =
@@ -1525,6 +1700,7 @@ where
                 experts,
                 shared_expert,
                 router_gate,
+                frozen,
             )?)))
         } else {
             let (gate_proj, up_proj, down_proj) =
@@ -1532,7 +1708,7 @@ where
                     reason: "FfnLayer::with_ids requires MLP weights when cfg.moe is unset".into(),
                 })?;
             Ok(FfnLayer::Mlp(Box::new(Mlp::with_ids(
-                cfg, gate_proj, up_proj, down_proj,
+                cfg, gate_proj, up_proj, down_proj, frozen,
             )?)))
         }
     }
@@ -1720,7 +1896,7 @@ where
                     &mut mamba3_vb,
                     dtype,
                     client,
-                    true,
+                    INITIALIZED_TRAINABLE,
                 )?),
                 norm,
             }
@@ -1741,7 +1917,7 @@ where
                     &mut mamba2_vb,
                     dtype,
                     client,
-                    true,
+                    INITIALIZED_TRAINABLE,
                 )?),
                 norm,
             }
@@ -1755,7 +1931,7 @@ where
                     &mut mamba1_vb,
                     dtype,
                     client,
-                    true,
+                    INITIALIZED_TRAINABLE,
                 )?),
                 norm: Self::take_rms_norm(vb.pp("norm"), cfg.hidden_size, eps, dtype, client)?,
             }
@@ -1877,6 +2053,7 @@ where
             (Tensor<R>, boostr::autograd::TensorId),
         )>,
         device: &R::Device,
+        frozen: &FrozenParams,
     ) -> Result<Self> {
         // The config's value, not a literal: boostr's `ModelConfig` carries
         // `rms_norm_eps`, and hardcoding it here would silently ignore a
@@ -1915,11 +2092,26 @@ where
                         "Block::with_ids requires Mamba3 weights and pre-norm for a Mamba3 layer"
                             .into(),
                 })?;
+            // boostr's Mamba3 applies one `trainable` flag to every raw
+            // parameter it wraps, so the whole group must agree.
+            let mut raw = vec![
+                ("b_bias", weights.b_bias.1),
+                ("c_bias", weights.c_bias.1),
+                ("a_log", weights.a_log.1),
+            ];
+            if let Some((_, id)) = weights.dt_bias.as_ref() {
+                raw.push(("dt_bias", *id));
+            }
+            if let Some((_, id)) = weights.d_param.as_ref() {
+                raw.push(("d_param", *id));
+            }
+            let raw_trainable = frozen
+                .group_trainable(&format!("layers.{layer_idx}.mamba3 raw parameters"), &raw)?;
             BlockType::Mamba3 {
                 block: Box::new(boostr::model::Mamba3::with_ids(
                     Self::mamba3_config(cfg)?,
                     weights,
-                    true,
+                    raw_trainable,
                 )),
                 norm: Self::layer_norm_with_ids(
                     "norm",
@@ -1927,6 +2119,7 @@ where
                     norm_bias,
                     cfg.hidden_size,
                     MAMBA_PRENORM_EPS,
+                    frozen,
                 )?,
             }
         } else if is_mamba && use_mamba2 {
@@ -1934,11 +2127,22 @@ where
                 reason: "Block::with_ids requires Mamba2 weights and pre-norm for a Mamba2 layer"
                     .into(),
             })?;
+            // boostr's Mamba2 applies one `trainable` flag to every raw
+            // parameter it wraps, so the whole group must agree.
+            let mut raw = vec![("a_log", weights.a_log.1)];
+            if let Some((_, id)) = weights.dt_bias.as_ref() {
+                raw.push(("dt_bias", *id));
+            }
+            if let Some((_, id)) = weights.d_param.as_ref() {
+                raw.push(("d_param", *id));
+            }
+            let raw_trainable = frozen
+                .group_trainable(&format!("layers.{layer_idx}.mamba2 raw parameters"), &raw)?;
             BlockType::Mamba2 {
                 block: Box::new(boostr::model::Mamba2::with_ids(
                     Self::mamba2_config(cfg)?,
                     weights,
-                    true,
+                    raw_trainable,
                 )),
                 norm: Self::rms_norm_with_id(
                     "norm.weight",
@@ -1946,6 +2150,7 @@ where
                     norm.1,
                     cfg.hidden_size,
                     MAMBA_PRENORM_EPS,
+                    frozen,
                 )?,
             }
         } else if is_mamba {
@@ -1953,13 +2158,28 @@ where
                 reason: "Block::with_ids requires Mamba1 weights and norm for a Mamba1 layer"
                     .into(),
             })?;
+            // boostr's Mamba1 applies one `trainable` flag to every raw
+            // parameter it wraps, so the whole group must agree.
+            let mut raw = vec![("a_log", weights.a_log.1)];
+            if let Some((_, id)) = weights.d_param.as_ref() {
+                raw.push(("d_param", *id));
+            }
+            let raw_trainable = frozen
+                .group_trainable(&format!("layers.{layer_idx}.mamba raw parameters"), &raw)?;
             BlockType::Mamba {
                 block: Box::new(boostr::model::Mamba1::with_ids(
                     Self::mamba1_config(cfg)?,
                     weights,
-                    true,
+                    raw_trainable,
                 )),
-                norm: Self::rms_norm_with_id("norm.weight", norm.0, norm.1, cfg.hidden_size, eps)?,
+                norm: Self::rms_norm_with_id(
+                    "norm.weight",
+                    norm.0,
+                    norm.1,
+                    cfg.hidden_size,
+                    eps,
+                    frozen,
+                )?,
             }
         } else if use_mla {
             let (
@@ -1990,14 +2210,16 @@ where
                     kv_b_proj,
                     o_proj,
                     device,
+                    frozen,
                 )?),
-                ffn: FfnLayer::with_ids(cfg, mlp, moe)?,
+                ffn: FfnLayer::with_ids(cfg, mlp, moe, frozen)?,
                 input_layernorm: Self::rms_norm_with_id(
                     "input_layernorm.weight",
                     input_layernorm.0,
                     input_layernorm.1,
                     cfg.hidden_size,
                     eps,
+                    frozen,
                 )?,
                 post_attention_layernorm: Self::rms_norm_with_id(
                     "post_attention_layernorm.weight",
@@ -2005,6 +2227,7 @@ where
                     post_attention_layernorm.1,
                     cfg.hidden_size,
                     eps,
+                    frozen,
                 )?,
             }
         } else {
@@ -2027,15 +2250,16 @@ where
 
             BlockType::LegacyAttention {
                 attn: Box::new(CausalSelfAttention::with_ids(
-                    cfg, q_proj, k_proj, v_proj, o_proj, rope_cos, rope_sin,
+                    cfg, q_proj, k_proj, v_proj, o_proj, rope_cos, rope_sin, frozen,
                 )?),
-                mlp: Box::new(Mlp::with_ids(cfg, gate_proj, up_proj, down_proj)?),
+                mlp: Box::new(Mlp::with_ids(cfg, gate_proj, up_proj, down_proj, frozen)?),
                 input_layernorm: Self::rms_norm_with_id(
                     "input_layernorm.weight",
                     input_layernorm.0,
                     input_layernorm.1,
                     cfg.hidden_size,
                     eps,
+                    frozen,
                 )?,
                 post_attention_layernorm: Self::rms_norm_with_id(
                     "post_attention_layernorm.weight",
@@ -2043,6 +2267,7 @@ where
                     post_attention_layernorm.1,
                     cfg.hidden_size,
                     eps,
+                    frozen,
                 )?,
             }
         };
@@ -2332,7 +2557,12 @@ where
         )?;
         let weight_id = weight.id();
         Self::ensure_shape(&param_name, &weight, &[expected_len])?;
-        Ok(RmsNorm::with_id(weight, weight_id, eps, true))
+        Ok(RmsNorm::with_id(
+            weight,
+            weight_id,
+            eps,
+            INITIALIZED_TRAINABLE,
+        ))
     }
 
     fn layer_norm_with_ids(
@@ -2341,11 +2571,23 @@ where
         bias: (Tensor<R>, boostr::autograd::TensorId),
         expected_len: usize,
         eps: f32,
+        frozen: &FrozenParams,
     ) -> Result<boostr::nn::LayerNorm<R>> {
-        Self::ensure_shape(&format!("{name}.weight"), &weight.0, &[expected_len])?;
-        Self::ensure_shape(&format!("{name}.bias"), &bias.0, &[expected_len])?;
+        let weight_name = format!("{name}.weight");
+        let bias_name = format!("{name}.bias");
+        Self::ensure_shape(&weight_name, &weight.0, &[expected_len])?;
+        Self::ensure_shape(&bias_name, &bias.0, &[expected_len])?;
+        // boostr's LayerNorm takes one flag for weight and bias together, so
+        // both must be frozen or neither.
+        let trainable = frozen.group_trainable(
+            &format!("{name} (LayerNorm)"),
+            &[
+                (weight_name.as_str(), weight.1),
+                (bias_name.as_str(), bias.1),
+            ],
+        )?;
         Ok(boostr::nn::LayerNorm::with_ids(
-            weight.0, weight.1, bias.0, bias.1, eps, true,
+            weight.0, weight.1, bias.0, bias.1, eps, trainable,
         ))
     }
 
@@ -2383,7 +2625,12 @@ where
         Self::ensure_shape(&bias_name, &bias, &[expected_len])?;
 
         Ok(boostr::nn::LayerNorm::with_ids(
-            weight, weight_id, bias, bias_id, eps, true,
+            weight,
+            weight_id,
+            bias,
+            bias_id,
+            eps,
+            INITIALIZED_TRAINABLE,
         ))
     }
 
@@ -2393,9 +2640,11 @@ where
         weight_id: boostr::autograd::TensorId,
         expected_len: usize,
         eps: f32,
+        frozen: &FrozenParams,
     ) -> Result<RmsNorm<R>> {
         Self::ensure_shape(name, &weight, &[expected_len])?;
-        Ok(RmsNorm::with_id(weight, weight_id, eps, true))
+        let trainable = frozen.trainable(weight_id);
+        Ok(RmsNorm::with_id(weight, weight_id, eps, trainable))
     }
 
     fn ensure_shape(name: &str, weight: &Tensor<R>, expected_shape: &[usize]) -> Result<()> {
@@ -2450,6 +2699,11 @@ pub struct LitGPT<R: boostr::Runtime> {
     /// RmsNorm and SSM computations use F32 internally for numerical stability
     #[allow(dead_code)]
     compute_dtype: DType,
+    /// Parameters that must stay frozen. Carried on the model and handed to
+    /// every `*_with_ids` constructor, so `rebuild_with_parameters` — which the
+    /// trainer calls every step — reconstructs each parameter with the same
+    /// trainability it was built with.
+    frozen: FrozenParams,
 }
 
 /// Conv1d hyperparameters needed to rebuild a `Conv1d` from named tensors.
@@ -2538,6 +2792,9 @@ where
             layers,
             (norm.weight().tensor().clone(), norm.weight().id()),
             lm_head_tuple,
+            // Every id above was minted by `take_*` in this call, so none of
+            // them can be frozen yet. See `INITIALIZED_TRAINABLE`.
+            FrozenParams::new(),
         )
     }
 
@@ -2547,6 +2804,7 @@ where
         layers: Vec<Block<R>>,
         norm: (Tensor<R>, boostr::autograd::TensorId),
         lm_head: (Tensor<R>, boostr::autograd::TensorId),
+        frozen: FrozenParams,
     ) -> Result<Self> {
         // Tied checkpoints (e.g. Qwen3-1.7B) have no independent
         // `lm_head.weight`: re-derive the tuple from `embed_tokens` here,
@@ -2584,18 +2842,28 @@ where
             });
         }
 
+        let embed_trainable = frozen.trainable(embed_tokens.1);
+        let norm_trainable = frozen.trainable(norm.1);
+        let lm_head_trainable = frozen.trainable(lm_head.1);
+
         Ok(Self {
             cfg: cfg.clone(),
-            embed_tokens: Embedding::with_id(embed_tokens.0, embed_tokens.1, true),
+            embed_tokens: Embedding::with_id(embed_tokens.0, embed_tokens.1, embed_trainable),
             layers,
             // boostr's default rather than a bare literal. oxidizr's YAML has no
             // `rms_norm_eps` field yet, so `to_boostr()` always yields the default
             // here — calling it keeps this in step with boostr if that default
             // ever changes, and marks the one place to read the config instead
             // once the field is surfaced.
-            norm: RmsNorm::with_id(norm.0, norm.1, default_rms_norm_eps() as f32, true),
-            lm_head: Linear::with_ids(lm_head.0, lm_head.1, None, true),
+            norm: RmsNorm::with_id(
+                norm.0,
+                norm.1,
+                default_rms_norm_eps() as f32,
+                norm_trainable,
+            ),
+            lm_head: Linear::with_ids(lm_head.0, lm_head.1, None, lm_head_trainable),
             compute_dtype: cfg.dtype.to_dtype(),
+            frozen,
         })
     }
 
@@ -2603,11 +2871,48 @@ where
         &self,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
     ) -> Result<Self> {
+        // `self.frozen`, never a fresh set: this is the call the training loop
+        // makes every step, and re-deriving trainability here is exactly how a
+        // frozen parameter would silently come back trainable.
+        self.rebuild(params, self.frozen.clone())
+    }
+
+    /// The parameters this model keeps frozen.
+    #[allow(dead_code)]
+    pub fn frozen_parameters(&self) -> &FrozenParams {
+        &self.frozen
+    }
+
+    /// Rebuild the model with a new frozen set, carrying every current tensor
+    /// value through unchanged.
+    ///
+    /// This is the only way to freeze a parameter: boostr's layers expose no
+    /// mutable access to their `Var`s, so trainability is fixed at
+    /// construction. The returned model keeps `frozen`, so every subsequent
+    /// `rebuild_with_parameters` honours it too.
+    #[allow(dead_code)]
+    pub fn with_frozen_parameters(&self, frozen: FrozenParams) -> Result<Self> {
+        // Every currently trainable parameter must appear in the map:
+        // `tensor_with_stable_id` treats a missing trainable parameter as the
+        // optimizer having lost it, and that check stays in force here.
+        let params: std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>> = self
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, var)| (id, var.tensor().clone()))
+            .collect();
+        self.rebuild(&params, frozen)
+    }
+
+    fn rebuild(
+        &self,
+        params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
+        frozen: FrozenParams,
+    ) -> Result<Self> {
         let device = self.embed_tokens.weight().tensor().device();
         let mut layers = Vec::with_capacity(self.layers.len());
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             layers.push(Self::rebuild_block_with_parameters(
-                &self.cfg, layer_idx, layer, params, device,
+                &self.cfg, layer_idx, layer, params, device, &frozen,
             )?);
         }
 
@@ -2617,6 +2922,7 @@ where
             layers,
             Self::tensor_with_stable_id(self.norm.weight(), params)?,
             Self::tensor_with_stable_id(self.lm_head.weight(), params)?,
+            frozen,
         )
     }
 
@@ -2792,6 +3098,7 @@ where
         layer: &Block<R>,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
         device: &R::Device,
+        frozen: &FrozenParams,
     ) -> Result<Block<R>> {
         let bcfg = cfg.to_boostr()?;
         match &layer.block_type {
@@ -2799,7 +3106,7 @@ where
                 &bcfg,
                 layer_idx,
                 Some((
-                    Self::mamba1_weights_with_ids(block, params)?,
+                    Self::mamba1_weights_with_ids(block, params, frozen)?,
                     Self::tensor_with_stable_id(norm.weight(), params)?,
                 )),
                 None,
@@ -2807,19 +3114,21 @@ where
                 None,
                 None,
                 device,
+                frozen,
             ),
             BlockType::Mamba2 { block, norm } => Block::with_ids(
                 &bcfg,
                 layer_idx,
                 None,
                 Some((
-                    Self::mamba2_weights_with_ids(block, params)?,
+                    Self::mamba2_weights_with_ids(block, params, frozen)?,
                     Self::tensor_with_stable_id(norm.weight(), params)?,
                 )),
                 None,
                 None,
                 None,
                 device,
+                frozen,
             ),
             BlockType::Mamba3 { block, norm } => Block::with_ids(
                 &bcfg,
@@ -2827,13 +3136,14 @@ where
                 None,
                 None,
                 Some((
-                    Self::mamba3_weights_with_ids(block, params)?,
+                    Self::mamba3_weights_with_ids(block, params, frozen)?,
                     Self::tensor_with_stable_id(norm.weight(), params)?,
                     Self::tensor_with_stable_id(norm.bias(), params)?,
                 )),
                 None,
                 None,
                 device,
+                frozen,
             ),
             BlockType::Attention {
                 attn,
@@ -2867,6 +3177,7 @@ where
                     )),
                     None,
                     device,
+                    frozen,
                 )
             }
             BlockType::LegacyAttention {
@@ -2895,6 +3206,7 @@ where
                     Self::tensor_with_stable_id(post_attention_layernorm.weight(), params)?,
                 )),
                 device,
+                frozen,
             ),
         }
     }
@@ -2902,21 +3214,47 @@ where
     fn mamba1_weights_with_ids(
         block: &boostr::model::Mamba1<R>,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
+        frozen: &FrozenParams,
     ) -> Result<boostr::model::mamba::Mamba1WeightsWithIds<R>> {
         let named = <boostr::model::Mamba1<R> as boostr::nn::Module<R>>::named_parameters(block);
         let config = block.config();
         Ok(boostr::model::mamba::Mamba1WeightsWithIds {
-            in_proj: Self::linear_from_named(&named, params, "in_proj.weight", "in_proj.bias")?,
+            in_proj: Self::linear_from_named(
+                &named,
+                params,
+                "in_proj.weight",
+                "in_proj.bias",
+                frozen,
+            )?,
             conv1d: Self::conv1d_from_named(
                 &named,
                 params,
                 "conv1d.weight",
                 "conv1d.bias",
                 Self::conv1d_hyperparams_for(config.d_conv, config.conv_channels()),
+                frozen,
             )?,
-            x_proj: Self::linear_from_named(&named, params, "x_proj.weight", "x_proj.bias")?,
-            dt_proj: Self::linear_from_named(&named, params, "dt_proj.weight", "dt_proj.bias")?,
-            out_proj: Self::linear_from_named(&named, params, "out_proj.weight", "out_proj.bias")?,
+            x_proj: Self::linear_from_named(
+                &named,
+                params,
+                "x_proj.weight",
+                "x_proj.bias",
+                frozen,
+            )?,
+            dt_proj: Self::linear_from_named(
+                &named,
+                params,
+                "dt_proj.weight",
+                "dt_proj.bias",
+                frozen,
+            )?,
+            out_proj: Self::linear_from_named(
+                &named,
+                params,
+                "out_proj.weight",
+                "out_proj.bias",
+                frozen,
+            )?,
             a_log: Self::pair_from_named(&named, params, "a_log")?,
             d_param: if config.use_d {
                 Some(Self::pair_from_named(&named, params, "d_param")?)
@@ -2929,26 +3267,41 @@ where
     fn mamba2_weights_with_ids(
         block: &boostr::model::Mamba2<R>,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
+        frozen: &FrozenParams,
     ) -> Result<boostr::model::mamba::Mamba2WeightsWithIds<R>> {
         let named = <boostr::model::Mamba2<R> as boostr::nn::Module<R>>::named_parameters(block);
         let config = block.config();
         let norm =
             if let Some(norm) = Self::optional_pair_from_named(&named, params, "norm.weight")? {
-                Some(RmsNorm::with_id(norm.0, norm.1, 1e-5, true))
+                let trainable = frozen.trainable(norm.1);
+                Some(RmsNorm::with_id(norm.0, norm.1, 1e-5, trainable))
             } else {
                 None
             };
 
         Ok(boostr::model::mamba::Mamba2WeightsWithIds {
-            in_proj: Self::linear_from_named(&named, params, "in_proj.weight", "in_proj.bias")?,
+            in_proj: Self::linear_from_named(
+                &named,
+                params,
+                "in_proj.weight",
+                "in_proj.bias",
+                frozen,
+            )?,
             conv1d: Self::conv1d_from_named(
                 &named,
                 params,
                 "conv1d.weight",
                 "conv1d.bias",
                 Self::conv1d_hyperparams_for(config.d_conv, config.conv_channels()),
+                frozen,
             )?,
-            out_proj: Self::linear_from_named(&named, params, "out_proj.weight", "out_proj.bias")?,
+            out_proj: Self::linear_from_named(
+                &named,
+                params,
+                "out_proj.weight",
+                "out_proj.bias",
+                frozen,
+            )?,
             a_log: Self::pair_from_named(&named, params, "a_log")?,
             dt_bias: Self::optional_pair_from_named(&named, params, "dt_bias")?,
             d_param: Self::optional_pair_from_named(&named, params, "d_param")?,
@@ -2959,6 +3312,7 @@ where
     fn mamba3_weights_with_ids(
         block: &boostr::model::Mamba3<R>,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
+        frozen: &FrozenParams,
     ) -> Result<boostr::model::mamba::Mamba3WeightsWithIds<R>> {
         let named = <boostr::model::Mamba3<R> as boostr::nn::Module<R>>::named_parameters(block);
         let config = block.config();
@@ -2970,6 +3324,7 @@ where
                 params,
                 "theta_proj.weight",
                 "theta_proj.bias",
+                frozen,
             )?)
         } else {
             None
@@ -2981,6 +3336,7 @@ where
                 "conv1d.weight",
                 "conv1d.bias",
                 Self::conv1d_hyperparams_for(config.d_conv, config.conv_channels()),
+                frozen,
             )?)
         } else {
             None
@@ -2992,12 +3348,14 @@ where
                     params,
                     "mimo_x_up.weight",
                     "mimo_x_up.bias",
+                    frozen,
                 )?),
                 Some(Self::linear_from_named(
                     &named,
                     params,
                     "mimo_x_down.weight",
                     "mimo_x_down.bias",
+                    frozen,
                 )?),
             )
         } else {
@@ -3005,15 +3363,30 @@ where
         };
         let bc_norm = Self::pair_from_named(&named, params, "bc_norm.weight")?;
         let norm = Self::pair_from_named(&named, params, "norm.weight")?;
+        let bc_norm_trainable = frozen.trainable(bc_norm.1);
+        let norm_trainable = frozen.trainable(norm.1);
 
         Ok(boostr::model::mamba::Mamba3WeightsWithIds {
-            in_proj: Self::linear_from_named(&named, params, "in_proj.weight", "in_proj.bias")?,
-            out_proj: Self::linear_from_named(&named, params, "out_proj.weight", "out_proj.bias")?,
+            in_proj: Self::linear_from_named(
+                &named,
+                params,
+                "in_proj.weight",
+                "in_proj.bias",
+                frozen,
+            )?,
+            out_proj: Self::linear_from_named(
+                &named,
+                params,
+                "out_proj.weight",
+                "out_proj.bias",
+                frozen,
+            )?,
             lambda_proj: Self::linear_from_named(
                 &named,
                 params,
                 "lambda_proj.weight",
                 "lambda_proj.bias",
+                frozen,
             )?,
             theta_proj,
             b_bias: Self::pair_from_named(&named, params, "b_bias")?,
@@ -3029,8 +3402,8 @@ where
             } else {
                 None
             },
-            bc_norm: RmsNorm::with_id(bc_norm.0, bc_norm.1, 1e-6, true),
-            norm: RmsNorm::with_id(norm.0, norm.1, 1e-6, true),
+            bc_norm: RmsNorm::with_id(bc_norm.0, bc_norm.1, 1e-6, bc_norm_trainable),
+            norm: RmsNorm::with_id(norm.0, norm.1, 1e-6, norm_trainable),
             conv1d,
             mimo_x_up,
             mimo_x_down,
@@ -3102,10 +3475,19 @@ where
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
         weight_name: &str,
         bias_name: &str,
+        frozen: &FrozenParams,
     ) -> Result<Linear<R>> {
         let weight = Self::pair_from_named(named, params, weight_name)?;
         let bias = Self::optional_pair_from_named(named, params, bias_name)?;
-        Ok(Linear::with_ids(weight.0, weight.1, bias, true))
+        // boostr's Linear takes one flag for weight and bias together.
+        let trainable = Self::weight_and_bias_trainable(
+            frozen,
+            weight_name,
+            weight.1,
+            bias_name,
+            bias.as_ref().map(|(_, id)| *id),
+        )?;
+        Ok(Linear::with_ids(weight.0, weight.1, bias, trainable))
     }
 
     fn conv1d_from_named(
@@ -3114,9 +3496,18 @@ where
         weight_name: &str,
         bias_name: &str,
         conv: Conv1dHyperParams,
+        frozen: &FrozenParams,
     ) -> Result<boostr::nn::Conv1d<R>> {
         let weight = Self::pair_from_named(named, params, weight_name)?;
         let bias = Self::optional_pair_from_named(named, params, bias_name)?;
+        // boostr's Conv1d takes one flag for weight and bias together.
+        let trainable = Self::weight_and_bias_trainable(
+            frozen,
+            weight_name,
+            weight.1,
+            bias_name,
+            bias.as_ref().map(|(_, id)| *id),
+        )?;
         Ok(boostr::nn::Conv1d::with_ids(
             weight.0,
             weight.1,
@@ -3125,8 +3516,26 @@ where
             conv.padding,
             conv.dilation,
             conv.groups,
-            true,
+            trainable,
         ))
+    }
+
+    /// Trainability for a `Linear`/`Conv1d` whose weight and bias share one
+    /// flag in boostr's API.
+    fn weight_and_bias_trainable(
+        frozen: &FrozenParams,
+        weight_name: &str,
+        weight_id: boostr::autograd::TensorId,
+        bias_name: &str,
+        bias_id: Option<boostr::autograd::TensorId>,
+    ) -> Result<bool> {
+        match bias_id {
+            None => Ok(frozen.trainable(weight_id)),
+            Some(bias_id) => frozen.group_trainable(
+                weight_name,
+                &[(weight_name, weight_id), (bias_name, bias_id)],
+            ),
+        }
     }
 
     fn pair_from_named(
@@ -3223,7 +3632,7 @@ where
         )?;
         let weight_id = weight.id();
         Self::ensure_shape(&param_name, &weight, &[vocab_size, hidden_size])?;
-        Ok(Embedding::with_id(weight, weight_id, true))
+        Ok(Embedding::with_id(weight, weight_id, INITIALIZED_TRAINABLE))
     }
 
     fn take_linear_no_bias<C>(
@@ -3251,7 +3660,12 @@ where
         )?;
         let weight_id = weight.id();
         Self::ensure_shape(&param_name, &weight, expected_shape)?;
-        Ok(Linear::with_ids(weight, weight_id, None, true))
+        Ok(Linear::with_ids(
+            weight,
+            weight_id,
+            None,
+            INITIALIZED_TRAINABLE,
+        ))
     }
 
     fn take_rms_norm<C>(
@@ -3280,7 +3694,12 @@ where
         )?;
         let weight_id = weight.id();
         Self::ensure_shape(&param_name, &weight, &[expected_len])?;
-        Ok(RmsNorm::with_id(weight, weight_id, eps, true))
+        Ok(RmsNorm::with_id(
+            weight,
+            weight_id,
+            eps,
+            INITIALIZED_TRAINABLE,
+        ))
     }
 
     fn ensure_shape(name: &str, weight: &Tensor<R>, expected_shape: &[usize]) -> Result<()> {
@@ -3747,6 +4166,7 @@ mod tie_word_embeddings_tests {
             Vec::new(),
             (norm, TensorId::new()),
             (lm_head, TensorId::new()),
+            FrozenParams::new(),
         )
         .unwrap()
     }
@@ -3905,5 +4325,280 @@ mod attention_extras_reach_dense_attention_tests {
             "rope_scaling must change the precomputed cos cache reaching \
              oxidizr's own attention block, not just boostr's unused Llama builder"
         );
+    }
+}
+
+/// Freezing a parameter must survive `rebuild_with_parameters` — the call the
+/// training loop makes on every step. Before `FrozenParams` was threaded
+/// through the reconstruction path, every `*_with_ids` site passed a literal
+/// `true`, so a frozen weight came back trainable on step 1.
+#[cfg(test)]
+mod frozen_parameter_tests {
+    use super::*;
+    use boostr::{CpuClient, CpuDevice, CpuRuntime};
+
+    /// The legacy GQA + MLP block: one layer, no MLA, no MoE, so the model
+    /// exercises a real `Block::with_ids` reconstruction without needing an
+    /// SSM or expert config.
+    const FROZEN_PARAM: &str = "layers.0.self_attn.q_proj.weight";
+
+    fn cfg() -> OxidizrModelConfig {
+        OxidizrModelConfig {
+            name: "freeze-test".to_string(),
+            hidden_size: 8,
+            num_layers: 1,
+            num_heads: 2,
+            kv_heads: None,
+            kv_latent_dim: None,
+            q_latent_dim: None,
+            d_rope: None,
+            num_experts: None,
+            experts_per_tok: None,
+            shared_expert_enabled: None,
+            intermediate_size: Some(16),
+            mamba_layers: None,
+            mamba2_num_heads: None,
+            mamba2_head_dim: None,
+            mamba2_state_size: None,
+            mamba2_chunk_size: None,
+            mamba2_n_groups: None,
+            mamba2_conv_kernel: None,
+            mamba2_expand: None,
+            mamba3_enabled: None,
+            mamba3_complex_rope: None,
+            mamba3_mimo_rank: None,
+            mamba3_use_conv: None,
+            vocab_size: 12,
+            grow_vocab: false,
+            tie_word_embeddings: false,
+            tokenizer_vocab: "custom".to_string(),
+            max_seq_len: 8,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            sliding_window: None,
+            speech_vocab: None,
+            dtype: crate::config::DTypePrecision::F32,
+        }
+    }
+
+    fn build_model() -> LitGPT<CpuRuntime> {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut varmap = boostr::VarMap::<CpuRuntime>::new();
+        let mut vb = VarBuilder::new(&mut varmap, &device);
+        LitGPT::<CpuRuntime>::new(&cfg(), &mut vb, &client).expect("model builds")
+    }
+
+    /// The `q_proj` weight `Var` itself, reached through the private block
+    /// fields so `requires_grad` can be read directly — `trainable_parameters`
+    /// would hide a frozen parameter and prove nothing.
+    fn q_proj_var(model: &LitGPT<CpuRuntime>) -> &boostr::autograd::Var<CpuRuntime> {
+        match &model.layers[0].block_type {
+            BlockType::LegacyAttention { attn, .. } => attn.q_proj.weight(),
+            _ => panic!("freeze-test config must produce a LegacyAttention block"),
+        }
+    }
+
+    fn named_id(model: &LitGPT<CpuRuntime>, name: &str) -> boostr::autograd::TensorId {
+        model
+            .named_trainable_parameters()
+            .into_iter()
+            .find(|(param_name, _, _)| param_name == name)
+            .map(|(_, id, _)| id)
+            .unwrap_or_else(|| panic!("model has no trainable parameter named '{name}'"))
+    }
+
+    /// The map the trainer hands to `rebuild_with_parameters`: every
+    /// optimizer-tracked (i.e. trainable) parameter keyed by its `TensorId`.
+    fn optimizer_params(
+        model: &LitGPT<CpuRuntime>,
+    ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
+        model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, var)| (id, var.tensor().clone()))
+            .collect()
+    }
+
+    fn values(tensor: &Tensor<CpuRuntime>) -> Vec<f32> {
+        tensor.contiguous().expect("contiguous").to_vec::<f32>()
+    }
+
+    fn trainable_ids(
+        model: &LitGPT<CpuRuntime>,
+    ) -> std::collections::HashSet<boostr::autograd::TensorId> {
+        model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn model_with_q_proj_frozen() -> LitGPT<CpuRuntime> {
+        let model = build_model();
+        let frozen = FrozenParams::from_ids([named_id(&model, FROZEN_PARAM)]);
+        model
+            .with_frozen_parameters(frozen)
+            .expect("freezing q_proj rebuilds the model")
+    }
+
+    #[test]
+    fn freezing_clears_requires_grad_on_the_parameter() {
+        let model = model_with_q_proj_frozen();
+        assert!(
+            !q_proj_var(&model).requires_grad(),
+            "a frozen parameter must be reconstructed with requires_grad = false"
+        );
+    }
+
+    #[test]
+    fn frozen_parameter_stays_frozen_across_rebuild_with_parameters() {
+        let model = model_with_q_proj_frozen();
+        let frozen_id = q_proj_var(&model).id();
+        let params = optimizer_params(&model);
+        assert!(
+            !params.contains_key(&frozen_id),
+            "a frozen parameter must not reach the optimizer's parameter map"
+        );
+
+        // The exact call the training loop makes on every step.
+        let rebuilt = model
+            .rebuild_with_parameters(&params)
+            .expect("rebuild succeeds");
+
+        assert!(
+            !q_proj_var(&rebuilt).requires_grad(),
+            "'{FROZEN_PARAM}' came back trainable after rebuild_with_parameters"
+        );
+        assert!(
+            !trainable_ids(&rebuilt).contains(&frozen_id),
+            "'{FROZEN_PARAM}' must stay out of trainable_parameters() after a rebuild"
+        );
+        assert_eq!(
+            q_proj_var(&rebuilt).id(),
+            frozen_id,
+            "freezing must not change the parameter's TensorId"
+        );
+        assert_eq!(
+            rebuilt.frozen_parameters(),
+            model.frozen_parameters(),
+            "the frozen set must be carried forward by the rebuild"
+        );
+    }
+
+    #[test]
+    fn frozen_parameter_value_survives_the_rebuild_unchanged() {
+        let model = model_with_q_proj_frozen();
+        let before = values(q_proj_var(&model).tensor());
+
+        let rebuilt = model
+            .rebuild_with_parameters(&optimizer_params(&model))
+            .expect("rebuild succeeds");
+        let after = values(q_proj_var(&rebuilt).tensor());
+
+        assert_eq!(
+            before, after,
+            "a frozen parameter's tensor must come through the \
+             tensor_with_stable_id fallback unchanged, not from the optimizer map"
+        );
+        assert!(
+            before.iter().any(|v| *v != 0.0),
+            "the test weight must be non-trivial for the comparison to mean anything"
+        );
+    }
+
+    #[test]
+    fn named_trainable_parameters_omits_the_frozen_parameter() {
+        // named_trainable_parameters drives checkpoint save, so a frozen
+        // parameter must not appear there either.
+        let model = model_with_q_proj_frozen();
+        let names: Vec<String> = model
+            .named_trainable_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(
+            !names.contains(&FROZEN_PARAM.to_string()),
+            "'{FROZEN_PARAM}' must be absent from named_trainable_parameters()"
+        );
+        assert!(
+            names.contains(&"layers.0.self_attn.k_proj.weight".to_string()),
+            "unfrozen siblings must still be listed"
+        );
+    }
+
+    #[test]
+    fn nothing_frozen_leaves_every_parameter_trainable_across_a_rebuild() {
+        let model = build_model();
+        assert!(
+            model.frozen_parameters().is_empty(),
+            "LitGPT::new must freeze nothing"
+        );
+
+        let before_ids = trainable_ids(&model);
+        let before_names: Vec<String> = model
+            .named_trainable_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+
+        let rebuilt = model
+            .rebuild_with_parameters(&optimizer_params(&model))
+            .expect("rebuild succeeds");
+
+        let after_names: Vec<String> = rebuilt
+            .named_trainable_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+
+        assert_eq!(before_ids, trainable_ids(&rebuilt));
+        assert_eq!(before_names, after_names);
+        assert!(
+            q_proj_var(&rebuilt).requires_grad(),
+            "with nothing frozen every parameter stays trainable"
+        );
+    }
+
+    #[test]
+    fn freezing_one_parameter_leaves_the_others_trainable() {
+        let plain = build_model();
+        let plain_count = plain.trainable_parameters().len();
+
+        let frozen_model = model_with_q_proj_frozen();
+        assert_eq!(
+            frozen_model.trainable_parameters().len(),
+            plain_count - 1,
+            "freezing one parameter must remove exactly one entry"
+        );
+    }
+
+    #[test]
+    fn partially_freezing_a_shared_flag_group_is_rejected() {
+        // boostr's LayerNorm/Linear/Conv1d and the Mamba raw parameters share
+        // one trainability flag, so a half-frozen group has no valid answer.
+        let frozen = FrozenParams::from_ids([TensorId::new()]);
+        let a = TensorId::new();
+        let err = frozen
+            .group_trainable("norm (LayerNorm)", &[("norm.weight", a), ("norm.bias", a)])
+            .err();
+        assert!(
+            err.is_none(),
+            "an entirely unfrozen group must not be an error"
+        );
+
+        let mut partial = FrozenParams::new();
+        let weight_id = TensorId::new();
+        let bias_id = TensorId::new();
+        partial.freeze(weight_id);
+        let message = partial
+            .group_trainable(
+                "norm (LayerNorm)",
+                &[("norm.weight", weight_id), ("norm.bias", bias_id)],
+            )
+            .expect_err("a half-frozen group must be rejected")
+            .to_string();
+        assert!(message.contains("norm.weight"), "{message}");
+        assert!(message.contains("norm.bias"), "{message}");
     }
 }
