@@ -6,9 +6,6 @@
 
 pub use boostr::{DType, Init, Tensor, VarBuilder, VarMap};
 
-#[cfg(feature = "cuda")]
-pub use boostr::CudaRuntime;
-
 pub use boostr::error::{Error, Result};
 pub use boostr::nn::loss::cross_entropy_loss as cross_entropy;
 pub use boostr::nn::loss::cross_entropy_loss_masked as cross_entropy_masked;
