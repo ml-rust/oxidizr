@@ -1,0 +1,109 @@
+# Qwen3-1.7B — import target for pretrained fine-tuning
+#
+# Every model scalar below is transcribed from the HuggingFace checkpoint's
+# config.json. They must not drift: `compute_model_config_hash` gates
+# `--resume`, so the config that imports the weights is the config that trains
+# them.
+#
+# Dense GQA attention (no MLA, no MoE, no Mamba), per-head QK RMSNorm, tied
+# embeddings, BF16 on disk.
+#
+# Usage:
+#   oxidizr import -f models/qwen3-1.7b.yaml \
+#     -m /path/to/qwen3-1.7b -d <tokenized.bin>
+#   oxidizr train -f models/qwen3-1.7b.yaml -d <tokenized.bin> \
+#     --dtype bf16 --resume ./checkpoints/qwen3-1.7b/<imported>.safetensors
+
+model:
+  name: llama-3.2-1b
+
+  hidden_size: 2048
+  num_layers: 16
+  num_heads: 32
+
+  # 32 * 64 == 2048, so the fallback would agree; stated anyway because
+  # config.json states it, and the two must not silently diverge.
+  head_dim: 64
+
+  # GQA: 8 KV heads shared across 32 query heads.
+  kv_heads: 8
+
+  # MLA off — dense attention is what the checkpoint's q/k/v/o projections are.
+  kv_latent_dim: null
+  q_latent_dim: null
+  d_rope: null
+
+  # MoE off — the checkpoint's FFN is a dense SwiGLU MLP.
+  num_experts: null
+  experts_per_tok: null
+  shared_expert_enabled: null
+  intermediate_size: 8192
+
+  # No Mamba layers: every layer is attention.
+  mamba_layers: null
+
+  # OFF for Llama 3.2 — unlike Qwen3, its checkpoint carries no
+  # `self_attn.q_norm.weight` / `k_norm.weight`. Turning it on here would make
+  # the model expect two tensors per layer the source does not have, and the
+  # import would hard-error naming them.
+  qk_norm: false
+
+  # LoRA is not optional at this size on a consumer GPU — it is the only
+  # thing that fits. A full fine-tune of 1.7B needs weights + gradients + AdamW's two
+  # moment buffers; AdamW allocates its moments in the PARAMETER's dtype, so
+  # even at bf16 that is 3.4 + 3.4 + 6.8 = 13.6 GB before any activation.
+  #
+  # LoRA freezes the base, so the base contributes no gradient and no optimizer
+  # state — only the adapters do.
+  lora:
+    rank: 16
+    alpha: 32.0
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+  # lm_head shares embed_tokens' matrix, so the checkpoint has no separate
+  # `lm_head.weight` to load.
+  tie_word_embeddings: true
+
+  vocab_size: 128256
+  tokenizer_vocab: llama3
+
+  # The loss layer materializes [batch, seq, vocab] logits, so sequence length
+  # multiplies a vocab-sized tensor and is the knob that decides whether a run
+  # fits. Changing it changes the config hash — re-import before training, not
+  # after.
+  max_seq_len: 512
+  rope_theta: 500000.0
+
+  # The checkpoint's on-disk precision. An F32 load doubles resident weights
+  # for no pretrained information.
+  dtype: bf16
+
+trainer:
+  target_device: gpu
+  learning_rate: 0.00002
+  max_steps: 0
+  num_epochs: 1
+  batch_size: 1
+  gradient_accumulation: 8
+  checkpoint_dir: "./checkpoints/qwen3-1.7b"
+  log_interval: 1
+  save_interval: 100
+  max_checkpoints: 3
+  load_balance_alpha: 0.0
+
+  max_grad_norm: 1.0
+  target_grad_norm: null
+  max_grad_value: null
+
+  adamw_beta1: 0.9
+  adamw_beta2: 0.95
+  adamw_eps: 0.000001
+  weight_decay: 0.1
+
+  warmup_steps: null
+  warmup_ratio: null
+
+  seed: 42
+
+  group_size: 4
+  beta_kl: 0.04
