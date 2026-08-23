@@ -2650,7 +2650,7 @@ where
                 let x = boostr::autograd::var_add(&x, residual, client)
                     .map_err(boostr::error::Error::Numr)?;
 
-                Self::debug_activation("Mamba2 output", &x)?;
+                Self::debug_activation(client, "Mamba2 output", &x)?;
 
                 Ok(BlockOutput {
                     hidden: x,
@@ -2705,7 +2705,7 @@ where
                     .map_err(boostr::error::Error::Numr)?;
                 LitGPT::check_nan(x.tensor(), "moe_residual")?;
 
-                Self::debug_activation("MLA+MoE output", &x)?;
+                Self::debug_activation(client, "MLA+MoE output", &x)?;
 
                 Ok(BlockOutput {
                     hidden: x,
@@ -3010,9 +3010,20 @@ where
         }
     }
 
-    fn debug_activation(label: &str, x: &boostr::autograd::Var<R>) -> Result<()> {
+    fn debug_activation<C>(client: &C, label: &str, x: &boostr::autograd::Var<R>) -> Result<()>
+    where
+        C: boostr::RuntimeClient<R> + boostr::TensorOps<R> + boostr::TypeConversionOps<R>,
+    {
         if std::env::var("DEBUG_ACTIVATION").is_ok() {
-            let vals = x.tensor().contiguous()?.to_vec::<f32>();
+            // Activations carry the model's compute dtype, so cast to F32 before
+            // reading: `to_vec::<f32>` sizes its copy from `f32`, not the dtype.
+            let tensor = x.tensor().contiguous()?;
+            let tensor = if tensor.dtype() == DType::F32 {
+                tensor
+            } else {
+                client.cast(&tensor, DType::F32)?.contiguous()?
+            };
+            let vals = tensor.to_vec::<f32>();
             if !vals.is_empty() {
                 let rms = (vals.iter().map(|v| v * v).sum::<f32>() / vals.len() as f32).sqrt();
                 let max_abs = vals.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
@@ -3084,7 +3095,14 @@ where
 
         // DEBUG: Log embedding init
         if std::env::var("DEBUG_INIT").is_ok() {
+            // The weight carries `compute_dtype`, so cast to F32 before reading:
+            // `to_vec::<f32>` sizes its copy from `f32`, not the tensor's dtype.
             let embed_tensor = embed.weight().tensor().contiguous()?;
+            let embed_tensor = if embed_tensor.dtype() == DType::F32 {
+                embed_tensor
+            } else {
+                client.cast(&embed_tensor, DType::F32)?.contiguous()?
+            };
             let v = embed_tensor.to_vec::<f32>();
             let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
             let max_abs = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
@@ -3392,8 +3410,10 @@ where
 
         // DEBUG: Check input_ids for duplicate tokens
         if std::env::var("DEBUG_GRAD").is_ok() {
+            // `data.rs` uploads token ids as I64, so read them as i64: `to_vec::<T>`
+            // sizes its copy from `T`, not the tensor's dtype.
             let ids_tensor = input_ids.contiguous()?;
-            let ids = ids_tensor.to_vec::<u32>();
+            let ids = ids_tensor.to_vec::<i64>();
             let seq_len = input_ids.shape().last().copied().unwrap_or(0);
             eprintln!(
                 "[Model forward] input_ids shape={:?}, first 10 tokens: {:?}",
@@ -3414,7 +3434,14 @@ where
 
         // DEBUG: Check embedding output
         if std::env::var("DEBUG_GRAD").is_ok() {
+            // The embedding output carries the model's compute dtype, so cast to
+            // F32 before reading: `to_vec::<f32>` sizes its copy from `f32`.
             let x_tensor = x.tensor().contiguous()?;
+            let x_tensor = if x_tensor.dtype() == DType::F32 {
+                x_tensor
+            } else {
+                client.cast(&x_tensor, DType::F32)?.contiguous()?
+            };
             let x_vec = x_tensor.to_vec::<f32>();
             let hidden_size = x.shape().last().copied().unwrap_or(0);
             eprintln!(
@@ -4688,12 +4715,132 @@ where
         + boostr::ReduceOps<R>
         + boostr::ShapeOps<R>,
 {
+    let device = model.embed_tokens.weight().tensor().device().clone();
+    let mut safetensors = boostr::format::SafeTensors::open(path)?;
+    let loaded = safetensors.load_all::<R>(&device)?;
+    load_tensors_into_model(model, loaded, path)
+}
+
+/// Rebuild `model` from an already-loaded tensor map, keyed by oxidizr
+/// parameter name.
+///
+/// This is the body [`load_checkpoint_into_model`] runs once it has read a
+/// safetensors file, split out so a caller holding tensors from somewhere else
+/// — several shards, or a foreign checkpoint whose names were remapped — goes
+/// through the SAME vocab-growth and missing-tensor checks rather than a
+/// parallel loader that could skip them. `source` names the origin in error
+/// messages: a file path, or a directory for a multi-shard import.
+pub fn load_tensors_into_model<R>(
+    model: &mut LitGPT<R>,
+    loaded: HashMap<String, Tensor<R>>,
+    source: &str,
+) -> Result<()>
+where
+    R: boostr::Runtime<DType = DType>,
+    R::Client: boostr::RuntimeClient<R>
+        + boostr::RandomOps<R>
+        + boostr::ScalarOps<R>
+        + boostr::BinaryOps<R>
+        + boostr::CompareOps<R>
+        + boostr::TensorOps<R>
+        + boostr::TypeConversionOps<R>
+        + boostr::ReduceOps<R>
+        + boostr::ShapeOps<R>,
+{
+    load_tensors(model, loaded, source, false).map(|_| ())
+}
+
+/// [`load_tensors_into_model`], but a LoRA adapter factor the source does not
+/// carry is initialized fresh instead of failing the load. Returns the names
+/// that were initialized, sorted.
+///
+/// This is the IMPORT path only. A pretrained base checkpoint has no adapters
+/// by definition — they are created at fine-tune time — so demanding them is
+/// demanding something that cannot exist. It stays safe because `lora_b` is
+/// initialized to zeros (see `CausalSelfAttention::projection`), making `B·A` zero:
+/// the adapted model computes the base model's function at step 0.
+///
+/// The exemption is narrow. Only names [`fresh_lora_names`] returns are
+/// waived — the `lora_a`/`lora_b` of projections the config actually targets.
+/// A missing base weight, norm, or embedding is the same hard error it is on
+/// resume.
+pub fn load_tensors_initializing_lora<R>(
+    model: &mut LitGPT<R>,
+    loaded: HashMap<String, Tensor<R>>,
+    source: &str,
+) -> Result<Vec<String>>
+where
+    R: boostr::Runtime<DType = DType>,
+    R::Client: boostr::RuntimeClient<R>
+        + boostr::RandomOps<R>
+        + boostr::ScalarOps<R>
+        + boostr::BinaryOps<R>
+        + boostr::CompareOps<R>
+        + boostr::TensorOps<R>
+        + boostr::TypeConversionOps<R>
+        + boostr::ReduceOps<R>
+        + boostr::ShapeOps<R>,
+{
+    load_tensors(model, loaded, source, true)
+}
+
+/// The parameter names an import may initialize fresh: the LoRA adapter
+/// factors of the projections `lora` targets.
+///
+/// Derived from `names` — the model's OWN parameter set — intersected with
+/// `target_modules`, never from the `.lora_a`/`.lora_b` suffix alone. A
+/// projection the config does not target has no adapter parameter on this
+/// model, so it can never enter the set and never be waived.
+fn fresh_lora_names(
+    names: &[String],
+    lora: Option<&LoraConfig>,
+) -> std::collections::HashSet<String> {
+    let Some(lora) = lora else {
+        return std::collections::HashSet::new();
+    };
+    names
+        .iter()
+        .filter(|name| {
+            let Some(projection) = name
+                .strip_suffix(".lora_a")
+                .or_else(|| name.strip_suffix(".lora_b"))
+            else {
+                return false;
+            };
+            projection
+                .rsplit('.')
+                .next()
+                .is_some_and(|projection| lora.targets(projection))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The shared body of [`load_tensors_into_model`] and
+/// [`load_tensors_initializing_lora`]. `initialize_lora` decides ONLY whether
+/// the missing-tensor check waives targeted adapter factors; every other step
+/// is identical, so the resume path cannot drift from the import path.
+fn load_tensors<R>(
+    model: &mut LitGPT<R>,
+    mut loaded: HashMap<String, Tensor<R>>,
+    source: &str,
+    initialize_lora: bool,
+) -> Result<Vec<String>>
+where
+    R: boostr::Runtime<DType = DType>,
+    R::Client: boostr::RuntimeClient<R>
+        + boostr::RandomOps<R>
+        + boostr::ScalarOps<R>
+        + boostr::BinaryOps<R>
+        + boostr::CompareOps<R>
+        + boostr::TensorOps<R>
+        + boostr::TypeConversionOps<R>
+        + boostr::ReduceOps<R>
+        + boostr::ShapeOps<R>,
+{
     let cfg = model.cfg.clone();
     let device = model.embed_tokens.weight().tensor().device().clone();
     let client = R::default_client(&device);
-
-    let mut safetensors = boostr::format::SafeTensors::open(path)?;
-    let mut loaded = safetensors.load_all::<R>(&device)?;
 
     // Grow embed_tokens/lm_head row counts before they enter the VarMap: once
     // wrapped in a trainable `Var` by `LitGPT::new`, the pretrained and grown
@@ -4716,17 +4863,33 @@ where
     // routes through `VarBuilder::take_or_init_tensor`, which silently
     // random-initializes any tensor the varmap lacks. Without this check an
     // incomplete checkpoint loads "successfully" and produces garbage.
-    let mut missing = model
+    let expected = model
         .named_parameters()
         .into_iter()
         .map(|(name, _, _)| name)
-        .filter(|name| !loaded.contains_key(name))
+        .collect::<Vec<_>>();
+    // Waived only on the import path, and only for the adapter factors this
+    // config actually creates. Everything else stays a hard error.
+    let waived = if initialize_lora {
+        fresh_lora_names(&expected, cfg.lora.as_ref())
+    } else {
+        std::collections::HashSet::new()
+    };
+    let mut initialized = expected
+        .iter()
+        .filter(|name| !loaded.contains_key(*name) && waived.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    initialized.sort();
+    let mut missing = expected
+        .into_iter()
+        .filter(|name| !loaded.contains_key(name) && !waived.contains(name))
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         missing.sort();
         return Err(boostr::error::Error::ModelError {
             reason: format!(
-                "checkpoint '{path}' is missing {} tensor(s) the model requires: {}. \
+                "checkpoint '{source}' is missing {} tensor(s) the model requires: {}. \
                  Loading it would random-initialize them. Re-save the checkpoint from a \
                  run whose config matches this one, or point --resume at a complete \
                  checkpoint.",
@@ -4747,9 +4910,12 @@ where
         varmap.insert(name, tensor);
     }
 
+    // Any waived adapter factor is simply absent from the varmap, so
+    // `LitGPT::new` initializes it through the SAME `take_or_init_tensor` path
+    // a from-scratch run uses: `lora_a` Kaiming-uniform, `lora_b` zeros.
     let mut vb = VarBuilder::new(&mut varmap, &device);
     *model = LitGPT::new(&cfg, &mut vb, &client)?;
-    Ok(())
+    Ok(initialized)
 }
 
 fn stage_tensor_for_safetensors<R>(
@@ -7092,6 +7258,221 @@ mod checkpoint_completeness_tests {
         load_checkpoint_into_model(&mut restored, &path).expect("legacy checkpoint must load");
         let _ = std::fs::remove_file(&path);
         assert_eq!(expected, all_values(&restored));
+    }
+
+    /// A pretrained BASE checkpoint's tensors, keyed by parameter name: the
+    /// map an import holds after remapping HuggingFace names. Built from a
+    /// `lora: None` model, so it carries every base weight and no adapter —
+    /// exactly what a HuggingFace release contains.
+    fn base_tensors(cfg: &OxidizrModelConfig) -> HashMap<String, Tensor<CpuRuntime>> {
+        build(cfg)
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _, var)| (name, var.tensor().clone()))
+            .collect()
+    }
+
+    /// The adapter names of `model`, sorted.
+    fn adapter_names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
+        let mut names: Vec<String> = model
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .filter(|name| name.ends_with(".lora_a") || name.ends_with(".lora_b"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// THE import case: a base checkpoint has no adapters, so requiring them
+    /// would make importing into a LoRA config impossible. They are
+    /// initialized instead, and the resulting model is COMPLETE — the
+    /// checkpoint written from it resumes through the unrelaxed check.
+    #[test]
+    fn import_initializes_absent_lora_adapters_and_writes_them() {
+        let base = base_tensors(&cfg(None));
+        let mut model = build(&cfg(Some(lora_cfg())));
+        let expected_adapters = adapter_names(&model);
+        assert!(
+            !expected_adapters.is_empty(),
+            "the LoRA config must actually create adapters for this test to mean anything"
+        );
+
+        let initialized = load_tensors_initializing_lora(&mut model, base, "hf-model-dir")
+            .expect("a base checkpoint must import into a LoRA config");
+
+        assert_eq!(
+            initialized, expected_adapters,
+            "every adapter — and nothing else — must be reported as freshly initialized"
+        );
+
+        // The written checkpoint must carry base weights AND adapters, so the
+        // subsequent `--resume` finds nothing missing.
+        let path = temp_path("lora-import");
+        save_checkpoint_from_params(&path, &model, &optimizer_params(&model)).expect("save");
+        let on_disk = checkpoint_names(&path);
+        for name in &expected_adapters {
+            assert!(
+                on_disk.contains_key(name),
+                "the imported checkpoint must contain '{name}'; got {:?}",
+                on_disk.keys().collect::<Vec<_>>()
+            );
+        }
+
+        let mut resumed = build(&cfg(Some(lora_cfg())));
+        let result = load_checkpoint_into_model(&mut resumed, &path);
+        let _ = std::fs::remove_file(&path);
+        result.expect("the imported checkpoint must resume through the unrelaxed check");
+    }
+
+    /// The property the whole exemption rests on: `B·A == 0` at step 0, so the
+    /// imported model computes the base model's function exactly. If `lora_b`
+    /// were random, importing would silently perturb the pretrained weights.
+    #[test]
+    fn imported_lora_b_is_all_zeros_and_lora_a_is_not() {
+        let base = base_tensors(&cfg(None));
+        let mut model = build(&cfg(Some(lora_cfg())));
+        load_tensors_initializing_lora(&mut model, base, "hf-model-dir").expect("import");
+
+        let after = all_values(&model);
+        let mut checked_b = 0;
+        let mut nonzero_a = 0;
+        for (name, values) in &after {
+            if name.ends_with(".lora_b") {
+                checked_b += 1;
+                assert!(
+                    values.iter().all(|value| *value == 0.0),
+                    "'{name}' must be all zeros after import; got {values:?}"
+                );
+            }
+            if name.ends_with(".lora_a") && values.iter().any(|value| *value != 0.0) {
+                nonzero_a += 1;
+            }
+        }
+        assert!(checked_b > 0, "the config must produce lora_b tensors");
+        assert!(
+            nonzero_a > 0,
+            "lora_a must be randomly initialized, not zeroed: a zero A with a zero B is a \
+             dead adapter that no gradient ever revives"
+        );
+    }
+
+    /// The exemption must not widen into "anything absent is fine". A base
+    /// weight the source lacks is a corrupt import and must name itself.
+    #[test]
+    fn import_still_rejects_a_missing_base_weight() {
+        let mut base = base_tensors(&cfg(None));
+        assert!(
+            base.remove(FROZEN_BASE).is_some(),
+            "'{FROZEN_BASE}' must be present before it can be removed"
+        );
+
+        let mut model = build(&cfg(Some(lora_cfg())));
+        let error = match load_tensors_initializing_lora(&mut model, base, "hf-model-dir") {
+            Ok(_) => panic!("a missing base weight must not be initialized fresh"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(FROZEN_BASE),
+            "the error must name the missing base weight; got: {error}"
+        );
+    }
+
+    /// The RESUME path is untouched. `load_tensors_into_model` — the body
+    /// `load_checkpoint_into_model` runs for `--resume` — must still reject a
+    /// checkpoint whose adapters are absent, because on a resume a missing
+    /// adapter means a truncated checkpoint, not a base model.
+    ///
+    /// Without the fix this test passes for the same reason it passes with it:
+    /// the strict entry point never waives anything. It is here so a later
+    /// change that plumbs the exemption through the shared body — the one way
+    /// the resume path could silently acquire it — fails.
+    #[test]
+    fn resume_still_rejects_a_checkpoint_without_its_adapters() {
+        let base = base_tensors(&cfg(None));
+        let mut model = build(&cfg(Some(lora_cfg())));
+        let adapters = adapter_names(&model);
+
+        let error = match load_tensors_into_model(&mut model, base, "checkpoint.safetensors") {
+            Ok(()) => panic!("a resume must not random-initialize an absent adapter"),
+            Err(error) => error.to_string(),
+        };
+        for name in &adapters {
+            assert!(
+                error.contains(name),
+                "the error must name the missing adapter '{name}'; got: {error}"
+            );
+        }
+    }
+
+    /// The exemption is derived from `target_modules`, not from the
+    /// `.lora_a`/`.lora_b` suffix.
+    ///
+    /// With only `q_proj` targeted, `v_proj.lora_a` is not a parameter this
+    /// model has, so it can never reach the waived set — and were it ever to
+    /// appear in the missing list, it would stay a hard error. A suffix-only
+    /// rule would have waived it.
+    #[test]
+    fn only_targeted_projections_are_exempt() {
+        let lora = crate::config::LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".to_string()],
+        };
+        let names = vec![
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            "layers.0.self_attn.q_proj.lora_a".to_string(),
+            "layers.0.self_attn.q_proj.lora_b".to_string(),
+            "layers.0.self_attn.v_proj.lora_a".to_string(),
+            "layers.0.self_attn.q_norm.weight".to_string(),
+        ];
+
+        let waived = fresh_lora_names(&names, Some(&lora));
+
+        assert!(waived.contains("layers.0.self_attn.q_proj.lora_a"));
+        assert!(waived.contains("layers.0.self_attn.q_proj.lora_b"));
+        assert!(
+            !waived.contains("layers.0.self_attn.v_proj.lora_a"),
+            "an untargeted projection's adapter must not be exempt"
+        );
+        assert!(
+            !waived.contains("layers.0.self_attn.q_proj.weight"),
+            "a base weight must never be exempt"
+        );
+        assert!(
+            !waived.contains("layers.0.self_attn.q_norm.weight"),
+            "a norm must never be exempt"
+        );
+        assert!(
+            fresh_lora_names(&names, None).is_empty(),
+            "a config without LoRA must exempt nothing"
+        );
+    }
+
+    /// A `v_proj`-adapter-free model is what `target_modules: [q_proj]` builds,
+    /// so an import whose source lacks `v_proj.lora_a` is not missing anything.
+    /// The import succeeds and initializes exactly the `q_proj` adapters.
+    #[test]
+    fn a_q_proj_only_config_initializes_only_q_proj_adapters() {
+        let q_proj_only = cfg(Some(crate::config::LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".to_string()],
+        }));
+        let base = base_tensors(&cfg(None));
+        let mut model = build(&q_proj_only);
+
+        let initialized =
+            load_tensors_initializing_lora(&mut model, base, "hf-model-dir").expect("import");
+
+        assert_eq!(
+            initialized,
+            vec![
+                "layers.0.self_attn.q_proj.lora_a".to_string(),
+                "layers.0.self_attn.q_proj.lora_b".to_string(),
+            ],
+            "only the targeted projection's adapters exist, so only they are initialized"
+        );
     }
 }
 

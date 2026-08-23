@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use oxidizr::commands::{self, MergeArgs, PackArgs, TrainArgs};
+use oxidizr::commands::{self, ImportArgs, MergeArgs, PackArgs, TrainArgs};
 
 #[cfg(feature = "huggingface")]
 use oxidizr::commands::PushArgs;
@@ -78,6 +78,9 @@ enum Commands {
     /// Train a model (default command)
     Train(TrainArgs),
 
+    /// Import a HuggingFace checkpoint as an oxidizr checkpoint
+    Import(ImportArgs),
+
     /// Package a trained model for distribution
     Pack(PackArgs),
 
@@ -118,6 +121,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Train(args)) => commands::run_train(args),
+        Some(Commands::Import(args)) => commands::run_import(args),
         Some(Commands::Pack(args)) => commands::run_pack(args),
         Some(Commands::Merge(args)) => commands::run_merge(args),
         #[cfg(feature = "huggingface")]
@@ -149,6 +153,10 @@ fn main() -> Result<()> {
                 println!("Oxidizr: A Rust-based ML training framework\n");
                 println!("Usage:");
                 println!("  oxidizr train -f <config.yaml>     Train a model");
+                println!("  oxidizr import -f <config.yaml> -m <hf-model-dir> -d <data.bin>");
+                println!(
+                    "                                     Import HuggingFace pretrained weights"
+                );
                 println!("  oxidizr pack                       Package a trained model");
                 println!(
                 "  oxidizr merge -f <config.yaml> -c <lora.safetensors> -o <merged.safetensors>"
