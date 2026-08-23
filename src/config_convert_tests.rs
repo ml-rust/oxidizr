@@ -39,6 +39,33 @@ fn mla_dims_land_on_attention() {
     assert_eq!(attn.d_rope, Some(16));
 }
 
+/// `head_dim` must reach boostr's `AttentionConfig` unchanged — the site
+/// `config_convert.rs` hardcoded to `None` before this unit.
+#[test]
+fn head_dim_lands_on_attention() {
+    let cfg = OxidizrModelConfig {
+        head_dim: Some(64), // matches dense_baseline's hidden_size(512)/num_heads(8) fallback
+        ..dense_baseline()
+    };
+    let boostr_cfg = cfg.to_boostr().unwrap();
+    boostr_cfg.validate().unwrap();
+
+    let attn = boostr_cfg.attention.as_ref().unwrap();
+    assert_eq!(attn.head_dim, Some(64));
+}
+
+/// The complement: an absent `head_dim` must reach boostr as `None`, so
+/// `AttentionConfig::head_dim` falls back to `hidden_size / num_heads` —
+/// byte-identical to every config written before this field existed.
+#[test]
+fn head_dim_absent_stays_none_on_attention() {
+    let cfg = dense_baseline();
+    assert!(cfg.head_dim.is_none());
+    let boostr_cfg = cfg.to_boostr().unwrap();
+    let attn = boostr_cfg.attention.as_ref().unwrap();
+    assert!(attn.head_dim.is_none());
+}
+
 #[test]
 fn moe_fields_carried_and_top_level_intermediate_size_cleared() {
     let cfg = hybrid_moe_baseline();

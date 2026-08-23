@@ -18,6 +18,7 @@ fn tiny_model_config() -> OxidizrModelConfig {
         hidden_size: 16,
         num_layers: 2,
         num_heads: 4,
+        head_dim: None,
         kv_heads: None,
         kv_latent_dim: None,
         q_latent_dim: None,

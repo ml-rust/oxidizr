@@ -68,6 +68,20 @@ pub struct OxidizrModelConfig {
     pub hidden_size: usize,
     pub num_layers: usize,
     pub num_heads: usize,
+    /// Explicit per-head dimension for dense attention. Absent falls back to
+    /// `hidden_size / num_heads` (see `CausalSelfAttention::head_dim` in
+    /// `model.rs`), which is byte-identical to before this field existed.
+    ///
+    /// Needed whenever `num_heads * head_dim != hidden_size` — e.g. a model
+    /// whose `q_proj`/`o_proj` are wider or narrower than `hidden_size`. The
+    /// fallback's divisibility check does not apply once this is set.
+    ///
+    /// `skip_serializing_if` keeps the key out of the JSON that
+    /// `compute_model_config_hash` hashes while absent, so every pre-existing
+    /// checkpoint keeps its hash and still passes resume validation — the
+    /// same reasoning as `rope_scaling` and `sliding_window` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_dim: Option<usize>,
 
     // Legacy GQA config (for old nano)
     pub kv_heads: Option<usize>,
@@ -574,6 +588,7 @@ impl LitConfig {
                 hidden_size: 512,
                 num_layers: 8,
                 num_heads: 8,
+                head_dim: None,
                 kv_heads: Some(4), // Grouped Query Attention
                 kv_latent_dim: None,
                 q_latent_dim: None,
@@ -649,6 +664,7 @@ impl LitConfig {
                 hidden_size: 384,
                 num_layers: 8,
                 num_heads: 6,
+                head_dim: None,
                 kv_heads: None, // Not using GQA, using MLA instead
 
                 // MLA configuration
@@ -1188,6 +1204,36 @@ mod tests {
         let mut cfg = LitConfig::nano_baseline().model;
         let before = compute_model_config_hash(&cfg);
         cfg.qk_norm = true;
+        assert_ne!(before, compute_model_config_hash(&cfg));
+    }
+
+    /// `head_dim` is a new field on an existing struct, and the hash covers
+    /// the serialized JSON string — KEYS included, not just values. So an
+    /// absent `head_dim` must omit the key entirely, or every checkpoint
+    /// written before the field existed fails resume validation with a false
+    /// "model mismatch" and `commands::train` offers to delete it.
+    #[test]
+    fn head_dim_absent_does_not_change_the_config_hash() {
+        let cfg = LitConfig::nano_baseline().model;
+        assert!(cfg.head_dim.is_none());
+
+        let value = serde_json::to_value(&cfg).unwrap();
+        let map = value.as_object().unwrap();
+        assert!(
+            !map.contains_key("head_dim"),
+            "head_dim must be omitted from JSON when absent"
+        );
+    }
+
+    /// The complement: a present `head_dim` changes which weight shapes the
+    /// checkpoint carries (`q_proj`/`o_proj` are sized from `num_heads *
+    /// head_dim`, not `hidden_size`), so the hash must separate it from the
+    /// fallback.
+    #[test]
+    fn head_dim_present_changes_the_config_hash() {
+        let mut cfg = LitConfig::nano_baseline().model;
+        let before = compute_model_config_hash(&cfg);
+        cfg.head_dim = Some(cfg.hidden_size / cfg.num_heads);
         assert_ne!(before, compute_model_config_hash(&cfg));
     }
 

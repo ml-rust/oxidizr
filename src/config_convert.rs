@@ -270,7 +270,7 @@ fn to_attention(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Option<Attentio
     Some(AttentionConfig {
         num_heads: cfg.num_heads,
         num_kv_heads: cfg.kv_heads,
-        head_dim: None,
+        head_dim: cfg.head_dim,
         rope_theta: cfg.rope_theta,
         rope_scaling: cfg.rope_scaling.as_ref().map(to_rope_scaling),
         kv_latent_dim: cfg.kv_latent_dim,

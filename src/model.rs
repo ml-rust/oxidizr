@@ -724,11 +724,17 @@ where
         let kv_heads = attn_cfg.num_kv_heads.unwrap_or(attn_cfg.num_heads);
         Self::validate_heads(attn_cfg.num_heads, kv_heads)?;
         let kv_hidden = kv_heads * head_dim;
+        // `num_heads * head_dim`, not `hidden_size`: the two coincide only
+        // when `head_dim` is left to its `hidden_size / num_heads` fallback.
+        // With an explicit `head_dim` they can legitimately differ, and
+        // `Self::projection`'s `ensure_shape` call below is the assertion
+        // that `q_proj.weight`'s row count actually equals this product.
+        let q_hidden = attn_cfg.num_heads * head_dim;
 
         let q_proj = Self::projection(
             vb.pp("q_proj"),
             "q_proj",
-            &[cfg.hidden_size, cfg.hidden_size],
+            &[q_hidden, cfg.hidden_size],
             dtype,
             lora,
             client,
@@ -752,7 +758,7 @@ where
         let o_proj = Self::projection(
             vb.pp("o_proj"),
             "o_proj",
-            &[cfg.hidden_size, cfg.hidden_size],
+            &[cfg.hidden_size, q_hidden],
             dtype,
             lora,
             client,
@@ -834,6 +840,10 @@ where
         let kv_heads = attn_cfg.num_kv_heads.unwrap_or(attn_cfg.num_heads);
         Self::validate_heads(attn_cfg.num_heads, kv_heads)?;
         let kv_hidden = kv_heads * head_dim;
+        // Same reasoning as `new`: `q_proj`'s expected row count is
+        // `num_heads * head_dim`, and `projection_with_ids`'s `ensure_shape`
+        // call below is what asserts the rebuilt tensor actually matches it.
+        let q_hidden = attn_cfg.num_heads * head_dim;
 
         // Same eps source as `new`, so a rebuild cannot silently re-scale Q/K.
         let norm_eps = cfg.rms_norm_eps as f32;
@@ -866,7 +876,7 @@ where
             q_proj: Self::projection_with_ids(
                 "q_proj",
                 q_proj,
-                &[cfg.hidden_size, cfg.hidden_size],
+                &[q_hidden, cfg.hidden_size],
                 frozen,
             )?,
             k_proj: Self::projection_with_ids(
@@ -884,7 +894,7 @@ where
             o_proj: Self::projection_with_ids(
                 "o_proj",
                 o_proj,
-                &[cfg.hidden_size, cfg.hidden_size],
+                &[cfg.hidden_size, q_hidden],
                 frozen,
             )?,
             num_heads: attn_cfg.num_heads,
@@ -991,6 +1001,13 @@ where
             return Err(boostr::error::Error::ModelError {
                 reason: "attention num_heads must be non-zero".into(),
             });
+        }
+        // An explicit `head_dim` overrides the `hidden_size / num_heads`
+        // fallback and need not divide `hidden_size` evenly: the projection
+        // shapes below are then sized from `num_heads * head_dim` directly,
+        // not from `hidden_size`.
+        if let Some(head_dim) = attn.head_dim {
+            return Ok(head_dim);
         }
         if !cfg.hidden_size.is_multiple_of(attn.num_heads) {
             return Err(boostr::error::Error::ModelError {
@@ -4769,6 +4786,7 @@ mod tie_word_embeddings_tests {
             hidden_size: 8,
             num_layers: 0,
             num_heads: 2,
+            head_dim: None,
             kv_heads: None,
             kv_latent_dim: None,
             q_latent_dim: None,
@@ -5063,6 +5081,260 @@ mod attention_extras_reach_dense_attention_tests {
     }
 }
 
+/// `head_dim` (`OxidizrModelConfig::head_dim`) lets `num_heads * head_dim`
+/// diverge from `hidden_size`. Before this unit the field did not exist,
+/// `config_convert.rs` hardcoded `head_dim: None`, and
+/// `CausalSelfAttention::head_dim` always fell back to `hidden_size /
+/// num_heads` — so a config asking for a wider head_dim built successfully
+/// but silently reshaped into the wrong number of head dimensions, with
+/// nothing erroring anywhere.
+#[cfg(test)]
+mod head_dim_tests {
+    use super::*;
+    use boostr::{CpuClient, CpuDevice, CpuRuntime, VarMap};
+    use std::collections::HashMap;
+
+    /// `num_heads(4) * head_dim(32) = 128 != hidden_size(64)`. Before this
+    /// unit, `head_dim` fell back to `hidden_size / num_heads = 16`, so
+    /// `q_proj.weight`/`o_proj.weight` would silently build as `[64, 64]`
+    /// instead of the `[128, 64]`/`[64, 128]` this test asserts — no error,
+    /// just a model that trains and generates while computing garbage
+    /// attention heads.
+    fn explicit_head_dim_cfg() -> OxidizrModelConfig {
+        OxidizrModelConfig {
+            name: "head-dim-test".to_string(),
+            hidden_size: 64,
+            num_layers: 1,
+            num_heads: 4,
+            head_dim: Some(32),
+            kv_heads: None,
+            kv_latent_dim: None,
+            q_latent_dim: None,
+            d_rope: None,
+            num_experts: None,
+            experts_per_tok: None,
+            shared_expert_enabled: None,
+            intermediate_size: Some(64),
+            mamba_layers: None,
+            mamba2_num_heads: None,
+            mamba2_head_dim: None,
+            mamba2_state_size: None,
+            mamba2_chunk_size: None,
+            mamba2_n_groups: None,
+            mamba2_conv_kernel: None,
+            mamba2_expand: None,
+            mamba3_enabled: None,
+            mamba3_complex_rope: None,
+            mamba3_mimo_rank: None,
+            mamba3_use_conv: None,
+            vocab_size: 32,
+            grow_vocab: false,
+            tie_word_embeddings: false,
+            tokenizer_vocab: "custom".to_string(),
+            max_seq_len: 8,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            sliding_window: None,
+            qk_norm: false,
+            speech_vocab: None,
+            lora: None,
+            dtype: crate::config::DTypePrecision::F32,
+        }
+    }
+
+    /// `hidden_size(10)`/`num_heads(3)`/`head_dim` built directly against
+    /// `CausalSelfAttention`, bypassing `OxidizrModelConfig::to_boostr`.
+    ///
+    /// `to_boostr` routes through boostr's own
+    /// `AttentionConfig::validate(hidden_size)`, which unconditionally
+    /// requires `hidden_size % num_heads == 0` — a boostr-side check this
+    /// unit does not touch, and which does not yet know an explicit
+    /// `head_dim` makes that divisibility irrelevant. The confinement this
+    /// unit's `CausalSelfAttention::head_dim` guarantees — the divisibility
+    /// error only firing on the `hidden_size / num_heads` fallback — is
+    /// therefore exercised directly against that function, the same way
+    /// `attention_extras_reach_dense_attention_tests` exercises
+    /// `sliding_window`/`rope_scaling`/`qk_norm`.
+    fn non_divisible_model_cfg(head_dim: Option<usize>) -> ModelConfig {
+        ModelConfig {
+            model_type: "llama".to_string(),
+            vocab_size: 16,
+            hidden_size: 10,
+            num_layers: 1,
+            max_seq_len: 8,
+            intermediate_size: None,
+            rms_norm_eps: default_rms_norm_eps(),
+            attention: Some(boostr::model::config::AttentionConfig {
+                num_heads: 3,
+                num_kv_heads: None,
+                head_dim,
+                rope_theta: 10000.0,
+                rope_scaling: None,
+                kv_latent_dim: None,
+                q_latent_dim: None,
+                d_rope: None,
+                sliding_window: None,
+                use_alibi: false,
+            }),
+            ssm: None,
+            moe: None,
+            hybrid_layers: None,
+            tie_word_embeddings: false,
+            grow_vocab: false,
+            vision: None,
+            audio: None,
+        }
+    }
+
+    fn build_attention_only(cfg: &ModelConfig) -> Result<CausalSelfAttention<CpuRuntime>> {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut varmap = VarMap::<CpuRuntime>::new();
+        let vb = VarBuilder::new(&mut varmap, &device);
+        CausalSelfAttention::<CpuRuntime>::new(cfg, vb, &client, DType::F32, None, false)
+    }
+
+    fn build(cfg: &OxidizrModelConfig) -> LitGPT<CpuRuntime> {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut varmap = VarMap::<CpuRuntime>::new();
+        let mut vb = VarBuilder::new(&mut varmap, &device);
+        LitGPT::<CpuRuntime>::new(cfg, &mut vb, &client)
+            .expect("model with explicit head_dim must build")
+    }
+
+    fn all_params(
+        model: &LitGPT<CpuRuntime>,
+    ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
+        model
+            .named_parameters()
+            .into_iter()
+            .map(|(_, id, var)| (id, var.tensor().clone()))
+            .collect()
+    }
+
+    fn temp_path(tag: &str) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!(
+                "oxidizr-head-dim-{tag}-{}-{unique}.safetensors",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// THE shape assertion this unit adds: `q_proj`/`o_proj` must be sized
+    /// from `num_heads * head_dim`, not `hidden_size`. Without the fix (the
+    /// hardcoded `head_dim: None` fallback), this builds with
+    /// `q_proj.weight == [64, 64]` and fails this assertion.
+    #[test]
+    fn explicit_head_dim_sizes_q_and_o_proj_from_num_heads_times_head_dim() {
+        let model = build(&explicit_head_dim_cfg());
+        let shapes: HashMap<String, Vec<usize>> = model
+            .named_parameters()
+            .into_iter()
+            .map(|(name, _, var)| (name, var.tensor().shape().to_vec()))
+            .collect();
+        assert_eq!(
+            shapes["layers.0.self_attn.q_proj.weight"],
+            vec![128, 64],
+            "q_proj must be [num_heads * head_dim, hidden_size] = [128, 64], not \
+             [hidden_size, hidden_size] = [64, 64]"
+        );
+        assert_eq!(
+            shapes["layers.0.self_attn.o_proj.weight"],
+            vec![64, 128],
+            "o_proj must be [hidden_size, num_heads * head_dim] = [64, 128], not \
+             [hidden_size, hidden_size] = [64, 64]"
+        );
+    }
+
+    /// Forward and backward must both run end to end with a head_dim that
+    /// diverges from `hidden_size / num_heads`.
+    #[test]
+    fn explicit_head_dim_forward_and_backward_succeed() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let model = build(&explicit_head_dim_cfg());
+
+        let input_ids = Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device);
+        let output = model
+            .forward(&client, &input_ids)
+            .expect("forward with explicit head_dim must succeed");
+        let loss =
+            boostr::autograd::var_sum(&output.logits, &[0, 1, 2], false, &client).expect("reduce");
+        let grads = boostr::autograd::backward(&loss, &client).expect("backward must succeed");
+
+        let (_, q_proj_id, _) = model
+            .named_parameters()
+            .into_iter()
+            .find(|(name, _, _)| name == "layers.0.self_attn.q_proj.weight")
+            .expect("q_proj must exist");
+        let grad = grads
+            .get(q_proj_id)
+            .expect("q_proj must receive a gradient");
+        let magnitude: f32 = grad
+            .contiguous()
+            .expect("contiguous")
+            .to_vec::<f32>()
+            .iter()
+            .map(|v| v.abs())
+            .sum();
+        assert!(
+            magnitude > 1e-8,
+            "q_proj gradient is all zeros ({magnitude})"
+        );
+    }
+
+    /// A checkpoint saved from this config must load back into a fresh model
+    /// of the same config.
+    #[test]
+    fn explicit_head_dim_checkpoint_round_trips() {
+        let model = build(&explicit_head_dim_cfg());
+        let path = temp_path("roundtrip");
+        save_checkpoint_from_params(&path, &model, &all_params(&model)).expect("save");
+
+        let mut reloaded = build(&explicit_head_dim_cfg());
+        let result = load_checkpoint_into_model(&mut reloaded, &path);
+        let _ = std::fs::remove_file(&path);
+        result.expect("a checkpoint saved from an explicit-head_dim config must reload");
+    }
+
+    /// The divisibility error stays confined to the `hidden_size / num_heads`
+    /// fallback: with `head_dim` absent, a non-divisible `hidden_size` must
+    /// still hard error.
+    #[test]
+    fn non_divisible_hidden_size_errors_without_explicit_head_dim() {
+        // `let ... else` rather than `expect_err`: the success type is
+        // `CausalSelfAttention`, which does not implement `Debug` (its fields
+        // are tensors), and `expect_err` requires it.
+        let Err(err) = build_attention_only(&non_divisible_model_cfg(None)) else {
+            panic!("hidden_size not divisible by num_heads must fail without an explicit head_dim");
+        };
+        assert!(
+            err.to_string().contains("must be divisible by num_heads"),
+            "got: {err}"
+        );
+    }
+
+    /// The complement: the SAME non-divisible hidden_size/num_heads succeeds
+    /// once `head_dim` is explicit, proving the divisibility check does not
+    /// run on that branch.
+    #[test]
+    fn non_divisible_hidden_size_succeeds_with_explicit_head_dim() {
+        let attn = build_attention_only(&non_divisible_model_cfg(Some(4)))
+            .expect("an explicit head_dim must skip the hidden_size/num_heads divisibility check");
+        assert_eq!(
+            attn.q_proj.weight().tensor().shape(),
+            &[12, 10],
+            "q_proj must be [num_heads(3) * head_dim(4), hidden_size(10)] = [12, 10]"
+        );
+    }
+}
+
 /// Freezing a parameter must survive `rebuild_with_parameters` — the call the
 /// training loop makes on every step. Before `FrozenParams` was threaded
 /// through the reconstruction path, every `*_with_ids` site passed a literal
@@ -5083,6 +5355,7 @@ mod frozen_parameter_tests {
             hidden_size: 8,
             num_layers: 1,
             num_heads: 2,
+            head_dim: None,
             kv_heads: None,
             kv_latent_dim: None,
             q_latent_dim: None,
@@ -5358,6 +5631,7 @@ mod lora_tests {
             hidden_size: 8,
             num_layers: 1,
             num_heads: 2,
+            head_dim: None,
             kv_heads: None,
             kv_latent_dim: None,
             q_latent_dim: None,
@@ -6079,6 +6353,7 @@ mod moe_lora_tests {
             hidden_size: 8,
             num_layers: 1,
             num_heads: 2,
+            head_dim: None,
             kv_heads: None,
             kv_latent_dim: Some(4),
             q_latent_dim: Some(4),
@@ -6525,6 +6800,7 @@ mod checkpoint_completeness_tests {
             hidden_size: 8,
             num_layers: 1,
             num_heads: 2,
+            head_dim: None,
             kv_heads: None,
             kv_latent_dim: None,
             q_latent_dim: None,
@@ -6847,6 +7123,7 @@ mod legacy_moe_tests {
             hidden_size: 8,
             num_layers: 1,
             num_heads: 2,
+            head_dim: None,
             kv_heads: None,
             kv_latent_dim: None,
             q_latent_dim: None,
