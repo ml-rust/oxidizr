@@ -887,8 +887,14 @@ pub fn compute_file_hash(path: &str) -> anyhow::Result<String> {
     let metadata = file.metadata()?;
     let file_size = metadata.len();
 
-    // Read first 1MB for hashing (fast for large files)
-    let mut buffer = vec![0u8; 1024 * 1024.min(file_size as usize)];
+    // Read up to the first 1 MB for hashing (fast for large files).
+    //
+    // The parenthesis matters: `.min()` binds tighter than `*`, so
+    // `1024 * 1024.min(file_size)` is `1024 * (1024.min(file_size))`, which for
+    // any file at least 1024 bytes long asks for a full 1 MB regardless of the
+    // file's real size — and `read_exact` then fails with "failed to fill whole
+    // buffer" on every dataset smaller than 1 MB.
+    let mut buffer = vec![0u8; (1024 * 1024).min(file_size as usize)];
     file.read_exact(&mut buffer)?;
 
     let mut hasher = DefaultHasher::new();

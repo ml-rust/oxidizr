@@ -11,6 +11,7 @@ use boostr::ops::{FusedOptimizerOps, TensorOps};
 use boostr::optimizer::AdamWConfig;
 use boostr::runtime::{Runtime, RuntimeClient};
 use boostr::tensor::TensorId;
+use boostr::{ReduceOps, TypeConversionOps};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -298,21 +299,21 @@ where
             let aux_losses = output.aux_losses;
             let z_losses = output.z_losses;
 
-            // Check for NaN in logits (indicates model forward pass issue)
-            // EXPENSIVE: This transfers entire logits tensor to CPU - only do on first step or if DEBUG
+            // Check for NaN in logits (indicates model forward pass issue).
+            // `all_finite` reduces on device and transfers one scalar, never the
+            // logits themselves. Still gated to step 0 / DEBUG_NAN because the
+            // reduction is a full pass over the logits.
             let nan_check_start = if profile { Some(Instant::now()) } else { None };
-            if self.global_step == 0 || std::env::var("DEBUG_NAN").is_ok() {
-                let logits_tensor = logits.tensor().contiguous()?;
-                let logits_vec: Vec<f32> = logits_tensor.to_vec();
-                if logits_vec.iter().any(|x| x.is_nan() || x.is_infinite()) {
-                    eprintln!("\n❌ NaN/Inf in model logits! This indicates:");
-                    eprintln!("   1. Numerical instability in forward pass");
-                    eprintln!("   2. RoPE or attention computation overflow");
-                    eprintln!("   3. Mamba SSM state explosion");
-                    return Err(Error::TrainingError {
-                        reason: "NaN in logits".to_string(),
-                    });
-                }
+            if (self.global_step == 0 || std::env::var("DEBUG_NAN").is_ok())
+                && !all_finite(&self.client, logits.tensor())?
+            {
+                eprintln!("\n❌ NaN/Inf in model logits! This indicates:");
+                eprintln!("   1. Numerical instability in forward pass");
+                eprintln!("   2. RoPE or attention computation overflow");
+                eprintln!("   3. Mamba SSM state explosion");
+                return Err(Error::TrainingError {
+                    reason: "NaN in logits".to_string(),
+                });
             }
             if let Some(start) = nan_check_start {
                 eprintln!(
@@ -333,13 +334,17 @@ where
                     let mask_flat = mask.reshape(&[b * s])?;
                     if !self.mask_stats_logged {
                         self.mask_stats_logged = true;
-                        let values: Vec<f32> = mask_flat.contiguous()?.to_vec();
-                        let masked_in = values.iter().filter(|v| **v != 0.0).count();
-                        let total = values.len().max(1);
+                        // The mask holds exactly 0.0/1.0 (see `data.rs`), so its sum
+                        // IS the masked-in count. Reduce on device and transfer one
+                        // scalar instead of the whole mask.
+                        let mask_contig = mask_flat.contiguous()?;
+                        let mask_sum = self.client.sum(&mask_contig, &[0], false)?;
+                        let masked_in = scalar_f32(&self.client, &mask_sum)? as usize;
+                        let positions = mask_contig.elem_count();
+                        let total = positions.max(1);
                         eprintln!(
-                            "[loss-mask] audio-only masking on: {masked_in}/{} positions \
+                            "[loss-mask] audio-only masking on: {masked_in}/{positions} positions \
                              masked in ({:.2}%) in the first batch",
-                            values.len(),
                             masked_in as f64 * 100.0 / total as f64
                         );
                     }
@@ -353,7 +358,7 @@ where
 
             // Check for NaN in CE loss before combining (only when check_nan is true)
             if check_nan {
-                let ce_loss_val = ce_loss.tensor().item::<f32>()? as f64;
+                let ce_loss_val = scalar_f32(&self.client, ce_loss.tensor())? as f64;
                 if ce_loss_val.is_nan() || ce_loss_val.is_infinite() {
                     eprintln!("\n❌ NaN/Inf detected in CE loss! This usually indicates:");
                     eprintln!("   1. Learning rate too high (try 1e-4 or lower)");
@@ -392,7 +397,7 @@ where
 
             // Check combined loss for NaN (only when check_nan is true)
             if check_nan {
-                let total_loss_val = loss.tensor().item::<f32>()? as f64;
+                let total_loss_val = scalar_f32(&self.client, loss.tensor())? as f64;
                 if total_loss_val.is_nan() || total_loss_val.is_infinite() {
                     eprintln!("\n❌ NaN/Inf in combined loss!");
                     return Err(Error::TrainingError {
@@ -424,7 +429,8 @@ where
         let loss_sync_start = if profile { Some(Instant::now()) } else { None };
         if let Some(ref acc_loss) = accumulated_loss {
             // Transfer the accumulated loss value
-            total_loss_for_logging = acc_loss.tensor().item::<f32>()? as f64 * accum_steps as f64;
+            total_loss_for_logging =
+                scalar_f32(&self.client, acc_loss.tensor())? as f64 * accum_steps as f64;
         }
         if let Some(start) = loss_sync_start {
             eprintln!(
@@ -1159,6 +1165,47 @@ where
     }
 }
 
+/// Read a single-element tensor as `f32`, casting to F32 first.
+///
+/// `Tensor::item::<f32>` sizes its copy from `f32`, not from the tensor's
+/// dtype, so reading a BF16/F16 scalar directly asks the device buffer for
+/// twice the bytes it holds and reinterprets whatever comes back. Under mixed
+/// precision the loss carries the model's compute dtype, so every scalar
+/// readback goes through here. For an F32 tensor the cast is a no-op.
+fn scalar_f32<R, C>(client: &C, tensor: &Tensor<R>) -> Result<f32>
+where
+    R: Runtime<DType = DType>,
+    C: TypeConversionOps<R>,
+{
+    Ok(client.cast(tensor, DType::F32)?.item::<f32>()?)
+}
+
+/// Report whether every element of `tensor` is finite.
+///
+/// The whole check runs on device and transfers a single scalar, never the
+/// tensor: the training rule is that tensor-sized data never crosses to the
+/// host for processing, and a full logits tensor is over a gigabyte.
+///
+/// Summing is what makes one scalar sufficient. A NaN anywhere makes the sum
+/// NaN. A single +/-Inf makes it Inf, and two of opposite sign make it NaN
+/// when they meet - either way non-finite, so no infinity can hide. Only an
+/// all-finite tensor can produce a finite sum.
+///
+/// The sum keeps the tensor's own dtype (BF16/F16 under mixed precision), so
+/// it is cast to F32 before being read as f32: `Tensor::to_vec`/`item` size
+/// their copy from the requested Rust type, not from the tensor's dtype, and
+/// reading a BF16 scalar as f32 would over-read the device buffer.
+fn all_finite<R, C>(client: &C, tensor: &Tensor<R>) -> Result<bool>
+where
+    R: Runtime<DType = DType>,
+    C: ReduceOps<R> + TypeConversionOps<R>,
+{
+    let contiguous = tensor.contiguous()?;
+    let all_dims: Vec<usize> = (0..contiguous.rank()).collect();
+    let total = client.sum(&contiguous, &all_dims, false)?;
+    Ok(scalar_f32(client, &total)?.is_finite())
+}
+
 fn scalar_loss_var<R>(loss: &Var<R>) -> Result<Var<R>>
 where
     R: Runtime<DType = DType>,
@@ -1195,5 +1242,90 @@ fn format_duration(secs: f64) -> String {
         format!("{}m{:02}s", minutes, seconds)
     } else {
         format!("{}s", seconds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boostr::{CpuClient, CpuDevice, CpuRuntime};
+
+    fn f32_tensor(values: &[f32], device: &CpuDevice) -> Tensor<CpuRuntime> {
+        Tensor::<CpuRuntime>::from_slice(values, &[values.len()], device)
+    }
+
+    #[test]
+    fn all_finite_accepts_a_finite_tensor() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let t = f32_tensor(&[1.0, -2.0, 3.5, 0.0], &device);
+        assert!(all_finite(&client, &t).expect("check runs"));
+    }
+
+    #[test]
+    fn all_finite_rejects_a_nan() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let t = f32_tensor(&[1.0, f32::NAN, 3.5], &device);
+        assert!(!all_finite(&client, &t).expect("check runs"));
+    }
+
+    /// Both signs of infinity, and both together: the +/- pair meets inside the
+    /// reduction and becomes NaN, which is still non-finite, so nothing hides.
+    #[test]
+    fn all_finite_rejects_every_infinity() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        for values in [
+            vec![1.0, f32::INFINITY, 3.5],
+            vec![1.0, f32::NEG_INFINITY, 3.5],
+            vec![f32::INFINITY, f32::NEG_INFINITY],
+        ] {
+            let t = f32_tensor(&values, &device);
+            assert!(
+                !all_finite(&client, &t).expect("check runs"),
+                "{values:?} must be reported non-finite"
+            );
+        }
+    }
+
+    /// Every scalar the trainer logs (CE loss, combined loss, accumulated loss)
+    /// carries the model's compute dtype. Read at a fixed f32 width, a BF16
+    /// scalar comes back as reinterpreted bytes - a plausible-looking but wrong
+    /// number, not an error - so the loss would be silently garbage.
+    #[test]
+    fn scalar_f32_reads_a_bf16_scalar_at_its_own_dtype() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let scalar = client
+            .cast(&f32_tensor(&[11.5], &device), DType::BF16)
+            .expect("cast to bf16");
+        let value = scalar_f32(&client, &scalar).expect("readback runs");
+        assert!(
+            (value - 11.5).abs() < 0.1,
+            "expected ~11.5 back from BF16, got {value}"
+        );
+    }
+
+    /// The BF16 regression: reading the reduction at a fixed f32 width against a
+    /// BF16 tensor asks the buffer for twice the bytes it holds. On CUDA that is
+    /// the `CUDA_ERROR_INVALID_VALUE` that killed step 0 of every half-precision
+    /// run; here it is an over-read of the host buffer. `all_finite` casts the
+    /// scalar to F32 first, so both cases below answer correctly.
+    #[test]
+    fn all_finite_reads_a_bf16_tensor_at_its_own_dtype() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+
+        let finite = client
+            .cast(&f32_tensor(&[1.0, -2.0, 3.5], &device), DType::BF16)
+            .expect("cast to bf16");
+        assert_eq!(finite.dtype(), DType::BF16);
+        assert!(all_finite(&client, &finite).expect("check runs"));
+
+        let with_nan = client
+            .cast(&f32_tensor(&[1.0, f32::NAN, 3.5], &device), DType::BF16)
+            .expect("cast to bf16");
+        assert!(!all_finite(&client, &with_nan).expect("check runs"));
     }
 }
