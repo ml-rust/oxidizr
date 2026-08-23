@@ -15,7 +15,9 @@
 use std::collections::{BTreeSet, HashMap};
 
 use boostr::tensor::TensorId;
-use boostr::{CpuClient, CpuDevice, CpuRuntime, Tensor, VarBuilder, VarMap};
+use boostr::{
+    CpuClient, CpuDevice, CpuRuntime, DType, Tensor, TypeConversionOps, VarBuilder, VarMap,
+};
 use oxidizr::config::{DTypePrecision, LoraConfig, OxidizrModelConfig};
 use oxidizr::model::{
     load_checkpoint_into_model, save_checkpoint_from_params, FrozenParams, LitGPT,
@@ -501,4 +503,188 @@ fn rebuilding_preserves_the_qk_norm_parameter_ids() {
     for name in QK_NORM_ADDED {
         assert!(names.contains(name), "{name} must survive the rebuild");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint dtype: the file must carry the model's OWN precision
+// ---------------------------------------------------------------------------
+
+/// `dense_cfg`, built at bf16. The ONLY difference, so anything that changes
+/// between the two is caused by the precision.
+fn bf16_cfg() -> OxidizrModelConfig {
+    let mut cfg = dense_cfg();
+    cfg.name = "checkpoint-names-bf16-test".to_string();
+    cfg.dtype = DTypePrecision::BF16;
+    cfg
+}
+
+/// A CPU tensor's values as `f32`, whatever dtype it holds.
+///
+/// Casting first is required: `to_vec::<f32>()` sizes its copy from `f32`, so
+/// reading a bf16 tensor through it would run past the end of the storage.
+fn f32_values(client: &CpuClient, tensor: &Tensor<CpuRuntime>) -> Vec<f32> {
+    let tensor = tensor.contiguous().expect("contiguous");
+    let tensor = if tensor.dtype() == DType::F32 {
+        tensor
+    } else {
+        client
+            .cast(&tensor, DType::F32)
+            .expect("cast to f32")
+            .contiguous()
+            .expect("contiguous")
+    };
+    tensor.to_vec::<f32>()
+}
+
+/// Every parameter's `f32` values, keyed by name.
+fn named_f32_values(model: &LitGPT<CpuRuntime>) -> Vec<(String, Vec<f32>)> {
+    let client = CpuClient::new(CpuDevice::new());
+    let mut out: Vec<(String, Vec<f32>)> = model
+        .named_parameters()
+        .into_iter()
+        .map(|(name, _, var)| (name, f32_values(&client, var.tensor())))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Save `model` and assert every tensor in the file is stored at `expected`,
+/// at `expected`'s byte width and no wider.
+///
+/// The byte-width assertion is the one that matters. A values-only round-trip
+/// cannot catch a re-widening to F32, because `load_tensors` casts each loaded
+/// tensor to the config's dtype on the way in: the values come back correct
+/// from a 4-byte-per-parameter file just as they do from a 2-byte one. Before
+/// `stage_tensor_for_safetensors` kept the tensor's own dtype, this assertion
+/// failed on the bf16 config with `F32` / 4 bytes per parameter — a checkpoint
+/// twice the size it should be, which then materializes at full F32 width on
+/// the device at load time.
+fn assert_on_disk_dtype(model: &LitGPT<CpuRuntime>, expected: DType, tag: &str) {
+    let path = temp_checkpoint_path(tag);
+    save_checkpoint_from_params(&path, model, &parameter_map(model))
+        .expect("checkpoint save must succeed");
+
+    let safetensors =
+        boostr::format::SafeTensors::open(&path).expect("saved checkpoint must be readable");
+    let names: Vec<String> = safetensors.tensor_names().map(|s| s.to_string()).collect();
+    assert!(
+        !names.is_empty(),
+        "the checkpoint must contain tensors for this assertion to mean anything"
+    );
+
+    for name in &names {
+        let info = safetensors
+            .tensor_info(name)
+            .expect("a listed tensor must have info");
+        assert_eq!(
+            info.dtype, expected,
+            "on-disk dtype of '{name}' must be the model's own dtype"
+        );
+        assert_eq!(
+            info.size_bytes(),
+            info.numel() * expected.size_in_bytes(),
+            "'{name}' must occupy {} byte(s) per parameter on disk, not {}",
+            expected.size_in_bytes(),
+            info.size_bytes() / info.numel().max(1)
+        );
+    }
+
+    drop(safetensors);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An F32 model still writes an F32 checkpoint — the format that every
+/// existing checkpoint and every tool reading them expects.
+#[test]
+fn an_f32_model_writes_an_f32_checkpoint() {
+    assert_on_disk_dtype(&build(&dense_cfg()), DType::F32, "dtype-f32");
+}
+
+/// A bf16 model writes a bf16 checkpoint: 2 bytes per parameter, not 4.
+#[test]
+fn a_bf16_model_writes_a_bf16_checkpoint() {
+    assert_on_disk_dtype(&build(&bf16_cfg()), DType::BF16, "dtype-bf16");
+}
+
+/// A bf16 checkpoint reloads into a bf16 model with every value intact. Saving
+/// at the tensor's own width is lossless, so this is an EXACT comparison — no
+/// cast happens in either direction.
+#[test]
+fn a_bf16_checkpoint_round_trips_without_losing_values() {
+    let cfg = bf16_cfg();
+    let model = build(&cfg);
+    let before = named_f32_values(&model);
+
+    let path = temp_checkpoint_path("bf16-roundtrip");
+    save_checkpoint_from_params(&path, &model, &parameter_map(&model))
+        .expect("checkpoint save must succeed");
+
+    let mut reloaded = build(&cfg);
+    let result = load_checkpoint_into_model(&mut reloaded, &path);
+    let _ = std::fs::remove_file(&path);
+    result.expect("a bf16 checkpoint must load back into a bf16 model");
+
+    for (_, _, var) in reloaded.named_parameters() {
+        assert_eq!(
+            var.tensor().dtype(),
+            DType::BF16,
+            "a bf16 config must hold bf16 parameters after the load"
+        );
+    }
+    assert_eq!(
+        before,
+        named_f32_values(&reloaded),
+        "a bf16 round-trip must be exact"
+    );
+}
+
+/// An F32 checkpoint — the only kind this trainer used to write — must still
+/// load into a bf16-configured model, and a bf16 checkpoint must load into an
+/// F32-configured one. `load_tensors` casts per tensor to the config's dtype
+/// in both directions, so neither file is version-locked to the config that
+/// wrote it.
+#[test]
+fn checkpoints_load_across_a_dtype_change_in_both_directions() {
+    // Old-style F32 file -> bf16 model.
+    let f32_model = build(&dense_cfg());
+    let f32_path = temp_checkpoint_path("f32-into-bf16");
+    save_checkpoint_from_params(&f32_path, &f32_model, &parameter_map(&f32_model))
+        .expect("checkpoint save must succeed");
+
+    let mut bf16_model = build(&bf16_cfg());
+    let result = load_checkpoint_into_model(&mut bf16_model, &f32_path);
+    let _ = std::fs::remove_file(&f32_path);
+    result.expect("an F32 checkpoint must still load into a bf16-configured model");
+    for (name, _, var) in bf16_model.named_parameters() {
+        assert_eq!(
+            var.tensor().dtype(),
+            DType::BF16,
+            "'{name}' must be cast down to the loading config's dtype"
+        );
+    }
+
+    // New-style bf16 file -> F32 model.
+    let source = build(&bf16_cfg());
+    let bf16_path = temp_checkpoint_path("bf16-into-f32");
+    save_checkpoint_from_params(&bf16_path, &source, &parameter_map(&source))
+        .expect("checkpoint save must succeed");
+
+    let mut f32_target = build(&dense_cfg());
+    let result = load_checkpoint_into_model(&mut f32_target, &bf16_path);
+    let _ = std::fs::remove_file(&bf16_path);
+    result.expect("a bf16 checkpoint must load into an F32-configured model");
+    for (name, _, var) in f32_target.named_parameters() {
+        assert_eq!(
+            var.tensor().dtype(),
+            DType::F32,
+            "'{name}' must be cast up to the loading config's dtype"
+        );
+    }
+
+    // Widening bf16 -> F32 is exact, so the values must match the bf16 source.
+    assert_eq!(
+        named_f32_values(&source),
+        named_f32_values(&f32_target),
+        "widening a bf16 checkpoint to F32 must preserve every value"
+    );
 }

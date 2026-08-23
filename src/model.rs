@@ -4918,6 +4918,15 @@ where
     Ok(initialized)
 }
 
+/// Copy a parameter to host memory for the safetensors writer, KEEPING its own
+/// dtype.
+///
+/// The tensor's own `dtype()` is authoritative, not `OxidizrModelConfig::dtype`:
+/// the checkpoint records what the model actually holds, and `load_tensors`
+/// casts per tensor to the loading config's dtype on the way back in. Casting
+/// to F32 here instead would write 4 bytes per parameter for a bf16 model — a
+/// 2x larger file that also forces the full F32 copy onto the device at load
+/// time before it is cast back down.
 fn stage_tensor_for_safetensors<R>(
     tensor: &Tensor<R>,
     cpu_device: &boostr::CpuDevice,
@@ -4926,18 +4935,14 @@ where
     R: boostr::Runtime<DType = DType>,
     R::Client: boostr::RuntimeClient<R> + boostr::TensorOps<R> + boostr::TypeConversionOps<R>,
 {
-    let client = R::default_client(tensor.device());
     let shape = tensor.shape().to_vec();
-    let contiguous = tensor.contiguous()?;
-    let f32_tensor = if contiguous.dtype() == DType::F32 {
-        contiguous
-    } else {
-        client.cast(&contiguous, DType::F32)?
-    };
-    let f32_tensor = f32_tensor.contiguous()?;
-    let values = f32_tensor.to_vec::<f32>();
+    let dtype = tensor.dtype();
+    // `to_bytes` makes the tensor contiguous, then sizes the device->host copy
+    // from the tensor's OWN dtype. Reading through `to_vec::<f32>()` instead
+    // would size the copy from `f32` and read past the end of a bf16 buffer.
+    let bytes = tensor.to_bytes()?;
 
-    Tensor::<boostr::CpuRuntime>::try_from_slice(&values, &shape, cpu_device)
+    Tensor::<boostr::CpuRuntime>::try_from_bytes(&bytes, &shape, dtype, cpu_device)
         .map_err(boostr::error::Error::Numr)
 }
 
