@@ -188,6 +188,12 @@ where
     /// `config.target_grad_norm`. Steps whose gradient norm is inf/NaN are skipped
     /// entirely rather than clipped. The earlier loss-pre-scaling heuristic (a
     /// workaround for Candle's lack of in-place gradient modification) is gone.
+    ///
+    /// Both clips norm over `self.parameter_ids` — the tensors the optimizer
+    /// actually steps. The grad store returned by `backward()` is far larger:
+    /// it holds the loss node's own `dL/dL = 1` seed, every activation, and a
+    /// gradient for every matmul operand including frozen ones. On a LoRA run
+    /// that is 11975 entries against 128 parameters.
     pub fn training_step<D: DataLoader<R>>(
         &mut self,
         model: &crate::model::LitGPT<R>,
@@ -549,6 +555,7 @@ where
             let grad_norm = crate::prelude::compute_grad_norm(
                 &self.client,
                 &mut synced_grads,
+                &self.parameter_ids,
                 self.config.max_grad_norm,
             )?;
             last_grad_norm = grad_norm;
@@ -562,8 +569,12 @@ where
             // The function returns the original norm as its value.
             let grad_norm_start = if profile { Some(Instant::now()) } else { None };
             let max_grad_norm = self.config.max_grad_norm;
-            let grad_norm =
-                crate::prelude::compute_grad_norm(&self.client, &mut grads, max_grad_norm)?;
+            let grad_norm = crate::prelude::compute_grad_norm(
+                &self.client,
+                &mut grads,
+                &self.parameter_ids,
+                max_grad_norm,
+            )?;
             if let Some(start) = grad_norm_start {
                 eprintln!(
                     "[PROFILE] grad_norm_compute: {:.3}ms",
@@ -599,7 +610,12 @@ where
                 let effective_after_max = grad_norm.min(max_grad_norm);
                 if let Some(target) = self.config.target_grad_norm {
                     if effective_after_max > target && effective_after_max > 1e-8 {
-                        crate::prelude::compute_grad_norm(&self.client, &mut grads, target)?;
+                        crate::prelude::compute_grad_norm(
+                            &self.client,
+                            &mut grads,
+                            &self.parameter_ids,
+                            target,
+                        )?;
                     }
                 }
 
@@ -1120,16 +1136,23 @@ where
         cloned
     }
 
-    /// Compute gradient norm by delegating to boostr::optimizer::clip_grad_norm.
+    /// Total gradient norm over the trainable parameters.
+    ///
+    /// `max_norm = f64::MAX` makes this a pure measurement: the clip branch
+    /// never fires, so nothing is rescaled. The norm is over
+    /// `self.parameter_ids` because `print_gradient_breakdown` divides each
+    /// parameter's own norm² by this total to get its contribution share.
+    /// Against a whole-graph total those shares would sum to a small fraction
+    /// of 100%, since the store also holds the loss seed and every activation.
     fn compute_grad_norm_from_grads(&self, grads: &GradStore<R>) -> Result<f64> {
         let mut cloned = self.clone_grad_store(grads);
-        crate::prelude::compute_grad_norm(&self.client, &mut cloned, f64::MAX)
+        crate::prelude::compute_grad_norm(&self.client, &mut cloned, &self.parameter_ids, f64::MAX)
     }
 
     fn grad_norm_for_tensor(&self, id: TensorId, grad: &Tensor<R>) -> Result<f64> {
         let mut one = GradStore::new();
         one.insert(id, grad.clone());
-        crate::prelude::compute_grad_norm(&self.client, &mut one, f64::MAX)
+        crate::prelude::compute_grad_norm(&self.client, &mut one, &[id], f64::MAX)
     }
 
     /// Print gradient breakdown by parameter (for debugging).
