@@ -213,7 +213,23 @@ fn validate_attention_extras(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Re
                  leave at least one attention layer.",
             ));
         }
+        if cfg.qk_norm {
+            return Err(model_error(
+                "qk_norm is set but mamba_layers covers every layer (SsmOnly): \
+                 there is no attention block to apply it to. Remove qk_norm or \
+                 leave at least one attention layer.",
+            ));
+        }
         return Ok(());
+    }
+
+    if cfg.qk_norm && cfg.kv_latent_dim.is_some() {
+        return Err(model_error(
+            "qk_norm is set on an MLA model (kv_latent_dim is present): MLA normalizes \
+             its compressed latents through q_a_layernorm/kv_a_layernorm, and has no \
+             per-head q_norm/k_norm to apply this to, so it would be silently ignored. \
+             Remove qk_norm or remove kv_latent_dim to use the dense-attention block.",
+        ));
     }
 
     if cfg.sliding_window.is_some() && matches!(shape, LayerShape::Hybrid) {

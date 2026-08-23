@@ -127,6 +127,28 @@ pub struct OxidizrModelConfig {
     /// dense-attention path; boostr's hybrid path never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sliding_window: Option<usize>,
+    /// Per-head RMS norm on Q and K inside the dense-attention block (Qwen3,
+    /// Command-R, Cohere). Off = byte-identical to before this field existed.
+    ///
+    /// On the MODEL config, not `TrainerConfig`, because it changes WHICH
+    /// PARAMETERS EXIST: every dense-attention layer gains
+    /// `layers.N.self_attn.q_norm.weight` and `layers.N.self_attn.k_norm.weight`.
+    /// A `qk_norm: true` checkpoint is therefore not interchangeable with a
+    /// `false` one, and `compute_model_config_hash` must reflect that — the
+    /// same reason `lora` and `tie_word_embeddings` are not stripped there.
+    /// Optimizer/schedule knobs, which never change the parameter set, stay on
+    /// `TrainerConfig`.
+    ///
+    /// `skip_serializing_if` keeps the key out of the hashed JSON while the
+    /// flag is off, so every pre-existing checkpoint keeps its hash and still
+    /// passes resume validation. A bare `#[serde(default)]` would NOT be safe
+    /// here: `compute_model_config_hash` hashes the serialized JSON STRING, so
+    /// a new `"qk_norm":false` KEY moves the hash of configs whose value never
+    /// changed, and `commands::train` then reports a model mismatch and offers
+    /// to delete their checkpoints. Serializing only when `true` keeps the
+    /// on/off distinction in the hash, which is the part that must be there.
+    #[serde(default, skip_serializing_if = "qk_norm_is_off")]
+    pub qk_norm: bool,
     /// LoRA adapters on the dense-attention projections. Absent = full
     /// fine-tuning, byte-identical to before this field existed.
     ///
@@ -160,6 +182,14 @@ pub struct OxidizrModelConfig {
     /// Mixed precision: SSM (Mamba/Mamba2) and RMSNorm always use F32 internally
     #[serde(default)]
     pub dtype: DTypePrecision,
+}
+
+/// `skip_serializing_if` predicate for [`OxidizrModelConfig::qk_norm`].
+///
+/// A free function rather than `<bool as std::ops::Not>::not` so the reason it
+/// exists is readable at the field.
+fn qk_norm_is_off(qk_norm: &bool) -> bool {
+    !*qk_norm
 }
 
 /// RoPE scaling parameters, mirroring `boostr::model::config::RopeScalingConfig`
@@ -572,6 +602,7 @@ impl LitConfig {
                 rope_theta: 10000.0,
                 rope_scaling: None,
                 sliding_window: None,
+                qk_norm: false,
                 speech_vocab: None,
                 lora: None,
                 dtype: DTypePrecision::F32,
@@ -658,6 +689,7 @@ impl LitConfig {
                 rope_theta: 10000.0,
                 rope_scaling: None,
                 sliding_window: None,
+                qk_norm: false,
                 speech_vocab: None,
                 lora: None,
                 dtype: DTypePrecision::F32,
@@ -1127,6 +1159,35 @@ mod tests {
         let mut cfg = LitConfig::nano_baseline().model;
         let before = compute_model_config_hash(&cfg);
         cfg.speech_vocab = Some(toy_speech_vocab());
+        assert_ne!(before, compute_model_config_hash(&cfg));
+    }
+
+    /// `qk_norm` is a new field on an existing struct, and the hash covers the
+    /// serialized JSON string — KEYS included, not just values. So an `off`
+    /// config must omit the key entirely, or every checkpoint written before
+    /// the field existed fails resume validation with a false "model mismatch"
+    /// and `commands::train` offers to delete it.
+    #[test]
+    fn qk_norm_off_does_not_change_the_config_hash() {
+        let cfg = LitConfig::nano_baseline().model;
+        assert!(!cfg.qk_norm);
+
+        let value = serde_json::to_value(&cfg).unwrap();
+        let map = value.as_object().unwrap();
+        assert!(
+            !map.contains_key("qk_norm"),
+            "qk_norm must be omitted from JSON when off"
+        );
+    }
+
+    /// The complement: turning `qk_norm` on adds two parameters per dense
+    /// layer, so the two settings describe different weights and the hash must
+    /// separate them.
+    #[test]
+    fn qk_norm_on_changes_the_config_hash() {
+        let mut cfg = LitConfig::nano_baseline().model;
+        let before = compute_model_config_hash(&cfg);
+        cfg.qk_norm = true;
         assert_ne!(before, compute_model_config_hash(&cfg));
     }
 

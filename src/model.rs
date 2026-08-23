@@ -623,6 +623,15 @@ struct CausalAttnProjsWithIds<R: boostr::Runtime> {
     o_proj: AttnProjWithIds<R>,
 }
 
+/// The dense block's per-head Q/K norms with their stable parameter ids, for
+/// the `*_with_ids` rebuild path. Present exactly when the model config's
+/// `qk_norm` is on. Named fields, like `CausalAttnProjsWithIds`, so the two
+/// same-typed norms cannot be swapped at the call site.
+struct QkNormsWithIds<R: boostr::Runtime> {
+    q_norm: WeightWithId<R>,
+    k_norm: WeightWithId<R>,
+}
+
 /// One MoE FFN's routed experts, its shared expert, and its router gate, for
 /// the `*_with_ids` rebuild path.
 type MoeWeightsWithIds<R> = (
@@ -671,6 +680,13 @@ struct CausalSelfAttention<R: boostr::Runtime> {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    /// Per-head RMS norm on Q, over the `head_dim` axis, applied BEFORE RoPE.
+    /// `Some` exactly when the model config's `qk_norm` is on (Qwen3,
+    /// Command-R, Cohere). `attention_core_flash` owns the norm/RoPE order —
+    /// see `boostr::model::attention_core::attention_prologue`.
+    q_norm: Option<RmsNorm<R>>,
+    /// Per-head RMS norm on K. Built and dropped together with [`Self::q_norm`].
+    k_norm: Option<RmsNorm<R>>,
     rope: RotaryEmbedding<R>,
     /// Sliding-window attention span. `0` disables it (boostr's kernel
     /// sentinel for "no window").
@@ -687,6 +703,7 @@ where
         client: &C,
         dtype: DType,
         lora: Option<&LoraConfig>,
+        qk_norm: bool,
     ) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
@@ -740,6 +757,35 @@ where
             lora,
             client,
         )?;
+        // The config's `rms_norm_eps`, the SAME source `Block::new` gives
+        // `input_layernorm`/`post_attention_layernorm`. A different eps here
+        // drifts the Q/K scale with no error anywhere.
+        let norm_eps = cfg.rms_norm_eps as f32;
+        // `MultiHeadLatentAttention::take_rms_norm` is the single VarBuilder
+        // norm builder both attention blocks share, the same way
+        // `CausalSelfAttention::projection` is the single projection builder
+        // the MLP and every MoE expert share. `head_dim`, not `hidden_size`:
+        // boostr normalizes over the last axis of `[B, H, S, D]`.
+        let (q_norm, k_norm) = if qk_norm {
+            (
+                Some(MultiHeadLatentAttention::<R>::take_rms_norm(
+                    vb.pp("q_norm"),
+                    head_dim,
+                    norm_eps,
+                    dtype,
+                    client,
+                )?),
+                Some(MultiHeadLatentAttention::<R>::take_rms_norm(
+                    vb.pp("k_norm"),
+                    head_dim,
+                    norm_eps,
+                    dtype,
+                    client,
+                )?),
+            )
+        } else {
+            (None, None)
+        };
         let rope = RotaryEmbedding::new(
             head_dim,
             cfg.max_seq_len,
@@ -756,6 +802,8 @@ where
             num_heads: attn_cfg.num_heads,
             num_kv_heads: kv_heads,
             head_dim,
+            q_norm,
+            k_norm,
             rope,
             sliding_window: attn_cfg.sliding_window(),
         })
@@ -766,6 +814,7 @@ where
         projs: CausalAttnProjsWithIds<R>,
         rope_cos: (Tensor<R>, boostr::autograd::TensorId),
         rope_sin: (Tensor<R>, boostr::autograd::TensorId),
+        qk_norms: Option<QkNormsWithIds<R>>,
         frozen: &FrozenParams,
     ) -> Result<Self> {
         let CausalAttnProjsWithIds {
@@ -785,6 +834,33 @@ where
         let kv_heads = attn_cfg.num_kv_heads.unwrap_or(attn_cfg.num_heads);
         Self::validate_heads(attn_cfg.num_heads, kv_heads)?;
         let kv_hidden = kv_heads * head_dim;
+
+        // Same eps source as `new`, so a rebuild cannot silently re-scale Q/K.
+        let norm_eps = cfg.rms_norm_eps as f32;
+        // `RmsNorm::with_id`, never a fresh `TensorId`: the trainer rebuilds
+        // the model every step, and a new id detaches the AdamW state so the
+        // parameter silently stops converging.
+        let (q_norm, k_norm) = match qk_norms {
+            Some(QkNormsWithIds { q_norm, k_norm }) => (
+                Some(MultiHeadLatentAttention::<R>::rms_norm_with_id(
+                    "q_norm.weight",
+                    q_norm.0,
+                    q_norm.1,
+                    head_dim,
+                    norm_eps,
+                    frozen,
+                )?),
+                Some(MultiHeadLatentAttention::<R>::rms_norm_with_id(
+                    "k_norm.weight",
+                    k_norm.0,
+                    k_norm.1,
+                    head_dim,
+                    norm_eps,
+                    frozen,
+                )?),
+            ),
+            None => (None, None),
+        };
 
         Ok(Self {
             q_proj: Self::projection_with_ids(
@@ -814,6 +890,8 @@ where
             num_heads: attn_cfg.num_heads,
             num_kv_heads: kv_heads,
             head_dim,
+            q_norm,
+            k_norm,
             rope: RotaryEmbedding::with_ids(
                 rope_cos.0, rope_cos.1, rope_sin.0, rope_sin.1, head_dim,
             ),
@@ -861,9 +939,12 @@ where
             num_heads: self.num_heads,
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
-            // QK-norm is not part of this block today.
-            q_norm: None,
-            k_norm: None,
+            // `Some` only when the config's `qk_norm` is on. boostr applies
+            // these over the `head_dim` axis BEFORE RoPE — the order
+            // HuggingFace's `Qwen3Attention` uses — and owns that order for
+            // every caller, so it is deliberately not reproduced here.
+            q_norm: self.q_norm.as_ref(),
+            k_norm: self.k_norm.as_ref(),
             use_alibi: false,
             sliding_window: self.sliding_window,
             // Ignored by `attention_core_flash`; stated for honesty.
@@ -888,6 +969,12 @@ where
         params.extend(self.k_proj.trainable_parameters());
         params.extend(self.v_proj.trainable_parameters());
         params.extend(self.o_proj.trainable_parameters());
+        if let Some(q_norm) = &self.q_norm {
+            params.extend(q_norm.trainable_parameters());
+        }
+        if let Some(k_norm) = &self.k_norm {
+            params.extend(k_norm.trainable_parameters());
+        }
         params.extend(self.rope.trainable_parameters());
         params
     }
@@ -2042,6 +2129,10 @@ where
     R: boostr::Runtime<DType = DType>,
 {
     // Create appropriate block type based on configuration
+    //
+    // `qk_norm` comes straight from `OxidizrModelConfig`: boostr's
+    // `AttentionConfig` carries no such flag, so there is nowhere in `cfg` to
+    // read it from.
     fn new<C>(
         cfg: &ModelConfig,
         layer_idx: usize,
@@ -2049,6 +2140,7 @@ where
         client: &C,
         dtype: DType,
         lora: Option<&LoraConfig>,
+        qk_norm: bool,
     ) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
@@ -2184,6 +2276,7 @@ where
                     client,
                     dtype,
                     lora,
+                    qk_norm,
                 )?),
                 ffn: FfnLayer::new(cfg, vb.pp(ffn_prefix), client, dtype, lora)?,
                 input_layernorm: Self::take_rms_norm(
@@ -2249,6 +2342,10 @@ where
             AttnProjWithIds<R>,
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
+            // The per-head Q/K norms, present exactly when the model config's
+            // `qk_norm` is on. Carried here rather than re-derived from `cfg`:
+            // boostr's `ModelConfig` has no `qk_norm` flag to read.
+            Option<QkNormsWithIds<R>>,
             // Exactly one of these is populated, chosen by `cfg.moe`, the same
             // way the MLA arm above carries its FFN.
             Option<MlpWeightsWithIds<R>>,
@@ -2442,6 +2539,7 @@ where
                 o_proj,
                 rope_cos,
                 rope_sin,
+                qk_norms,
                 mlp,
                 moe,
                 input_layernorm,
@@ -2462,6 +2560,7 @@ where
                     },
                     rope_cos,
                     rope_sin,
+                    qk_norms,
                     frozen,
                 )?),
                 ffn: FfnLayer::with_ids(cfg, mlp, moe, frozen)?,
@@ -2987,6 +3086,7 @@ where
                 client,
                 compute_dtype,
                 cfg.lora.as_ref(),
+                cfg.qk_norm,
             )?);
         }
 
@@ -3615,6 +3715,7 @@ where
                         Self::attn_proj_with_ids(cfg, "o_proj", &attn.o_proj, params)?,
                         Self::tensor_with_stable_id(&attn.rope.cos, params)?,
                         Self::tensor_with_stable_id(&attn.rope.sin, params)?,
+                        Self::qk_norms_with_ids(cfg, attn, params)?,
                         mlp,
                         moe,
                         Self::tensor_with_stable_id(input_layernorm.weight(), params)?,
@@ -3624,6 +3725,37 @@ where
                     frozen,
                 )
             }
+        }
+    }
+
+    /// The dense block's Q/K norms with their stable ids, or `None` when
+    /// `qk_norm` is off.
+    ///
+    /// Cross-checks the config flag against what the live block actually
+    /// holds. `Block::with_ids` decides purely from the `Option`, so a block
+    /// whose norms went missing would rebuild WITHOUT them and keep training
+    /// happily — the same silent-drop failure this parameter exists to close.
+    fn qk_norms_with_ids(
+        cfg: &OxidizrModelConfig,
+        attn: &CausalSelfAttention<R>,
+        params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
+    ) -> Result<Option<QkNormsWithIds<R>>> {
+        match (&attn.q_norm, &attn.k_norm) {
+            (Some(q_norm), Some(k_norm)) if cfg.qk_norm => Ok(Some(QkNormsWithIds {
+                q_norm: Self::tensor_with_stable_id(q_norm.weight(), params)?,
+                k_norm: Self::tensor_with_stable_id(k_norm.weight(), params)?,
+            })),
+            (None, None) if !cfg.qk_norm => Ok(None),
+            _ => Err(boostr::error::Error::ModelError {
+                reason: format!(
+                    "config qk_norm is {} but the dense-attention block holds q_norm={} / \
+                     k_norm={} while rebuilding LitGPT. Rebuilding from this state would \
+                     drop or fabricate self_attn.q_norm.weight / self_attn.k_norm.weight.",
+                    cfg.qk_norm,
+                    attn.q_norm.is_some(),
+                    attn.k_norm.is_some()
+                ),
+            }),
         }
     }
 
@@ -4385,6 +4517,19 @@ where
                         proj,
                     );
                 }
+                // `q_norm.weight` / `k_norm.weight` under the same `self_attn`
+                // prefix, matching HuggingFace's Qwen3 names exactly. Present
+                // only when `qk_norm` is on, so a `false` config's name set is
+                // unchanged.
+                for (name, norm) in [("q_norm", &attn.q_norm), ("k_norm", &attn.k_norm)] {
+                    if let Some(norm) = norm {
+                        Self::push_named_param(
+                            params,
+                            format!("{prefix}.self_attn.{name}.weight"),
+                            norm.weight(),
+                        );
+                    }
+                }
                 Self::push_named_param(
                     params,
                     format!("{prefix}.post_attention_layernorm.weight"),
@@ -4652,6 +4797,7 @@ mod tie_word_embeddings_tests {
             rope_theta: 10000.0,
             rope_scaling: None,
             sliding_window: None,
+            qk_norm: false,
             speech_vocab: None,
             lora: None,
             dtype: crate::config::DTypePrecision::F32,
@@ -4788,12 +4934,24 @@ mod attention_extras_reach_dense_attention_tests {
     }
 
     fn build_attention(attention: AttentionConfig) -> CausalSelfAttention<CpuRuntime> {
+        build_attention_with_qk_norm(attention, false).0
+    }
+
+    /// The block plus the client it was built with, so a test can run the
+    /// block's own norms.
+    fn build_attention_with_qk_norm(
+        attention: AttentionConfig,
+        qk_norm: bool,
+    ) -> (CausalSelfAttention<CpuRuntime>, CpuClient) {
         let device = CpuDevice::new();
         let client = CpuClient::new(device.clone());
         let cfg = model_cfg(attention);
         let mut varmap = boostr::VarMap::<CpuRuntime>::new();
         let vb = VarBuilder::new(&mut varmap, &device);
-        CausalSelfAttention::<CpuRuntime>::new(&cfg, vb, &client, DType::F32, None).unwrap()
+        let attn =
+            CausalSelfAttention::<CpuRuntime>::new(&cfg, vb, &client, DType::F32, None, qk_norm)
+                .unwrap();
+        (attn, client)
     }
 
     #[test]
@@ -4838,6 +4996,70 @@ mod attention_extras_reach_dense_attention_tests {
             "rope_scaling must change the precomputed cos cache reaching \
              oxidizr's own attention block, not just boostr's unused Llama builder"
         );
+    }
+
+    #[test]
+    fn qk_norm_off_builds_no_norms() {
+        let (attn, _) = build_attention_with_qk_norm(attn_cfg(None, None), false);
+        assert!(
+            attn.q_norm.is_none() && attn.k_norm.is_none(),
+            "qk_norm off must leave the block byte-identical to before the flag existed"
+        );
+    }
+
+    #[test]
+    fn qk_norm_on_normalizes_over_head_dim_not_hidden_size() {
+        let (attn, _) = build_attention_with_qk_norm(attn_cfg(None, None), true);
+        let q_norm = attn.q_norm.as_ref().expect("qk_norm on must build q_norm");
+        let k_norm = attn.k_norm.as_ref().expect("qk_norm on must build k_norm");
+        // hidden_size(8) / num_heads(2). boostr normalizes the last axis of
+        // `[B, H, S, D]`, so a `hidden_size`-long weight would be silently
+        // mis-broadcast or rejected at the first forward, not here.
+        assert_eq!(q_norm.weight().tensor().shape(), &[4]);
+        assert_eq!(k_norm.weight().tensor().shape(), &[4]);
+    }
+
+    /// Pin the epsilon. `RmsNorm` keeps `eps` private, so this reads it back
+    /// the only way available: through the arithmetic.
+    ///
+    /// The input is deliberately small (`1e-3` per element, so
+    /// `mean(x^2) = 1e-6`) — at that scale `eps` DOMINATES the denominator, so
+    /// the wrong eps changes the output by ~3x rather than by a rounding
+    /// error. A norm built with boostr's `MlaConfig::norm_eps` (`1e-6`) or a
+    /// hardcoded `1e-12` fails this outright.
+    #[test]
+    fn qk_norm_uses_the_config_rms_norm_eps() {
+        use boostr::autograd::Var;
+
+        let (attn, client) = build_attention_with_qk_norm(attn_cfg(None, None), true);
+        let q_norm = attn.q_norm.as_ref().expect("qk_norm on must build q_norm");
+
+        let head_dim = 4;
+        let device = CpuDevice::new();
+        let values = vec![1e-3f32; head_dim];
+        let input = Var::new(
+            Tensor::<CpuRuntime>::try_from_slice(&values, &[1, 1, 1, head_dim], &device).unwrap(),
+            false,
+        );
+
+        let out: Vec<f32> = q_norm
+            .forward(&client, &input)
+            .expect("q_norm forward must succeed")
+            .tensor()
+            .contiguous()
+            .unwrap()
+            .to_vec();
+
+        // weight is initialized to ones, so out = x * rsqrt(mean(x^2) + eps).
+        let eps = default_rms_norm_eps() as f32;
+        let mean_sq = values.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+        let expected = 1e-3f32 / (mean_sq + eps).sqrt();
+        for value in &out {
+            assert!(
+                (value - expected).abs() <= expected * 1e-4,
+                "q_norm must use rms_norm_eps ({eps:e}): expected {expected}, got {value}"
+            );
+        }
     }
 }
 
@@ -4889,6 +5111,7 @@ mod frozen_parameter_tests {
             rope_theta: 10000.0,
             rope_scaling: None,
             sliding_window: None,
+            qk_norm: false,
             speech_vocab: None,
             lora: None,
             dtype: crate::config::DTypePrecision::F32,
@@ -5163,6 +5386,7 @@ mod lora_tests {
             rope_theta: 10000.0,
             rope_scaling: None,
             sliding_window: None,
+            qk_norm: false,
             speech_vocab: None,
             lora,
             dtype: crate::config::DTypePrecision::F32,
@@ -5883,6 +6107,7 @@ mod moe_lora_tests {
             rope_theta: 10000.0,
             rope_scaling: None,
             sliding_window: None,
+            qk_norm: false,
             speech_vocab: None,
             lora,
             dtype: crate::config::DTypePrecision::F32,
@@ -6328,6 +6553,7 @@ mod checkpoint_completeness_tests {
             rope_theta: 10000.0,
             rope_scaling: None,
             sliding_window: None,
+            qk_norm: false,
             speech_vocab: None,
             lora,
             dtype: crate::config::DTypePrecision::F32,
@@ -6649,6 +6875,7 @@ mod legacy_moe_tests {
             rope_theta: 10000.0,
             rope_scaling: None,
             sliding_window: None,
+            qk_norm: false,
             speech_vocab: None,
             lora,
             dtype: crate::config::DTypePrecision::F32,

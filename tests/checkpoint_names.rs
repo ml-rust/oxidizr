@@ -5,8 +5,8 @@
 //! a missing one (see `src/model.rs` around `missing.is_empty()`). A single
 //! renamed parameter in the dense-attention block therefore makes every
 //! existing checkpoint unloadable. This file hardcodes the exact name set for
-//! three configurations so an upcoming refactor of that block cannot rename
-//! a parameter without a test failing here first.
+//! each dense configuration so an upcoming refactor of that block cannot
+//! rename a parameter without a test failing here first.
 //!
 //! Golden lists are written out literally, not generated from
 //! `named_parameters` itself — generating them from the function under test
@@ -59,6 +59,7 @@ fn dense_cfg() -> OxidizrModelConfig {
         rope_theta: 10000.0,
         rope_scaling: None,
         sliding_window: None,
+        qk_norm: false,
         speech_vocab: None,
         lora: None,
         dtype: DTypePrecision::F32,
@@ -75,6 +76,15 @@ fn lora_cfg() -> OxidizrModelConfig {
         alpha: 4.0,
         target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
     });
+    cfg
+}
+
+/// `dense_cfg`, with per-head QK-norm on. The ONLY difference, so any name
+/// that moves between the two golden lists moved because of this flag.
+fn qk_norm_cfg() -> OxidizrModelConfig {
+    let mut cfg = dense_cfg();
+    cfg.name = "checkpoint-names-qk-norm-test".to_string();
+    cfg.qk_norm = true;
     cfg
 }
 
@@ -151,6 +161,48 @@ const DENSE_GOLDEN: &[&str] = &[
     "norm.weight",
 ];
 
+/// `qk_norm_cfg()`'s parameter names: `DENSE_GOLDEN` plus exactly
+/// `self_attn.q_norm.weight` and `self_attn.k_norm.weight` per layer.
+///
+/// The names match HuggingFace's Qwen3 checkpoint
+/// (`model.layers.N.self_attn.q_norm.weight`) minus the `model.` prefix
+/// oxidizr does not use, so a Qwen3 import lands on them by name.
+const QK_NORM_GOLDEN: &[&str] = &[
+    "embed_tokens.weight",
+    "layers.0.input_layernorm.weight",
+    "layers.0.mlp.down_proj.weight",
+    "layers.0.mlp.gate_proj.weight",
+    "layers.0.mlp.up_proj.weight",
+    "layers.0.post_attention_layernorm.weight",
+    "layers.0.self_attn.k_norm.weight",
+    "layers.0.self_attn.k_proj.weight",
+    "layers.0.self_attn.o_proj.weight",
+    "layers.0.self_attn.q_norm.weight",
+    "layers.0.self_attn.q_proj.weight",
+    "layers.0.self_attn.v_proj.weight",
+    "layers.1.input_layernorm.weight",
+    "layers.1.mlp.down_proj.weight",
+    "layers.1.mlp.gate_proj.weight",
+    "layers.1.mlp.up_proj.weight",
+    "layers.1.post_attention_layernorm.weight",
+    "layers.1.self_attn.k_norm.weight",
+    "layers.1.self_attn.k_proj.weight",
+    "layers.1.self_attn.o_proj.weight",
+    "layers.1.self_attn.q_norm.weight",
+    "layers.1.self_attn.q_proj.weight",
+    "layers.1.self_attn.v_proj.weight",
+    "lm_head.weight",
+    "norm.weight",
+];
+
+/// The two names `qk_norm` adds per layer, and the ONLY names it adds.
+const QK_NORM_ADDED: &[&str] = &[
+    "layers.0.self_attn.k_norm.weight",
+    "layers.0.self_attn.q_norm.weight",
+    "layers.1.self_attn.k_norm.weight",
+    "layers.1.self_attn.q_norm.weight",
+];
+
 /// `lora_cfg()`'s parameter names: `DENSE_GOLDEN` plus `.lora_a`/`.lora_b`
 /// for `q_proj` and `v_proj` in each layer (their `.weight` entries stay,
 /// since the base is frozen, not dropped from `named_parameters`).
@@ -190,6 +242,33 @@ const LORA_GOLDEN: &[&str] = &[
 fn dense_attention_config_has_the_golden_parameter_names() {
     let model = build(&dense_cfg());
     assert_names_match(&model, DENSE_GOLDEN, "dense config");
+}
+
+/// `qk_norm: true` must add `self_attn.q_norm.weight` /
+/// `self_attn.k_norm.weight` per layer and NOTHING else.
+#[test]
+fn qk_norm_adds_exactly_q_norm_and_k_norm_per_layer() {
+    let model = build(&qk_norm_cfg());
+    assert_names_match(&model, QK_NORM_GOLDEN, "dense config with qk_norm");
+}
+
+/// The complement, stated as a diff rather than as two literal lists: the
+/// `qk_norm` name set minus the `qk_norm: false` name set is exactly the two
+/// norms per layer. This is what fails if a future change makes the flag drag
+/// some other parameter along with it.
+#[test]
+fn qk_norm_changes_nothing_but_the_two_norms_per_layer() {
+    let off: BTreeSet<String> = sorted_names(&build(&dense_cfg())).into_iter().collect();
+    let on: BTreeSet<String> = sorted_names(&build(&qk_norm_cfg())).into_iter().collect();
+
+    let added: Vec<&str> = on.difference(&off).map(String::as_str).collect();
+    let removed: Vec<&str> = off.difference(&on).map(String::as_str).collect();
+
+    assert_eq!(added, QK_NORM_ADDED, "qk_norm added the wrong names");
+    assert!(
+        removed.is_empty(),
+        "qk_norm must not remove any parameter, but dropped: {removed:?}"
+    );
 }
 
 #[test]
@@ -300,4 +379,125 @@ fn dense_checkpoint_round_trips_through_save_and_load() {
         "a checkpoint saved from this exact config must load back into a fresh model of the \
          same config without error",
     );
+}
+
+/// Every parameter of `model`, keyed by `TensorId` — the shape
+/// `save_checkpoint_from_params` and `rebuild_with_parameters` both take.
+fn parameter_map(model: &LitGPT<CpuRuntime>) -> HashMap<TensorId, Tensor<CpuRuntime>> {
+    model
+        .named_parameters()
+        .into_iter()
+        .map(|(_, id, var)| (id, var.tensor().clone()))
+        .collect()
+}
+
+/// A `qk_norm: true` model must save and reload like any other: the on-disk
+/// keys carry the two norms, and `load_checkpoint_into_model` accepts them.
+#[test]
+fn qk_norm_checkpoint_round_trips_through_save_and_load() {
+    let cfg = qk_norm_cfg();
+    let model = build(&cfg);
+    let params = parameter_map(&model);
+
+    let path = temp_checkpoint_path("qk-norm-roundtrip");
+    save_checkpoint_from_params(&path, &model, &params).expect("checkpoint save must succeed");
+
+    let mut safetensors =
+        boostr::format::SafeTensors::open(&path).expect("saved checkpoint must be readable");
+    let on_disk = safetensors
+        .load_all::<CpuRuntime>(&CpuDevice::new())
+        .expect("saved checkpoint tensors must load");
+    let mut disk_names: Vec<String> = on_disk.keys().cloned().collect();
+    disk_names.sort();
+    assert_name_set(
+        &disk_names,
+        QK_NORM_GOLDEN,
+        "on-disk qk_norm checkpoint keys",
+    );
+
+    let mut reloaded = build(&cfg);
+    let result = load_checkpoint_into_model(&mut reloaded, &path);
+    let _ = std::fs::remove_file(&path);
+
+    result.expect("a qk_norm checkpoint must load back into a fresh model of the same config");
+}
+
+/// THE regression test for the silent-drop bug this unit closes.
+///
+/// A `qk_norm: true` model loading a checkpoint that lacks
+/// `self_attn.q_norm.weight` / `self_attn.k_norm.weight` must hard-error and
+/// NAME them.
+///
+/// Without the fix the two names are absent from `named_parameters()`, so
+/// `load_checkpoint_into_model`'s missing-tensor check has nothing to miss:
+/// the load "succeeds", the tensors are dropped on the floor, and the model
+/// trains to fluent text while computing a different function from the one
+/// the weights were trained for. This test is the assertion that the names
+/// now exist and that the completeness check therefore covers them.
+#[test]
+fn a_qk_norm_model_rejects_a_checkpoint_without_the_qk_norm_tensors() {
+    // Saved from a model WITHOUT qk_norm: every other name and shape matches,
+    // so only the two norms are missing. Exactly the shape of a Qwen3 import
+    // going the other way.
+    let without = build(&dense_cfg());
+    let params = parameter_map(&without);
+    let path = temp_checkpoint_path("qk-norm-missing");
+    save_checkpoint_from_params(&path, &without, &params).expect("checkpoint save must succeed");
+
+    let mut with_qk_norm = build(&qk_norm_cfg());
+    let result = load_checkpoint_into_model(&mut with_qk_norm, &path);
+    let _ = std::fs::remove_file(&path);
+
+    let err = result
+        .expect_err(
+            "loading a checkpoint that lacks q_norm/k_norm into a qk_norm model must fail: \
+             silently random-initializing them is the exact bug this guards",
+        )
+        .to_string();
+    for name in [
+        "layers.0.self_attn.q_norm.weight",
+        "layers.0.self_attn.k_norm.weight",
+        "layers.1.self_attn.q_norm.weight",
+        "layers.1.self_attn.k_norm.weight",
+    ] {
+        assert!(
+            err.contains(name),
+            "the error must name the missing tensor {name}, got: {err}"
+        );
+    }
+}
+
+/// The trainer rebuilds the model from the optimizer's parameter map once per
+/// step. `q_norm`/`k_norm` must come back with the SAME `TensorId`s: a fresh
+/// id detaches the AdamW state keyed by it, and the parameter silently stops
+/// converging with nothing failing anywhere. This is the `qk_norm` half of
+/// what `Trainer::assert_stable_parameter_ids` enforces at runtime.
+#[test]
+fn rebuilding_preserves_the_qk_norm_parameter_ids() {
+    let model = build(&qk_norm_cfg());
+    let before: Vec<(String, TensorId)> = model
+        .named_parameters()
+        .into_iter()
+        .map(|(name, id, _)| (name, id))
+        .collect();
+
+    let rebuilt = model
+        .rebuild_with_parameters(&parameter_map(&model))
+        .expect("rebuilding a qk_norm model from its own parameters must succeed");
+    let after: Vec<(String, TensorId)> = rebuilt
+        .named_parameters()
+        .into_iter()
+        .map(|(name, id, _)| (name, id))
+        .collect();
+
+    assert_eq!(
+        before, after,
+        "every parameter must keep its name AND its TensorId across a rebuild"
+    );
+
+    // Not vacuous: the norms really are among the names checked above.
+    let names: BTreeSet<&str> = after.iter().map(|(name, _)| name.as_str()).collect();
+    for name in QK_NORM_ADDED {
+        assert!(names.contains(name), "{name} must survive the rebuild");
+    }
 }

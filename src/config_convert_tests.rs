@@ -264,6 +264,45 @@ fn attention_extras_on_ssm_only_are_rejected() {
         err.contains("sliding_window"),
         "error must name sliding_window: {err}"
     );
+
+    let with_qk_norm = OxidizrModelConfig {
+        qk_norm: true,
+        ..ssm_only
+    };
+    let err = with_qk_norm.to_boostr().unwrap_err().to_string();
+    assert!(err.contains("qk_norm"), "error must name qk_norm: {err}");
+}
+
+/// `qk_norm` builds `q_norm`/`k_norm` in the DENSE block only. The MLA block
+/// normalizes its compressed latents instead and has nowhere to put them, so
+/// asking for both must fail rather than drop the flag — the same silent-drop
+/// class of bug the flag itself exists to close.
+#[test]
+fn qk_norm_on_an_mla_model_is_rejected() {
+    let cfg = OxidizrModelConfig {
+        qk_norm: true,
+        kv_latent_dim: Some(128),
+        q_latent_dim: Some(128),
+        d_rope: Some(16),
+        ..dense_baseline()
+    };
+    let err = cfg.to_boostr().unwrap_err().to_string();
+    assert!(
+        err.contains("qk_norm") && err.contains("kv_latent_dim"),
+        "error must name qk_norm and the conflicting kv_latent_dim: {err}"
+    );
+}
+
+/// The dense path accepts it: this is the config `LitGPT::new` then builds the
+/// two norms from.
+#[test]
+fn qk_norm_on_a_dense_model_is_accepted() {
+    let cfg = OxidizrModelConfig {
+        qk_norm: true,
+        ..dense_baseline()
+    };
+    cfg.to_boostr()
+        .expect("qk_norm on an attention-only model must convert");
 }
 
 #[test]
