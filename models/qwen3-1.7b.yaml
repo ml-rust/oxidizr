@@ -70,7 +70,14 @@ model:
 
   # Below the checkpoint's 40960 max_position_embeddings, which only shortens
   # the context the run trains on. Raising it costs activation memory.
-  max_seq_len: 2048
+  # 512, not Qwen3's native 40960 or a round 2048: the loss layer materializes
+  # [batch, seq, 151936] logits, so sequence length multiplies a vocab-sized
+  # tensor. At 2048 that alone is 622 MB in bf16 before any softmax or backward
+  # intermediate, and training runs out of memory on a consumer GPU. Raise it
+  # only alongside gradient checkpointing or a chunked loss — and note that
+  # changing it changes the config hash, so re-import before training, not
+  # after.
+  max_seq_len: 512
   rope_theta: 1000000.0
 
   # The checkpoint's on-disk precision. An F32 load doubles resident weights
