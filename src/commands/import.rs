@@ -344,8 +344,9 @@ where
         report_qk_norm(&model, &client)?;
     }
 
-    // Nothing is frozen and no optimizer is in play, so each parameter's own
-    // `Var` is its value.
+    // No optimizer is in play, so each parameter's own `Var` is its value.
+    // `named_parameters`, not the trainable subset: a LoRA config freezes the
+    // base, and the checkpoint must still carry every frozen weight.
     let params: HashMap<TensorId, Tensor<R>> = model
         .named_parameters()
         .into_iter()

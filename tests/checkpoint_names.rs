@@ -78,6 +78,11 @@ fn lora_cfg() -> OxidizrModelConfig {
         rank: 2,
         alpha: 4.0,
         target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+        // The default freeze policy on purpose: freezing the whole base must
+        // not drop a single name from the checkpoint, and this golden list is
+        // what proves it.
+        freeze_base: true,
+        train_modules: Vec::new(),
     });
     cfg
 }

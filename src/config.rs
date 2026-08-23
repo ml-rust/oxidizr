@@ -265,12 +265,81 @@ pub struct LoraConfig {
     /// Which projections get an adapter. Must be a non-empty subset of
     /// [`SUPPORTED_LORA_TARGETS`].
     pub target_modules: Vec<String>,
+    /// Freeze every parameter that is not a LoRA adapter factor. Default true.
+    ///
+    /// This is the flag that makes LoRA cheap. The optimizer allocates a
+    /// gradient plus two AdamW moment buffers per TRAINABLE parameter, so
+    /// freezing only the adapted projections leaves the embedding, every
+    /// norm, and the whole MLP stack paying full-fine-tune memory on a run
+    /// the config calls LoRA.
+    ///
+    /// `false` freezes only the base weight of a projection that carries an
+    /// adapter, which is the minimum LoRA needs to be correct.
+    ///
+    /// `skip_serializing_if` keeps the key out of the JSON that
+    /// `compute_model_config_hash` hashes while the flag holds its default,
+    /// so every `lora` block written before this field existed keeps its hash
+    /// and still passes resume validation. Setting it to `false` DOES move
+    /// the hash, which is right: it changes which parameters the optimizer
+    /// owns.
+    #[serde(
+        default = "default_freeze_base",
+        skip_serializing_if = "freeze_base_is_default"
+    )]
+    pub freeze_base: bool,
+    /// Parameter-path segments kept trainable even under `freeze_base`.
+    ///
+    /// Matched per PATH SEGMENT against the names
+    /// `LitGPT::named_parameters` produces: an entry matches when it equals
+    /// one whole dot-separated segment. So `norm` matches `norm.weight` and
+    /// NOT `layers.0.input_layernorm.weight`, `embed_tokens` matches
+    /// `embed_tokens.weight`, and `q_proj` matches every layer's
+    /// `layers.N.self_attn.q_proj.weight`. Substring matching would let
+    /// `norm` silently sweep in both per-layer norms.
+    ///
+    /// An entry that matches no parameter is a hard error, not a no-op: it
+    /// means the user believes something is training that is not.
+    ///
+    /// A `grow_vocab` speech run needs `embed_tokens` here (and `lm_head`
+    /// when untied). The rows added for new audio ids start random, so a
+    /// frozen embedding can never learn to emit audio while the loss still
+    /// falls on the adapters alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub train_modules: Vec<String>,
+}
+
+/// `serde(default)` source for [`LoraConfig::freeze_base`].
+fn default_freeze_base() -> bool {
+    true
+}
+
+/// `skip_serializing_if` predicate for [`LoraConfig::freeze_base`].
+///
+/// A free function rather than a closure so the reason it exists — hash
+/// stability for `lora` blocks written before the field — is readable at the
+/// field.
+fn freeze_base_is_default(freeze_base: &bool) -> bool {
+    *freeze_base == default_freeze_base()
 }
 
 impl LoraConfig {
     /// Whether `projection` (e.g. `"q_proj"`) carries an adapter.
     pub fn targets(&self, projection: &str) -> bool {
         self.target_modules.iter().any(|name| name == projection)
+    }
+
+    /// Whether `name` — a `LitGPT::named_parameters` name — is kept trainable
+    /// by a [`LoraConfig::train_modules`] entry, and which entry matched.
+    ///
+    /// Returns the index so the caller can report an entry that matched
+    /// nothing.
+    pub fn train_module_matches(&self, name: &str) -> Vec<usize> {
+        self.train_modules
+            .iter()
+            .enumerate()
+            .filter(|(_, module)| name.split('.').any(|segment| segment == module.as_str()))
+            .map(|(index, _)| index)
+            .collect()
     }
 }
 
@@ -1048,7 +1117,12 @@ pub fn find_latest_checkpoint(
         return Ok(None);
     }
 
-    let mut latest_step = 0usize;
+    // `Option`, not `0`: an IMPORTED checkpoint is step 0 by definition
+    // (`commands::import::IMPORT_STEP`), and a `latest_step` seeded at 0 with a
+    // `step > latest_step` test can never select it. That made `--resume auto`
+    // silently unable to find the one checkpoint the import command exists to
+    // produce, so a fine-tune started from random weights instead.
+    let mut latest_step: Option<usize> = None;
     let mut latest_checkpoint: Option<String> = None;
     let mut latest_meta: Option<String> = None;
 
@@ -1062,14 +1136,14 @@ pub fn find_latest_checkpoint(
                 if let Some(step_part) = filename.split("_step_").last() {
                     if let Some(step_str) = step_part.strip_suffix(".safetensors") {
                         if let Ok(step) = step_str.parse::<usize>() {
-                            if step > latest_step {
+                            if latest_step.is_none_or(|latest| step > latest) {
                                 // Check if corresponding meta file exists
                                 let meta_path = format!(
                                     "{}/checkpoint_step_{}.meta.json",
                                     checkpoint_dir, step
                                 );
                                 if Path::new(&meta_path).exists() {
-                                    latest_step = step;
+                                    latest_step = Some(step);
                                     latest_checkpoint = Some(path.to_string_lossy().to_string());
                                     latest_meta = Some(meta_path);
                                 }
@@ -1081,8 +1155,8 @@ pub fn find_latest_checkpoint(
         }
     }
 
-    match (latest_checkpoint, latest_meta) {
-        (Some(ckpt), Some(meta)) => Ok(Some((ckpt, meta, latest_step))),
+    match (latest_checkpoint, latest_meta, latest_step) {
+        (Some(ckpt), Some(meta), Some(step)) => Ok(Some((ckpt, meta, step))),
         _ => Ok(None),
     }
 }
@@ -1090,6 +1164,82 @@ pub fn find_latest_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory holding the named `*_step_N.safetensors` files, each with
+    /// the `checkpoint_step_N.meta.json` that makes it eligible.
+    fn checkpoint_dir_with_steps(tag: &str, steps: &[usize]) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "oxidizr-find-latest-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp checkpoint dir");
+        for step in steps {
+            fs::write(dir.join(format!("model_512_1b_bf16_step_{step}.safetensors")), b"")
+                .expect("write checkpoint");
+            fs::write(dir.join(format!("checkpoint_step_{step}.meta.json")), b"{}")
+                .expect("write meta");
+        }
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// `oxidizr import` always writes step 0, so this is the ONLY checkpoint a
+    /// fine-tune from pretrained weights has to resume from. A `latest_step`
+    /// seeded at `0` with a `step > latest_step` test skipped it, and
+    /// `--resume auto` then fell through to random init — a from-scratch run
+    /// wearing a fine-tune's clothes.
+    #[test]
+    fn resume_auto_finds_an_imported_step_0_checkpoint() {
+        let dir = checkpoint_dir_with_steps("step0", &[0]);
+        let found = find_latest_checkpoint(&dir).expect("scan succeeds");
+
+        let (path, _meta, step) = found.expect(
+            "a step-0 checkpoint is what `oxidizr import` writes; --resume auto must find it",
+        );
+        assert_eq!(step, 0);
+        assert!(path.ends_with("model_512_1b_bf16_step_0.safetensors"), "{path}");
+    }
+
+    /// Step 0 must not win over later steps just because it is now eligible.
+    #[test]
+    fn resume_auto_prefers_the_highest_step() {
+        let dir = checkpoint_dir_with_steps("highest", &[0, 5, 120, 30]);
+        let (path, _meta, step) = find_latest_checkpoint(&dir)
+            .expect("scan succeeds")
+            .expect("checkpoints exist");
+
+        assert_eq!(step, 120);
+        assert!(path.ends_with("model_512_1b_bf16_step_120.safetensors"), "{path}");
+    }
+
+    /// An empty directory still reports nothing, so the caller's
+    /// starting-fresh warning stays reachable.
+    #[test]
+    fn resume_auto_reports_nothing_for_an_empty_directory() {
+        let dir = checkpoint_dir_with_steps("empty", &[]);
+        assert!(find_latest_checkpoint(&dir)
+            .expect("scan succeeds")
+            .is_none());
+    }
+
+    /// A checkpoint without its metadata sidecar stays ineligible at step 0,
+    /// exactly as at any other step — the fix widened which STEPS qualify, not
+    /// which FILES.
+    #[test]
+    fn resume_auto_skips_a_step_0_checkpoint_with_no_metadata() {
+        let dir = checkpoint_dir_with_steps("nometa", &[]);
+        fs::write(
+            Path::new(&dir).join("model_512_1b_bf16_step_0.safetensors"),
+            b"",
+        )
+        .expect("write checkpoint");
+
+        assert!(find_latest_checkpoint(&dir)
+            .expect("scan succeeds")
+            .is_none());
+    }
 
     /// The config hash identifies the *architecture*, so a load-time policy
     /// flag must not enter it. If it did, every checkpoint written before that
@@ -1258,5 +1408,108 @@ mod tests {
             beta_slow: None,
         });
         assert_ne!(before, compute_model_config_hash(&cfg));
+    }
+
+    /// A `lora` block exactly as a YAML file written before `freeze_base` and
+    /// `train_modules` existed produces one.
+    fn lora_block() -> LoraConfig {
+        serde_yaml::from_str("rank: 8\nalpha: 16.0\ntarget_modules: [q_proj, v_proj]\n")
+            .expect("a lora block naming only the original three fields must deserialize")
+    }
+
+    /// A `lora` block that omits the two new fields must keep the freeze
+    /// policy LoRA is supposed to have. A `bool` field without an explicit
+    /// `default` would deserialize to `false` and silently full-fine-tune
+    /// every existing LoRA YAML.
+    #[test]
+    fn a_lora_block_without_freeze_base_freezes_the_base() {
+        let lora = lora_block();
+        assert!(
+            lora.freeze_base,
+            "an omitted freeze_base must default to true, not false"
+        );
+        assert!(lora.train_modules.is_empty());
+    }
+
+    /// `freeze_base`/`train_modules` are new fields on an existing struct, and
+    /// `compute_model_config_hash` hashes the serialized JSON STRING — KEYS
+    /// included. A `lora` block at their defaults must therefore serialize
+    /// EXACTLY the keys it did before they existed, or every LoRA checkpoint
+    /// fails resume validation with a false "model mismatch" and
+    /// `commands::train` offers to delete it.
+    #[test]
+    fn a_default_lora_block_does_not_change_the_config_hash() {
+        let mut cfg = LitConfig::nano_baseline().model;
+        cfg.lora = Some(lora_block());
+
+        let value = serde_json::to_value(&cfg).expect("the model config must serialize");
+        let lora = value
+            .get("lora")
+            .and_then(|lora| lora.as_object())
+            .expect("the lora block must serialize as an object");
+        let mut keys: Vec<&str> = lora.keys().map(|key| key.as_str()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["alpha", "rank", "target_modules"],
+            "a default lora block must serialize the three keys it had before \
+             freeze_base and train_modules existed, and nothing else"
+        );
+    }
+
+    /// The complement: turning `freeze_base` off hands the optimizer the
+    /// embedding, every norm, and the whole MLP stack, so the two settings
+    /// describe different training runs and the hash must separate them.
+    #[test]
+    fn freeze_base_off_changes_the_config_hash() {
+        let mut cfg = LitConfig::nano_baseline().model;
+        cfg.lora = Some(lora_block());
+        let before = compute_model_config_hash(&cfg);
+
+        if let Some(lora) = cfg.lora.as_mut() {
+            lora.freeze_base = false;
+        }
+        assert_ne!(before, compute_model_config_hash(&cfg));
+    }
+
+    /// Same reasoning for `train_modules`: it decides which parameters the
+    /// optimizer owns, so it must reach the hash once it is non-empty.
+    #[test]
+    fn train_modules_changes_the_config_hash() {
+        let mut cfg = LitConfig::nano_baseline().model;
+        cfg.lora = Some(lora_block());
+        let before = compute_model_config_hash(&cfg);
+
+        if let Some(lora) = cfg.lora.as_mut() {
+            lora.train_modules = vec!["embed_tokens".to_string()];
+        }
+        assert_ne!(before, compute_model_config_hash(&cfg));
+    }
+
+    /// `train_modules` matches one WHOLE dot-separated segment, never a
+    /// substring. A substring rule would make `norm` sweep in both per-layer
+    /// norms alongside the final one.
+    #[test]
+    fn train_modules_matches_whole_path_segments_only() {
+        let mut lora = lora_block();
+        lora.train_modules = vec!["norm".to_string(), "embed_tokens".to_string()];
+
+        assert_eq!(lora.train_module_matches("norm.weight"), vec![0]);
+        assert_eq!(lora.train_module_matches("embed_tokens.weight"), vec![1]);
+        assert!(
+            lora.train_module_matches("layers.0.input_layernorm.weight")
+                .is_empty(),
+            "'norm' must not match 'input_layernorm' — that is a substring, not a segment"
+        );
+        assert!(
+            lora.train_module_matches("layers.0.post_attention_layernorm.weight")
+                .is_empty(),
+            "'norm' must not match 'post_attention_layernorm'"
+        );
+        assert!(
+            lora.train_module_matches("layers.0.self_attn.q_norm.weight")
+                .is_empty(),
+            "'norm' must not match 'q_norm'"
+        );
     }
 }

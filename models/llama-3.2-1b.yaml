@@ -1,18 +1,18 @@
-# Qwen3-1.7B — import target for pretrained fine-tuning
+# Llama-3.2-1B — import target for pretrained fine-tuning
 #
 # Every model scalar below is transcribed from the HuggingFace checkpoint's
 # config.json. They must not drift: `compute_model_config_hash` gates
 # `--resume`, so the config that imports the weights is the config that trains
 # them.
 #
-# Dense GQA attention (no MLA, no MoE, no Mamba), per-head QK RMSNorm, tied
-# embeddings, BF16 on disk.
+# Dense GQA attention (no MLA, no MoE, no Mamba), NO QK norm, tied embeddings,
+# BF16 on disk.
 #
 # Usage:
-#   oxidizr import -f models/qwen3-1.7b.yaml \
-#     -m /path/to/qwen3-1.7b -d <tokenized.bin>
-#   oxidizr train -f models/qwen3-1.7b.yaml -d <tokenized.bin> \
-#     --dtype bf16 --resume ./checkpoints/qwen3-1.7b/<imported>.safetensors
+#   oxidizr import -f models/llama-3.2-1b.yaml \
+#     -m /path/to/llama-3.2-1b -d <tokenized.bin>
+#   oxidizr train -f models/llama-3.2-1b.yaml -d <tokenized.bin> \
+#     --dtype bf16 --resume ./checkpoints/llama-3.2-1b/<imported>.safetensors
 
 model:
   name: llama-3.2-1b
@@ -49,9 +49,18 @@ model:
   qk_norm: false
 
   # LoRA is not optional at this size on a consumer GPU — it is the only
-  # thing that fits. A full fine-tune of 1.7B needs weights + gradients + AdamW's two
-  # moment buffers; AdamW allocates its moments in the PARAMETER's dtype, so
-  # even at bf16 that is 3.4 + 3.4 + 6.8 = 13.6 GB before any activation.
+  # thing that fits. Every trainable parameter costs 16 bytes in steady state, even
+  # at bf16: 2 for the weight, 2 for the gradient, and 12 for the optimizer.
+  # AdamW keeps its state and an F32 MASTER COPY of every parameter narrower
+  # than F32 (4 + 4 + 4), because a bf16 weight cannot absorb its own update —
+  # at lr 2e-5 the relative step is ~0.1%, below bf16's ~0.4% resolution, so
+  # `w + dw` rounds back to `w` and the run reports a loss while training
+  # nothing. Full fine-tuning this 1.2B model is therefore 2.4 GB weights +
+  # 2.4 gradients + 14.4 optimizer = 19.2 GB before a single activation.
+  #
+  # Under LoRA only the adapters reach the optimizer: 128 small tensors here,
+  # so the 16 bytes apply to almost nothing. The frozen base costs its 2 bytes
+  # per parameter and nothing else — no gradient, no master, no moments.
   #
   # LoRA freezes the base, so the base contributes no gradient and no optimizer
   # state — only the adapters do.
@@ -59,6 +68,13 @@ model:
     rank: 16
     alpha: 32.0
     target_modules: [q_proj, k_proj, v_proj, o_proj]
+    # freeze_base defaults to true: every parameter that is not a lora_a/lora_b
+    # factor is frozen, so only the adapters carry a gradient and AdamW state.
+    # train_modules names path segments to keep trainable anyway, e.g.
+    # [embed_tokens] for a grow_vocab run whose new rows start random. An entry
+    # matching no parameter is a hard error, and it matches one whole
+    # dot-separated segment — `norm` hits `norm.weight`, not
+    # `input_layernorm.weight`.
 
   # lm_head shares embed_tokens' matrix, so the checkpoint has no separate
   # `lm_head.weight` to load.
@@ -85,7 +101,11 @@ trainer:
   num_epochs: 1
   batch_size: 1
   gradient_accumulation: 8
-  checkpoint_dir: "./checkpoints/qwen3-1.7b"
+  # Its own directory, not shared with qwen3-1.7b: `--resume auto` reads a
+  # single `checkpoint_step_N.meta.json` per directory, so two models writing
+  # to one directory leave the second import's metadata pointing at whichever
+  # ran last.
+  checkpoint_dir: "./checkpoints/llama-3.2-1b"
   log_interval: 1
   save_interval: 100
   max_checkpoints: 3

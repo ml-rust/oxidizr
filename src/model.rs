@@ -3163,7 +3163,7 @@ where
         // first point at which the wrapped base ids EXIST, and routing the
         // freeze through `FrozenParams` is what makes it survive every later
         // `rebuild_with_parameters` — the trainer calls that once per step.
-        let frozen = model.lora_frozen_base_ids();
+        let frozen = model.lora_frozen_ids()?;
         if frozen.is_empty() {
             return Ok(model);
         }
@@ -3198,12 +3198,96 @@ where
         Self::new(&config.model, &mut vb, client)
     }
 
+    /// Every id a `lora:` block must freeze.
+    ///
+    /// Empty when the config has no `lora` block, which is what keeps a
+    /// non-LoRA model's parameter set byte-identical to before LoRA existed.
+    ///
+    /// With `freeze_base` (the default) this is EVERY parameter that is not a
+    /// `lora_a`/`lora_b` factor, minus what `train_modules` holds back.
+    /// Freezing only the adapted projections is not enough to deliver LoRA's
+    /// memory saving: the optimizer allocates a gradient and two AdamW moment
+    /// buffers per trainable parameter, so a 1.24B model with adapters on
+    /// `[q,k,v,o]_proj` still carries ~1.04B trainable parameters — the
+    /// embedding, every norm, and the whole MLP stack — and OOMs exactly as a
+    /// full fine-tune would.
+    fn lora_frozen_ids(&self) -> Result<FrozenParams> {
+        let Some(lora) = self.cfg.lora.as_ref() else {
+            return Ok(FrozenParams::new());
+        };
+        if !lora.freeze_base {
+            return Ok(self.adapted_base_ids());
+        }
+
+        let mut frozen = FrozenParams::new();
+        let mut matched = vec![false; lora.train_modules.len()];
+        for (name, id, _) in self.named_parameters() {
+            // The adapter is the thing LoRA trains. It is never frozen, and it
+            // never satisfies a `train_modules` entry either — an entry naming
+            // a segment that only adapters carry has matched nothing real.
+            if is_lora_adapter(&name) {
+                continue;
+            }
+            let keep = lora.train_module_matches(&name);
+            for index in &keep {
+                matched[*index] = true;
+            }
+            if keep.is_empty() {
+                frozen.freeze(id);
+            }
+        }
+
+        let unmatched: Vec<&str> = lora
+            .train_modules
+            .iter()
+            .zip(&matched)
+            .filter(|(_, hit)| !**hit)
+            .map(|(module, _)| module.as_str())
+            .collect();
+        if !unmatched.is_empty() {
+            return Err(boostr::error::Error::ModelError {
+                reason: format!(
+                    "lora.train_modules names [{}], which matches no parameter of this model. \
+                     An entry must equal one whole dot-separated segment of a parameter name, \
+                     so 'norm' matches 'norm.weight' but not 'input_layernorm.weight'. \
+                     This model's segments are: {}.",
+                    unmatched.join(", "),
+                    self.parameter_name_segments().join(", ")
+                ),
+            });
+        }
+        Ok(frozen)
+    }
+
+    /// The dot-separated segments that appear in this model's parameter
+    /// names, minus the leaf (`weight`/`bias`/`lora_a`/...) and the numeric
+    /// layer and expert indices, sorted and deduplicated.
+    ///
+    /// Built only to populate the `train_modules` error, so an entry that
+    /// matched nothing is answered with the list it could have named.
+    fn parameter_name_segments(&self) -> Vec<String> {
+        let mut segments: Vec<String> = self
+            .named_parameters()
+            .into_iter()
+            .flat_map(|(name, _, _)| {
+                let mut parts: Vec<String> = name.split('.').map(|part| part.to_string()).collect();
+                parts.pop();
+                parts
+            })
+            .filter(|segment| segment.parse::<usize>().is_err())
+            .collect();
+        segments.sort();
+        segments.dedup();
+        segments
+    }
+
     /// The base-weight ids of every LoRA-adapted projection: attention, MLP,
     /// and every MoE expert alike.
     ///
-    /// Empty when no projection carries an adapter, which is what keeps a
-    /// non-LoRA model's parameter set byte-identical to before LoRA existed.
-    fn lora_frozen_base_ids(&self) -> FrozenParams {
+    /// This is the minimum LoRA needs to be correct — training a projection
+    /// and its own adapter at once trains the same function twice — and is
+    /// the whole frozen set under `freeze_base: false`.
+    fn adapted_base_ids(&self) -> FrozenParams {
         let mut frozen = FrozenParams::new();
         let mut freeze_adapted = |proj: &MaybeLora<R>| {
             if proj.adapters().is_some() {
@@ -4784,6 +4868,16 @@ where
     load_tensors(model, loaded, source, true)
 }
 
+/// Whether `name` — a [`LitGPT::named_parameters`] name — is a LoRA adapter
+/// factor rather than a base parameter.
+///
+/// The suffix alone is enough here: `push_named_projection` is the only thing
+/// that emits `.lora_a`/`.lora_b`, and it emits them only for a projection
+/// that actually carries an adapter.
+fn is_lora_adapter(name: &str) -> bool {
+    name.ends_with(".lora_a") || name.ends_with(".lora_b")
+}
+
 /// The parameter names an import may initialize fresh: the LoRA adapter
 /// factors of the projections `lora` targets.
 ///
@@ -5838,11 +5932,18 @@ mod lora_tests {
         }
     }
 
+    /// `freeze_base: false` throughout this module: these tests are about
+    /// adapter WIRING — which projections get an adapter, that the adapter
+    /// stays attached to the gradient, that a merge folds it back — and they
+    /// assert the un-adapted siblings stay trainable. The freeze policy has
+    /// its own module, `lora_freeze_base_tests`, which covers the default.
     fn lora_cfg() -> LoraConfig {
         LoraConfig {
             rank: 2,
             alpha: 4.0,
             target_modules: TARGETS.iter().map(|name| name.to_string()).collect(),
+            freeze_base: false,
+            train_modules: Vec::new(),
         }
     }
 
@@ -5907,6 +6008,8 @@ mod lora_tests {
             rank: 2,
             alpha: 4.0,
             target_modules: targets.iter().map(|name| name.to_string()).collect(),
+            freeze_base: false,
+            train_modules: Vec::new(),
         }
     }
 
@@ -6098,6 +6201,8 @@ mod lora_tests {
             rank: 2,
             alpha: 4.0,
             target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            freeze_base: false,
+            train_modules: Vec::new(),
         }));
         let listed = names(&model);
         for target in ["q_proj", "v_proj"] {
@@ -6121,6 +6226,8 @@ mod lora_tests {
             // MLA's `kv_b_proj` is real but unwrapped: naming it must fail
             // rather than yield a model with one adapter fewer than asked.
             target_modules: vec!["q_proj".to_string(), "kv_b_proj".to_string()],
+            freeze_base: false,
+            train_modules: Vec::new(),
         }))
         .to_boostr()
         .expect_err("an unsupported target must be rejected")
@@ -6143,6 +6250,8 @@ mod lora_tests {
             rank: 0,
             alpha: 4.0,
             target_modules: vec!["q_proj".to_string()],
+            freeze_base: false,
+            train_modules: Vec::new(),
         }))
         .to_boostr()
         .expect_err("rank 0 must be rejected")
@@ -6156,6 +6265,8 @@ mod lora_tests {
             rank: 2,
             alpha: 4.0,
             target_modules: Vec::new(),
+            freeze_base: false,
+            train_modules: Vec::new(),
         }))
         .to_boostr()
         .expect_err("an empty target list must be rejected")
@@ -6495,6 +6606,296 @@ mod lora_tests {
     }
 }
 
+/// `freeze_base` is what turns a `lora:` block into an actual memory saving.
+///
+/// The optimizer allocates a gradient plus two AdamW moment buffers per
+/// TRAINABLE parameter. Freezing only the projections that carry an adapter
+/// leaves the embedding, every norm, and the whole MLP stack trainable — on
+/// Llama-3.2-1B with adapters on `[q,k,v,o]_proj` that is ~1.04B of 1.24B
+/// parameters still paying full-fine-tune memory.
+#[cfg(test)]
+mod lora_freeze_base_tests {
+    use super::*;
+    use boostr::{CpuClient, CpuDevice, CpuRuntime};
+
+    /// Two layers, so a `train_modules` entry has to match a segment that
+    /// repeats under `layers.N` rather than one unique name.
+    const NUM_LAYERS: usize = 2;
+    const TARGETS: [&str; 2] = ["q_proj", "v_proj"];
+
+    fn cfg(lora: LoraConfig) -> OxidizrModelConfig {
+        OxidizrModelConfig {
+            name: "lora-freeze-test".to_string(),
+            hidden_size: 8,
+            num_layers: NUM_LAYERS,
+            num_heads: 2,
+            head_dim: None,
+            kv_heads: None,
+            kv_latent_dim: None,
+            q_latent_dim: None,
+            d_rope: None,
+            num_experts: None,
+            experts_per_tok: None,
+            shared_expert_enabled: None,
+            intermediate_size: Some(16),
+            mamba_layers: None,
+            mamba2_num_heads: None,
+            mamba2_head_dim: None,
+            mamba2_state_size: None,
+            mamba2_chunk_size: None,
+            mamba2_n_groups: None,
+            mamba2_conv_kernel: None,
+            mamba2_expand: None,
+            mamba3_enabled: None,
+            mamba3_complex_rope: None,
+            mamba3_mimo_rank: None,
+            mamba3_use_conv: None,
+            vocab_size: 12,
+            grow_vocab: false,
+            // Untied, so `lm_head.weight` is an independent parameter the
+            // freeze has to reach on its own.
+            tie_word_embeddings: false,
+            tokenizer_vocab: "custom".to_string(),
+            max_seq_len: 8,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            sliding_window: None,
+            qk_norm: false,
+            speech_vocab: None,
+            lora: Some(lora),
+            dtype: crate::config::DTypePrecision::F32,
+        }
+    }
+
+    fn lora_cfg(freeze_base: bool, train_modules: &[&str]) -> LoraConfig {
+        LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: TARGETS.iter().map(|name| name.to_string()).collect(),
+            freeze_base,
+            train_modules: train_modules.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    fn try_build(lora: LoraConfig) -> Result<LitGPT<CpuRuntime>> {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+        let mut varmap = boostr::VarMap::<CpuRuntime>::new();
+        let mut vb = VarBuilder::new(&mut varmap, &device);
+        LitGPT::<CpuRuntime>::new(&cfg(lora), &mut vb, &client)
+    }
+
+    fn build(lora: LoraConfig) -> LitGPT<CpuRuntime> {
+        try_build(lora).expect("model builds")
+    }
+
+    fn sorted(mut names: Vec<String>) -> Vec<String> {
+        names.sort();
+        names
+    }
+
+    fn trainable_names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
+        sorted(
+            model
+                .named_trainable_parameters()
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect(),
+        )
+    }
+
+    fn all_names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
+        sorted(
+            model
+                .named_parameters()
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect(),
+        )
+    }
+
+    /// The eight adapter factors this config creates: two layers, two
+    /// targeted projections, `lora_a` and `lora_b` each.
+    fn adapter_names() -> Vec<String> {
+        let mut names = Vec::new();
+        for layer in 0..NUM_LAYERS {
+            for target in TARGETS {
+                for factor in ["lora_a", "lora_b"] {
+                    names.push(format!("layers.{layer}.self_attn.{target}.{factor}"));
+                }
+            }
+        }
+        sorted(names)
+    }
+
+    /// The map the trainer hands to `rebuild_with_parameters`: every
+    /// optimizer-tracked parameter keyed by its `TensorId`.
+    fn optimizer_params(
+        model: &LitGPT<CpuRuntime>,
+    ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
+        model
+            .trainable_parameters()
+            .into_iter()
+            .map(|(id, var)| (id, var.tensor().clone()))
+            .collect()
+    }
+
+    /// THE assertion this unit exists for. Before the fix the trainable set
+    /// also held `embed_tokens.weight`, `lm_head.weight`, `norm.weight`,
+    /// every layer norm, every MLP projection, and the two un-adapted
+    /// attention projections per layer — everything but the four adapted
+    /// bases.
+    #[test]
+    fn freeze_base_leaves_only_the_adapters_trainable() {
+        let model = build(lora_cfg(true, &[]));
+        assert_eq!(
+            trainable_names(&model),
+            adapter_names(),
+            "freeze_base must hand the optimizer the LoRA factors and nothing else"
+        );
+    }
+
+    /// The opt-out the speech-LM plan needs: `grow_vocab` adds randomly
+    /// initialized rows for new audio ids, so a frozen `embed_tokens` can
+    /// never learn to emit audio while the loss still falls on the adapters
+    /// alone.
+    #[test]
+    fn train_modules_keeps_exactly_the_named_parameter_trainable() {
+        let model = build(lora_cfg(true, &["embed_tokens"]));
+        let mut expected = adapter_names();
+        expected.push("embed_tokens.weight".to_string());
+
+        assert_eq!(trainable_names(&model), sorted(expected));
+    }
+
+    /// Segment matching, not substring matching: `norm` keeps the final
+    /// `norm.weight` and leaves `input_layernorm` / `post_attention_layernorm`
+    /// frozen. A substring rule would sweep in four more parameters the user
+    /// never named.
+    #[test]
+    fn train_modules_matches_a_whole_path_segment_not_a_substring() {
+        let model = build(lora_cfg(true, &["norm"]));
+        let mut expected = adapter_names();
+        expected.push("norm.weight".to_string());
+
+        assert_eq!(trainable_names(&model), sorted(expected));
+    }
+
+    /// An entry that matches nothing means the user believes something is
+    /// training that is not — a silent no-op is the worst possible answer.
+    #[test]
+    fn a_train_modules_entry_matching_nothing_is_rejected() {
+        let Err(error) = try_build(lora_cfg(true, &["embed_tokens", "audio_head"])) else {
+            panic!("an unmatched train_modules entry must be rejected");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("audio_head"),
+            "the error must name the entry that matched nothing: {message}"
+        );
+        assert!(
+            message.contains("embed_tokens"),
+            "the error must list the segments that WERE available: {message}"
+        );
+    }
+
+    /// `freeze_base: false` is the pre-existing policy, byte for byte: only
+    /// the base weight of a projection that carries an adapter is frozen.
+    #[test]
+    fn freeze_base_off_freezes_only_the_adapted_bases() {
+        let model = build(lora_cfg(false, &[]));
+        let adapted_bases: Vec<String> = (0..NUM_LAYERS)
+            .flat_map(|layer| {
+                TARGETS
+                    .iter()
+                    .map(move |target| format!("layers.{layer}.self_attn.{target}.weight"))
+            })
+            .collect();
+        let expected: Vec<String> = all_names(&model)
+            .into_iter()
+            .filter(|name| !adapted_bases.contains(name))
+            .collect();
+
+        assert_eq!(trainable_names(&model), expected);
+        assert!(
+            expected.contains(&"embed_tokens.weight".to_string()),
+            "freeze_base: false must leave the embedding trainable, as before this field existed"
+        );
+    }
+
+    /// The trainer rebuilds the model on EVERY step. If the frozen set does
+    /// not ride through `rebuild_with_parameters`, freezing is cosmetic:
+    /// step 1 rebuilds every parameter with a literal `trainable = true`, the
+    /// full base comes back trainable and carries full-fine-tune memory —
+    /// while this file's other tests, which only inspect the freshly built
+    /// model, all still pass.
+    #[test]
+    fn the_frozen_set_survives_the_per_step_rebuild() {
+        let model = build(lora_cfg(true, &["embed_tokens"]));
+        let before = trainable_names(&model);
+
+        let rebuilt = model
+            .rebuild_with_parameters(&optimizer_params(&model))
+            .expect("the per-step rebuild succeeds");
+
+        assert_eq!(
+            trainable_names(&rebuilt),
+            before,
+            "the trainable set changed across rebuild_with_parameters"
+        );
+        assert_eq!(
+            rebuilt.frozen_parameters(),
+            model.frozen_parameters(),
+            "the frozen set must be carried forward by the rebuild"
+        );
+        assert_eq!(
+            all_names(&rebuilt),
+            all_names(&model),
+            "a rebuild must not drop a frozen parameter from the checkpoint set"
+        );
+    }
+
+    /// Freezing must never reach the thing LoRA trains, under any policy.
+    #[test]
+    fn the_adapters_are_trainable_under_every_policy() {
+        for lora in [
+            lora_cfg(true, &[]),
+            lora_cfg(true, &["embed_tokens"]),
+            lora_cfg(false, &[]),
+        ] {
+            let policy = format!("{lora:?}");
+            let model = build(lora);
+            let listed = trainable_names(&model);
+            for adapter in adapter_names() {
+                assert!(
+                    listed.contains(&adapter),
+                    "'{adapter}' must stay trainable under {policy}"
+                );
+            }
+        }
+    }
+
+    /// Freezing changes who the optimizer owns, never what the checkpoint
+    /// carries. `named_parameters` random-initializes any name a load does
+    /// not find, so a frozen base dropped from the saved set would "load"
+    /// into garbage.
+    #[test]
+    fn freezing_the_base_keeps_every_parameter_in_the_checkpoint_set() {
+        let frozen_base = build(lora_cfg(true, &[]));
+        let trainable_base = build(lora_cfg(false, &[]));
+
+        assert_eq!(
+            all_names(&frozen_base),
+            all_names(&trainable_base),
+            "the saved parameter set must not depend on the freeze policy"
+        );
+        assert!(
+            all_names(&frozen_base).contains(&"embed_tokens.weight".to_string()),
+            "a frozen embedding must still be written to the checkpoint"
+        );
+    }
+}
+
 /// LoRA on MoE expert projections.
 ///
 /// `gate_proj`/`up_proj`/`down_proj` name a projection inside every expert, so
@@ -6560,11 +6961,16 @@ mod moe_lora_tests {
         }
     }
 
+    /// `freeze_base: false` for the same reason as `lora_tests::lora_cfg`:
+    /// this module tests adapter wiring on the MLA path, not the freeze
+    /// policy.
     fn lora_cfg() -> LoraConfig {
         LoraConfig {
             rank: 2,
             alpha: 4.0,
             target_modules: MLP_TARGETS.iter().map(|name| name.to_string()).collect(),
+            freeze_base: false,
+            train_modules: Vec::new(),
         }
     }
 
@@ -6939,6 +7345,8 @@ mod moe_lora_tests {
             rank: 2,
             alpha: 4.0,
             target_modules: vec!["gate_proj".to_string(), "q_proj".to_string()],
+            freeze_base: false,
+            train_modules: Vec::new(),
         }))
         .to_boostr()
         .expect_err("an attention target must be rejected while kv_latent_dim is set")
@@ -7007,11 +7415,15 @@ mod checkpoint_completeness_tests {
         }
     }
 
+    /// `freeze_base: false` for the same reason as `lora_tests::lora_cfg`:
+    /// this module tests checkpoint completeness, not the freeze policy.
     fn lora_cfg() -> crate::config::LoraConfig {
         crate::config::LoraConfig {
             rank: 2,
             alpha: 4.0,
             target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            freeze_base: false,
+            train_modules: Vec::new(),
         }
     }
 
@@ -7141,6 +7553,8 @@ mod checkpoint_completeness_tests {
                 "up_proj".to_string(),
                 "down_proj".to_string(),
             ],
+            freeze_base: false,
+            train_modules: Vec::new(),
         }));
         let (saved, restored) = round_trip(&cfg, "mlp-lora");
 
@@ -7423,6 +7837,8 @@ mod checkpoint_completeness_tests {
             rank: 2,
             alpha: 4.0,
             target_modules: vec!["q_proj".to_string()],
+            freeze_base: false,
+            train_modules: Vec::new(),
         };
         let names = vec![
             "layers.0.self_attn.q_proj.weight".to_string(),
@@ -7463,6 +7879,8 @@ mod checkpoint_completeness_tests {
             rank: 2,
             alpha: 4.0,
             target_modules: vec!["q_proj".to_string()],
+            freeze_base: false,
+            train_modules: Vec::new(),
         }));
         let base = base_tensors(&cfg(None));
         let mut model = build(&q_proj_only);
@@ -7725,6 +8143,8 @@ mod legacy_moe_tests {
             rank: 2,
             alpha: 4.0,
             target_modules: MLP_TARGETS.iter().map(|name| name.to_string()).collect(),
+            freeze_base: false,
+            train_modules: Vec::new(),
         };
         let model = build(&cfg(Some(NUM_EXPERTS), Some(lora)));
         let listed = names(&model);

@@ -48,9 +48,18 @@ model:
   qk_norm: true
 
   # LoRA is not optional at this size on a consumer GPU — it is the only
-  # thing that fits. A full fine-tune of 1.7B needs weights + gradients + AdamW's two
-  # moment buffers; AdamW allocates its moments in the PARAMETER's dtype, so
-  # even at bf16 that is 3.4 + 3.4 + 6.8 = 13.6 GB before any activation.
+  # thing that fits. Every trainable parameter costs 16 bytes in steady state, even
+  # at bf16: 2 for the weight, 2 for the gradient, and 12 for the optimizer.
+  # AdamW keeps its state and an F32 MASTER COPY of every parameter narrower
+  # than F32 (4 + 4 + 4), because a bf16 weight cannot absorb its own update —
+  # at lr 2e-5 the relative step is ~0.1%, below bf16's ~0.4% resolution, so
+  # `w + dw` rounds back to `w` and the run reports a loss while training
+  # nothing. Full fine-tuning 1.7B is therefore 3.4 GB weights + 3.4 gradients
+  # + 20.4 optimizer = 27.2 GB before a single activation.
+  #
+  # Under LoRA only the adapters reach the optimizer, so the 16 bytes apply to
+  # a few hundred small tensors. The frozen base costs its 2 bytes per
+  # parameter and nothing else — no gradient, no master, no moments.
   #
   # LoRA freezes the base, so the base contributes no gradient and no optimizer
   # state — only the adapters do.
@@ -58,6 +67,13 @@ model:
     rank: 16
     alpha: 32.0
     target_modules: [q_proj, k_proj, v_proj, o_proj]
+    # freeze_base defaults to true: every parameter that is not a lora_a/lora_b
+    # factor is frozen, so only the adapters carry a gradient and AdamW state.
+    # train_modules names path segments to keep trainable anyway, e.g.
+    # [embed_tokens] for a grow_vocab run whose new rows start random. An entry
+    # matching no parameter is a hard error, and it matches one whole
+    # dot-separated segment — `norm` hits `norm.weight`, not
+    # `input_layernorm.weight`.
 
   # lm_head shares embed_tokens' matrix, so the checkpoint has no separate
   # `lm_head.weight` to load.

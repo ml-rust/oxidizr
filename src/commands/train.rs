@@ -540,9 +540,20 @@ where
                     }
                 }
                 None => {
-                    if !headless {
-                        println!("No checkpoint found, starting fresh");
-                    }
+                    // stderr, and NOT gated on `headless`. `--resume auto` is an
+                    // explicit request to continue from existing weights; falling
+                    // back to random init is the opposite of what was asked, and
+                    // a from-scratch run is indistinguishable from a fine-tune in
+                    // the JSON metrics until the loss refuses to drop. Under
+                    // `--headless` this was silent, so a fine-tune that never
+                    // loaded its pretrained weights looked like a working run.
+                    eprintln!(
+                        "⚠️  --resume auto found no checkpoint in '{}' — STARTING FROM RANDOM \
+                         WEIGHTS. A checkpoint is only eligible if it is named \
+                         `*_step_N.safetensors` AND has a matching \
+                         `checkpoint_step_N.meta.json` beside it.",
+                        config.trainer.checkpoint_dir
+                    );
                     0
                 }
             }

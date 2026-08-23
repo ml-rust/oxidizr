@@ -173,6 +173,8 @@ mod tests {
             rank: 2,
             alpha: 4.0,
             target_modules: vec!["q_proj".to_string()],
+            freeze_base: false,
+            train_modules: Vec::new(),
         }
     }
 

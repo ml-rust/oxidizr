@@ -9,11 +9,12 @@ use crate::prelude::{
 use boostr::autograd::{backward, var_add, var_mul_scalar, var_reshape, GradStore, Var};
 use boostr::ops::{FusedOptimizerOps, TensorOps};
 use boostr::optimizer::AdamWConfig;
+use boostr::readback::scalar_f32;
 use boostr::runtime::{Runtime, RuntimeClient};
 use boostr::tensor::TensorId;
 use boostr::{ReduceOps, TypeConversionOps};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
@@ -949,13 +950,63 @@ where
             .collect();
 
         if current_ids != self.parameter_ids {
+            // Name the difference: "the ids changed" alone leaves the operator
+            // with a 1.2B-parameter model and no way to tell WHICH parameter
+            // moved, and the two failure modes need opposite fixes. A set
+            // difference means the rebuild changed which parameters are
+            // trainable (a freezing bug); an identical set in a different
+            // order means only the traversal order moved.
+            let before: HashSet<TensorId> = self.parameter_ids.iter().copied().collect();
+            let after: HashSet<TensorId> = current_ids.iter().copied().collect();
+            let appeared: Vec<&str> = current_ids
+                .iter()
+                .filter(|id| !before.contains(id))
+                .map(|id| self.parameter_name(*id))
+                .collect();
+            let vanished: Vec<&str> = self
+                .parameter_ids
+                .iter()
+                .filter(|id| !after.contains(id))
+                .map(|id| self.parameter_name(*id))
+                .collect();
+            let detail = if appeared.is_empty() && vanished.is_empty() {
+                format!(
+                    "the same {} parameters came back in a different order",
+                    current_ids.len()
+                )
+            } else {
+                format!(
+                    "{} newly trainable ({}), {} no longer trainable ({})",
+                    appeared.len(),
+                    Self::name_sample(&appeared),
+                    vanished.len(),
+                    Self::name_sample(&vanished)
+                )
+            };
             return Err(Error::TrainingError {
-                reason: "model rebuild changed trainable TensorIds; AdamW state would be orphaned"
-                    .to_string(),
+                reason: format!(
+                    "model rebuild changed trainable TensorIds; AdamW state would be orphaned: \
+                     {detail}"
+                ),
             });
         }
 
         Ok(())
+    }
+
+    /// A readable sample of a name list: a 1.2B model can move hundreds of
+    /// parameters at once, and the first few plus a count is what an operator
+    /// reads.
+    fn name_sample(names: &[&str]) -> String {
+        const LISTED: usize = 6;
+        if names.len() <= LISTED {
+            return names.join(", ");
+        }
+        format!(
+            "{}, and {} more",
+            names[..LISTED].join(", "),
+            names.len() - LISTED
+        )
     }
 
     fn parameter_name(&self, id: TensorId) -> &str {
@@ -1163,21 +1214,6 @@ where
             }
         }
     }
-}
-
-/// Read a single-element tensor as `f32`, casting to F32 first.
-///
-/// `Tensor::item::<f32>` sizes its copy from `f32`, not from the tensor's
-/// dtype, so reading a BF16/F16 scalar directly asks the device buffer for
-/// twice the bytes it holds and reinterprets whatever comes back. Under mixed
-/// precision the loss carries the model's compute dtype, so every scalar
-/// readback goes through here. For an F32 tensor the cast is a no-op.
-fn scalar_f32<R, C>(client: &C, tensor: &Tensor<R>) -> Result<f32>
-where
-    R: Runtime<DType = DType>,
-    C: TypeConversionOps<R>,
-{
-    Ok(client.cast(tensor, DType::F32)?.item::<f32>()?)
 }
 
 /// Report whether every element of `tensor` is finite.
