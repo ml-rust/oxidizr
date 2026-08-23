@@ -193,21 +193,6 @@ where
         }
     }
 
-    fn apply_rotary_emb<C>(
-        &self,
-        client: &C,
-        q: &boostr::autograd::Var<R>,
-        k: &boostr::autograd::Var<R>,
-    ) -> Result<(boostr::autograd::Var<R>, boostr::autograd::Var<R>)>
-    where
-        C: boostr::RuntimeClient<R> + boostr::RoPEOps<R>,
-    {
-        Ok((
-            client.apply_rope(q, &self.cos, &self.sin)?,
-            client.apply_rope(k, &self.cos, &self.sin)?,
-        ))
-    }
-
     fn trainable_parameters(&self) -> Vec<(boostr::autograd::TensorId, &boostr::autograd::Var<R>)> {
         Vec::new()
     }
@@ -850,7 +835,8 @@ where
             + boostr::RoPEOps<R>
             + boostr::TensorOps<R>
             + boostr::BinaryOps<R>
-            + boostr::ScalarOps<R>,
+            + boostr::ScalarOps<R>
+            + boostr::NormalizationOps<R>,
         R::Client: boostr::FlashAttentionOps<R>
             + boostr::TensorOps<R>
             + boostr::BinaryOps<R>
@@ -862,48 +848,35 @@ where
                 reason: format!("attention input must be [batch, seq, hidden], got {shape:?}"),
             });
         }
-        let (b_sz, seq_len) = (shape[0], shape[1]);
 
         // Project to Q, K, V using boostr's Var-based Linear primitive.
         let q = self.q_proj.forward(client, x)?;
         let k = self.k_proj.forward(client, x)?;
         let v = self.v_proj.forward(client, x)?;
 
-        // Q: [B, Seq, H, D] -> [B, H, Seq, D]
-        let q = boostr::autograd::var_reshape(&q, &[b_sz, seq_len, self.num_heads, self.head_dim])?;
-        let q = boostr::autograd::var_permute(&q, &[0, 2, 1, 3])?;
-        let q = boostr::nn::var_contiguous(&q)?;
-
-        // K, V: [B, Seq, KV_H, D] -> [B, KV_H, Seq, D]
-        let k =
-            boostr::autograd::var_reshape(&k, &[b_sz, seq_len, self.num_kv_heads, self.head_dim])?;
-        let k = boostr::autograd::var_permute(&k, &[0, 2, 1, 3])?;
-        let k = boostr::nn::var_contiguous(&k)?;
-
-        let v =
-            boostr::autograd::var_reshape(&v, &[b_sz, seq_len, self.num_kv_heads, self.head_dim])?;
-        let v = boostr::autograd::var_permute(&v, &[0, 2, 1, 3])?;
-        let v = boostr::nn::var_contiguous(&v)?;
-
-        // Apply boostr RoPE primitive, then boostr FlashAttention primitive.
-        let (q, k) = self.rope.apply_rotary_emb(client, &q, &k)?;
-        let output = boostr::var_flash_attention(
+        // Everything between the projections and `o_proj` — reshape/permute,
+        // contiguous Q/K, RoPE, the fused kernel, flatten back — lives in
+        // boostr so this block cannot drift from every other dense block.
+        let spec = boostr::model::AttentionCoreSpec {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            // QK-norm is not part of this block today.
+            q_norm: None,
+            k_norm: None,
+            use_alibi: false,
+            sliding_window: self.sliding_window,
+            // Ignored by `attention_core_flash`; stated for honesty.
+            kernel: boostr::model::AttentionKernel::Flash,
+        };
+        let output = boostr::model::attention_core_flash(
+            client,
             &q,
             &k,
             &v,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            true,
-            self.sliding_window,
-        )?;
-
-        // [B, H, Seq, D] -> [B, Seq, H, D] -> [B, Seq, Hidden]
-        let output = boostr::autograd::var_permute(&output, &[0, 2, 1, 3])?;
-        let output = boostr::nn::var_contiguous(&output)?;
-        let output = boostr::autograd::var_reshape(
-            &output,
-            &[b_sz, seq_len, self.num_heads * self.head_dim],
+            &self.rope.cos,
+            &self.rope.sin,
+            &spec,
         )?;
 
         self.o_proj.forward(client, &output)
@@ -2526,6 +2499,7 @@ where
             + boostr::ConvOps<R>
             + boostr::QuantMatmulOps<R>
             + boostr::RoPEOps<R>
+            + boostr::NormalizationOps<R>
             + boostr::TypeConversionOps<R>,
         R::Client: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
