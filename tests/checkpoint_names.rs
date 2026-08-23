@@ -1,0 +1,303 @@
+//! Golden-name safety net for `LitGPT::extend_block_named_trainable`
+//! (`src/model.rs`, dense-attention arm around line 4391).
+//!
+//! `load_checkpoint_into_model` keys every tensor by NAME and hard-errors on
+//! a missing one (see `src/model.rs` around `missing.is_empty()`). A single
+//! renamed parameter in the dense-attention block therefore makes every
+//! existing checkpoint unloadable. This file hardcodes the exact name set for
+//! three configurations so an upcoming refactor of that block cannot rename
+//! a parameter without a test failing here first.
+//!
+//! Golden lists are written out literally, not generated from
+//! `named_parameters` itself — generating them from the function under test
+//! would make the assertion vacuous.
+
+use std::collections::{BTreeSet, HashMap};
+
+use boostr::tensor::TensorId;
+use boostr::{CpuClient, CpuDevice, CpuRuntime, Tensor, VarBuilder, VarMap};
+use oxidizr::config::{DTypePrecision, LoraConfig, OxidizrModelConfig};
+use oxidizr::model::{
+    load_checkpoint_into_model, save_checkpoint_from_params, FrozenParams, LitGPT,
+};
+
+/// A small dense-attention config: no `mamba_layers`, no `kv_latent_dim`
+/// (so `Block::new` takes the `LegacyAttention` arm, not MLA), no
+/// `num_experts` (so the FFN is a plain MLP, not MoE). Two layers is enough
+/// to prove per-layer indices are named correctly while staying fast.
+fn dense_cfg() -> OxidizrModelConfig {
+    OxidizrModelConfig {
+        name: "checkpoint-names-test".to_string(),
+        hidden_size: 8,
+        num_layers: 2,
+        num_heads: 2,
+        kv_heads: None,
+        kv_latent_dim: None,
+        q_latent_dim: None,
+        d_rope: None,
+        num_experts: None,
+        experts_per_tok: None,
+        shared_expert_enabled: None,
+        intermediate_size: Some(16),
+        mamba_layers: None,
+        mamba2_num_heads: None,
+        mamba2_head_dim: None,
+        mamba2_state_size: None,
+        mamba2_chunk_size: None,
+        mamba2_n_groups: None,
+        mamba2_conv_kernel: None,
+        mamba2_expand: None,
+        mamba3_enabled: None,
+        mamba3_complex_rope: None,
+        mamba3_mimo_rank: None,
+        mamba3_use_conv: None,
+        vocab_size: 16,
+        grow_vocab: false,
+        tie_word_embeddings: false,
+        tokenizer_vocab: "custom".to_string(),
+        max_seq_len: 8,
+        rope_theta: 10000.0,
+        rope_scaling: None,
+        sliding_window: None,
+        speech_vocab: None,
+        lora: None,
+        dtype: DTypePrecision::F32,
+    }
+}
+
+/// `dense_cfg`, with LoRA adapters on `q_proj` and `v_proj`. Proves the
+/// `.lora_a` / `.lora_b` names `push_named_projection` emits are locked too.
+fn lora_cfg() -> OxidizrModelConfig {
+    let mut cfg = dense_cfg();
+    cfg.name = "checkpoint-names-lora-test".to_string();
+    cfg.lora = Some(LoraConfig {
+        rank: 2,
+        alpha: 4.0,
+        target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+    });
+    cfg
+}
+
+/// Build a model through the real public construction path: a fresh
+/// `VarMap`/`VarBuilder`, then `LitGPT::new`, the same wiring
+/// `commands::train` uses (minus the seed, which is irrelevant to names).
+fn build(cfg: &OxidizrModelConfig) -> LitGPT<CpuRuntime> {
+    let device = CpuDevice::new();
+    let client = CpuClient::new(device.clone());
+    let mut varmap = VarMap::<CpuRuntime>::new();
+    let mut vb = VarBuilder::new(&mut varmap, &device);
+    LitGPT::<CpuRuntime>::new(cfg, &mut vb, &client).expect("dense model must build")
+}
+
+/// `model.named_parameters()`'s names, sorted.
+fn sorted_names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
+    let mut names: Vec<String> = model
+        .named_parameters()
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Assert `model`'s parameter-name set equals `golden` exactly, reporting
+/// which names are missing and which are unexpected rather than a bare
+/// "left != right" on a multi-element vec.
+fn assert_names_match(model: &LitGPT<CpuRuntime>, golden: &[&str], config_label: &str) {
+    assert_name_set(&sorted_names(model), golden, config_label);
+}
+
+/// The set comparison itself, over any name list — used both for a model's
+/// in-memory parameters and for the keys actually written to a checkpoint file.
+fn assert_name_set(actual: &[String], golden: &[&str], config_label: &str) {
+    let actual_set: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
+    let golden_set: BTreeSet<&str> = golden.iter().copied().collect();
+
+    let missing: Vec<&str> = golden_set.difference(&actual_set).copied().collect();
+    let unexpected: Vec<&str> = actual_set.difference(&golden_set).copied().collect();
+
+    assert!(
+        missing.is_empty() && unexpected.is_empty(),
+        "{config_label}: parameter-name set diverged from the golden list.\n\
+         missing (golden expects these, model does not have them): {missing:?}\n\
+         unexpected (model has these, golden does not expect them): {unexpected:?}"
+    );
+}
+
+/// `dense_cfg()`'s parameter names, sorted. Two layers x
+/// (input_layernorm + q/k/v/o_proj + post_attention_layernorm +
+/// gate/up/down_proj) plus embed_tokens/norm/lm_head (not tied).
+const DENSE_GOLDEN: &[&str] = &[
+    "embed_tokens.weight",
+    "layers.0.input_layernorm.weight",
+    "layers.0.mlp.down_proj.weight",
+    "layers.0.mlp.gate_proj.weight",
+    "layers.0.mlp.up_proj.weight",
+    "layers.0.post_attention_layernorm.weight",
+    "layers.0.self_attn.k_proj.weight",
+    "layers.0.self_attn.o_proj.weight",
+    "layers.0.self_attn.q_proj.weight",
+    "layers.0.self_attn.v_proj.weight",
+    "layers.1.input_layernorm.weight",
+    "layers.1.mlp.down_proj.weight",
+    "layers.1.mlp.gate_proj.weight",
+    "layers.1.mlp.up_proj.weight",
+    "layers.1.post_attention_layernorm.weight",
+    "layers.1.self_attn.k_proj.weight",
+    "layers.1.self_attn.o_proj.weight",
+    "layers.1.self_attn.q_proj.weight",
+    "layers.1.self_attn.v_proj.weight",
+    "lm_head.weight",
+    "norm.weight",
+];
+
+/// `lora_cfg()`'s parameter names: `DENSE_GOLDEN` plus `.lora_a`/`.lora_b`
+/// for `q_proj` and `v_proj` in each layer (their `.weight` entries stay,
+/// since the base is frozen, not dropped from `named_parameters`).
+const LORA_GOLDEN: &[&str] = &[
+    "embed_tokens.weight",
+    "layers.0.input_layernorm.weight",
+    "layers.0.mlp.down_proj.weight",
+    "layers.0.mlp.gate_proj.weight",
+    "layers.0.mlp.up_proj.weight",
+    "layers.0.post_attention_layernorm.weight",
+    "layers.0.self_attn.k_proj.weight",
+    "layers.0.self_attn.o_proj.weight",
+    "layers.0.self_attn.q_proj.lora_a",
+    "layers.0.self_attn.q_proj.lora_b",
+    "layers.0.self_attn.q_proj.weight",
+    "layers.0.self_attn.v_proj.lora_a",
+    "layers.0.self_attn.v_proj.lora_b",
+    "layers.0.self_attn.v_proj.weight",
+    "layers.1.input_layernorm.weight",
+    "layers.1.mlp.down_proj.weight",
+    "layers.1.mlp.gate_proj.weight",
+    "layers.1.mlp.up_proj.weight",
+    "layers.1.post_attention_layernorm.weight",
+    "layers.1.self_attn.k_proj.weight",
+    "layers.1.self_attn.o_proj.weight",
+    "layers.1.self_attn.q_proj.lora_a",
+    "layers.1.self_attn.q_proj.lora_b",
+    "layers.1.self_attn.q_proj.weight",
+    "layers.1.self_attn.v_proj.lora_a",
+    "layers.1.self_attn.v_proj.lora_b",
+    "layers.1.self_attn.v_proj.weight",
+    "lm_head.weight",
+    "norm.weight",
+];
+
+#[test]
+fn dense_attention_config_has_the_golden_parameter_names() {
+    let model = build(&dense_cfg());
+    assert_names_match(&model, DENSE_GOLDEN, "dense config");
+}
+
+#[test]
+fn lora_on_q_and_v_proj_adds_exactly_the_adapter_names() {
+    let model = build(&lora_cfg());
+    assert_names_match(
+        &model,
+        LORA_GOLDEN,
+        "dense config with LoRA on q_proj/v_proj",
+    );
+}
+
+/// Freezing part of the base must not change which NAMES exist — only
+/// which ones `named_trainable_parameters` reports as trainable.
+/// `named_parameters` is documented as "every parameter a checkpoint must
+/// carry, frozen ones included", so the golden list here is `DENSE_GOLDEN`
+/// unchanged.
+#[test]
+fn freezing_part_of_the_base_does_not_change_the_name_set() {
+    let model = build(&dense_cfg());
+
+    let to_freeze = [
+        "layers.0.self_attn.k_proj.weight",
+        "layers.1.mlp.gate_proj.weight",
+    ];
+    let ids: Vec<TensorId> = model
+        .named_parameters()
+        .into_iter()
+        .filter(|(name, _, _)| to_freeze.contains(&name.as_str()))
+        .map(|(_, id, _)| id)
+        .collect();
+    assert_eq!(
+        ids.len(),
+        to_freeze.len(),
+        "expected to find every name in `to_freeze` among the model's parameters"
+    );
+
+    let frozen_model = model
+        .with_frozen_parameters(FrozenParams::from_ids(ids))
+        .expect("rebuilding with a partially frozen base must succeed");
+
+    assert_names_match(
+        &frozen_model,
+        DENSE_GOLDEN,
+        "dense config with part of the base frozen",
+    );
+}
+
+fn temp_checkpoint_path(tag: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!(
+            "oxidizr-checkpoint-names-{tag}-{}-{unique}.safetensors",
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A checkpoint saved from a dense-attention model must load back into a
+/// freshly built model of the SAME config. This exercises
+/// `save_checkpoint_from_params` and `load_checkpoint_into_model`
+/// (`src/model.rs`) the same way `commands/train.rs` does on save/resume: it
+/// is these two functions' name-keyed matching against
+/// `extend_block_named_trainable`'s output that a renamed parameter breaks.
+#[test]
+fn dense_checkpoint_round_trips_through_save_and_load() {
+    let cfg = dense_cfg();
+    let model = build(&cfg);
+
+    // Every parameter, not just the trainable ones: `save_checkpoint_from_params`
+    // falls back to `var.tensor()` for a frozen entry absent from this map, but
+    // nothing here is frozen, so handing it the full set (as
+    // `commands/train.rs`'s optimizer-parameter map does for the trainable
+    // subset) is the straightforward, correct input.
+    let params: HashMap<TensorId, Tensor<CpuRuntime>> = model
+        .named_parameters()
+        .into_iter()
+        .map(|(_, id, var)| (id, var.tensor().clone()))
+        .collect();
+
+    let path = temp_checkpoint_path("roundtrip");
+    save_checkpoint_from_params(&path, &model, &params).expect("checkpoint save must succeed");
+
+    // Assert the ON-DISK keys, not just that save->load agrees with itself.
+    //
+    // A round-trip alone cannot catch a rename: save and load run the same code,
+    // so a renamed parameter is written and read back consistently and the
+    // reload succeeds. Checking the keys actually present in the file is what
+    // pins the checkpoint's external contract — the thing another tool, or a
+    // future version of this one, has to agree with.
+    let mut safetensors =
+        boostr::format::SafeTensors::open(&path).expect("saved checkpoint must be readable");
+    let on_disk = safetensors
+        .load_all::<CpuRuntime>(&CpuDevice::new())
+        .expect("saved checkpoint tensors must load");
+    let mut disk_names: Vec<String> = on_disk.keys().cloned().collect();
+    disk_names.sort();
+    assert_name_set(&disk_names, DENSE_GOLDEN, "on-disk checkpoint keys");
+
+    let mut reloaded = build(&cfg);
+    let result = load_checkpoint_into_model(&mut reloaded, &path);
+    let _ = std::fs::remove_file(&path);
+
+    result.expect(
+        "a checkpoint saved from this exact config must load back into a fresh model of the \
+         same config without error",
+    );
+}
