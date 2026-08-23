@@ -22,7 +22,14 @@ exclude = [
 ]
 
 [features]
-default = []
+# `f16` is on by default: `DTypePrecision` offers F16 and BF16 unconditionally,
+# so without it a `dtype: bf16` config parses, validates, builds a model, and
+# then dies inside the first op with "Unsupported dtype BF16". Half precision is
+# not optional for training a modern LLM — a 1.7B model in f32 does not fit on a
+# consumer GPU once AdamW's two moment buffers are counted.
+default = ["f16"]
+# Half-precision (F16 / BF16) dtype support.
+f16 = ["boostr/f16"]
 # CUDA GPU acceleration (via boostr CubeCL backend)
 cuda = ["boostr/cuda"]
 # NCCL backend for high-performance multi-GPU gradient synchronization
