@@ -1,4 +1,4 @@
-use crate::prelude::{DType, Embedding, Init, Linear, Result, RmsNorm, Tensor, VarBuilder};
+use crate::prelude::{DType, Embedding, Init, Linear, Result, RmsNorm, Tensor, VarBuilder, VarMap};
 
 use crate::config::{LoraConfig, OxidizrModelConfig};
 use boostr::model::config::{default_rms_norm_eps, ModelConfig};
@@ -627,6 +627,17 @@ struct AttnProjWithIds<R: boostr::Runtime> {
 /// order, for the `*_with_ids` rebuild path.
 type MlpWeightsWithIds<R> = (AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>);
 
+/// `CausalSelfAttention`'s four projections, for the `*_with_ids` rebuild
+/// path. Named fields keep `CausalSelfAttention::with_ids` within clippy's
+/// argument limit, and rule out swapping two same-typed projections at the
+/// call site, which four positional arguments would allow.
+struct CausalAttnProjsWithIds<R: boostr::Runtime> {
+    q_proj: AttnProjWithIds<R>,
+    k_proj: AttnProjWithIds<R>,
+    v_proj: AttnProjWithIds<R>,
+    o_proj: AttnProjWithIds<R>,
+}
+
 /// One MoE FFN's routed experts, its shared expert, and its router gate, for
 /// the `*_with_ids` rebuild path.
 type MoeWeightsWithIds<R> = (
@@ -767,14 +778,17 @@ where
 
     fn with_ids(
         cfg: &ModelConfig,
-        q_proj: AttnProjWithIds<R>,
-        k_proj: AttnProjWithIds<R>,
-        v_proj: AttnProjWithIds<R>,
-        o_proj: AttnProjWithIds<R>,
+        projs: CausalAttnProjsWithIds<R>,
         rope_cos: (Tensor<R>, boostr::autograd::TensorId),
         rope_sin: (Tensor<R>, boostr::autograd::TensorId),
         frozen: &FrozenParams,
     ) -> Result<Self> {
+        let CausalAttnProjsWithIds {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+        } = projs;
         let attn_cfg = cfg
             .attention
             .as_ref()
@@ -1023,7 +1037,7 @@ where
             client,
         )?;
         let (lora_a_id, lora_b_id) = (lora_a.id(), lora_b.id());
-        Ok(MaybeLora::Lora(boostr::nn::LoraLinear::with_ids(
+        Ok(MaybeLora::Lora(Box::new(boostr::nn::LoraLinear::with_ids(
             base,
             lora_a,
             lora_a_id,
@@ -1031,7 +1045,7 @@ where
             lora_b_id,
             lora.alpha,
             INITIALIZED_TRAINABLE,
-        )))
+        ))))
     }
 
     /// Rebuild one projection from optimizer-updated tensors, preserving every
@@ -1087,9 +1101,9 @@ where
             name,
             &[(a_name.as_str(), lora.a.1), (b_name.as_str(), lora.b.1)],
         )?;
-        Ok(MaybeLora::Lora(boostr::nn::LoraLinear::with_ids(
+        Ok(MaybeLora::Lora(Box::new(boostr::nn::LoraLinear::with_ids(
             base, lora.a.0, lora.a.1, lora.b.0, lora.b.1, lora.alpha, trainable,
-        )))
+        ))))
     }
 
     fn ensure_shape(name: &str, weight: &Tensor<R>, expected_shape: &[usize]) -> Result<()> {
@@ -2466,7 +2480,16 @@ where
 
             BlockType::LegacyAttention {
                 attn: Box::new(CausalSelfAttention::with_ids(
-                    cfg, q_proj, k_proj, v_proj, o_proj, rope_cos, rope_sin, frozen,
+                    cfg,
+                    CausalAttnProjsWithIds {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        o_proj,
+                    },
+                    rope_cos,
+                    rope_sin,
+                    frozen,
                 )?),
                 ffn: FfnLayer::with_ids(cfg, mlp, moe, frozen)?,
                 input_layernorm: Self::rms_norm_with_id(
@@ -3036,6 +3059,34 @@ where
             return Ok(model);
         }
         model.with_frozen_parameters(frozen)
+    }
+
+    /// Build a fresh model with `config.trainer.seed` applied to the
+    /// `VarBuilder`, exactly as `commands::train::run_train_with_runtime`
+    /// does before calling `LitGPT::new`.
+    ///
+    /// `commands::train` and integration tests both go through this instead
+    /// of each inlining the `with_seed` call, so the two can never drift
+    /// apart into "trainer seeds, test doesn't" (or vice versa).
+    pub fn new_seeded<C>(
+        config: &crate::config::LitConfig,
+        varmap: &mut VarMap<R>,
+        device: &R::Device,
+        client: &C,
+    ) -> Result<Self>
+    where
+        C: boostr::RuntimeClient<R>
+            + boostr::RandomOps<R>
+            + boostr::ScalarOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::CompareOps<R>
+            + boostr::TensorOps<R>,
+    {
+        let mut vb = VarBuilder::new(varmap, device);
+        if let Some(seed) = config.trainer.seed {
+            vb = vb.with_seed(seed);
+        }
+        Self::new(&config.model, &mut vb, client)
     }
 
     /// The base-weight ids of every LoRA-adapted projection: attention, MLP,

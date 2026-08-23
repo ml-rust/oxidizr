@@ -258,16 +258,42 @@ impl DTypePrecision {
             DTypePrecision::BF16 => crate::prelude::DType::BF16,
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+/// Parses the CLI/YAML spellings of each precision.
+///
+/// This is the `FromStr` trait rather than an inherent `from_str`: an inherent
+/// method of that name shadows the trait one at call sites, so a caller writing
+/// `"f32".parse()` and a caller writing `DTypePrecision::from_str("f32")` could
+/// silently reach different code.
+impl std::str::FromStr for DTypePrecision {
+    type Err = UnknownDTypePrecision;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "f32" | "fp32" | "float32" => Some(Self::F32),
-            "f16" | "fp16" | "float16" => Some(Self::F16),
-            "bf16" | "bfloat16" => Some(Self::BF16),
-            _ => None,
+            "f32" | "fp32" | "float32" => Ok(Self::F32),
+            "f16" | "fp16" | "float16" => Ok(Self::F16),
+            "bf16" | "bfloat16" => Ok(Self::BF16),
+            _ => Err(UnknownDTypePrecision(s.to_string())),
         }
     }
 }
+
+/// The string given for a precision matched none of the accepted spellings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownDTypePrecision(pub String);
+
+impl std::fmt::Display for UnknownDTypePrecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown dtype precision '{}' (expected one of: f32, f16, bf16)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnknownDTypePrecision {}
 
 impl std::fmt::Display for DTypePrecision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -408,6 +434,23 @@ pub struct TrainerConfig {
     /// Distributed training configuration
     #[serde(default)]
     pub distributed: DistributedConfig,
+
+    /// Base seed for deterministic weight initialization, passed to
+    /// `VarBuilder::with_seed`. `take_or_init_tensor` mixes this with each
+    /// tensor's full parameter name (FNV-1a + SplitMix64), so init is
+    /// order-independent and reproducible across runs. `None` keeps the
+    /// prior unseeded (RNG-driven) behavior.
+    ///
+    /// On `TrainerConfig`, not `OxidizrModelConfig`: `compute_model_config_hash`
+    /// hashes `OxidizrModelConfig` to gate checkpoint-resume compatibility, and
+    /// a seed changes neither tensor shapes nor which tensors exist — only the
+    /// values they start from. Unlike `lora`/`speech_vocab`, which alter the
+    /// parameter set and so must be reflected (or explicitly stripped) in that
+    /// hash, `seed` belongs with the other optimizer/run knobs on
+    /// `TrainerConfig` and needs no stripping because it was never in the
+    /// hashed struct to begin with.
+    #[serde(default)]
+    pub seed: Option<u64>,
 
     // GRPO (Group Relative Policy Optimization) config - Phase 2
     #[allow(dead_code)] // Phase 2: GRPO implementation
@@ -558,6 +601,7 @@ impl LitConfig {
                 warmup_ratio: Some(0.1), // 10% warmup
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
+                seed: None,
                 group_size: 4, // GRPO: 4 rollouts per prompt
                 beta_kl: 0.04, // GRPO: KL penalty coefficient
             },
@@ -643,6 +687,7 @@ impl LitConfig {
                 warmup_ratio: Some(0.1), // 10% warmup
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
+                seed: None,
                 group_size: 4, // GRPO: 4 rollouts per prompt
                 beta_kl: 0.04, // GRPO: KL penalty coefficient
             },

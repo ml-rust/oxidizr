@@ -1,20 +1,10 @@
-mod commands;
-mod config;
-mod config_convert;
-mod data;
-mod distributed;
-mod model;
-mod prelude;
-mod trainer;
-mod vocab;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use commands::{MergeArgs, PackArgs, TrainArgs};
+use oxidizr::commands::{self, MergeArgs, PackArgs, TrainArgs};
 
 #[cfg(feature = "huggingface")]
-use commands::PushArgs;
+use oxidizr::commands::PushArgs;
 
 /// Oxidizr: Rust-based ML training framework for GPT-style language models
 #[derive(Parser, Debug)]

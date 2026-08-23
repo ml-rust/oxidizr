@@ -2,7 +2,7 @@
 //!
 //! This module contains the training logic, extracted from the original main.rs.
 
-use crate::prelude::{DType, Tensor, VarBuilder, VarMap};
+use crate::prelude::{DType, Tensor, VarMap};
 use anyhow::Result;
 use boostr::autograd::Var;
 use boostr::ops::{FusedOptimizerOps, TensorOps};
@@ -378,7 +378,7 @@ where
     }
 
     // Apply dtype override
-    if let Some(dtype) = DTypePrecision::from_str(&args.dtype) {
+    if let Ok(dtype) = args.dtype.parse::<DTypePrecision>() {
         if dtype != config.model.dtype {
             if !headless {
                 println!(
@@ -425,8 +425,7 @@ where
     // Model migration owns initialization through boostr VarBuilder/Init and must
     // expose trainable parameters with stable TensorIds.
     let mut varmap = VarMap::<R>::new();
-    let mut vb = VarBuilder::new(&mut varmap, &device);
-    let mut model = LitGPT::<R>::new(&config.model, &mut vb, &client)?;
+    let mut model = LitGPT::<R>::new_seeded(&config, &mut varmap, &device, &client)?;
 
     // Load checkpoint if resuming
     let start_step = if let Some(ref resume_arg) = args.resume {

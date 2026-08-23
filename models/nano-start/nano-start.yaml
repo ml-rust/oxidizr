@@ -286,6 +286,15 @@ trainer:
   warmup_ratio: null
 
   # ---------------------------------------------------------------------------
+  # REPRODUCIBILITY
+  # ---------------------------------------------------------------------------
+  # seed: Base seed for deterministic weight initialization (null = random)
+  #   - Two runs with the same seed start from identical weights
+  #   - Data order and dropout are unaffected - this only seeds init
+
+  seed: 42
+
+  # ---------------------------------------------------------------------------
   # GRPO CONFIG (Advanced - Phase 2)
   # ---------------------------------------------------------------------------
   # Group Relative Policy Optimization for RLHF
