@@ -1404,7 +1404,7 @@ where
         } else {
             client.cast(tensor, DType::F32)?
         };
-        Ok(tensor.contiguous()?.to_vec::<f32>())
+        Ok(tensor.contiguous()?.try_to_vec::<f32>()?)
     }
 }
 
@@ -3023,7 +3023,7 @@ where
             } else {
                 client.cast(&tensor, DType::F32)?.contiguous()?
             };
-            let vals = tensor.to_vec::<f32>();
+            let vals = tensor.try_to_vec::<f32>()?;
             if !vals.is_empty() {
                 let rms = (vals.iter().map(|v| v * v).sum::<f32>() / vals.len() as f32).sqrt();
                 let max_abs = vals.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
@@ -3497,7 +3497,7 @@ where
             // `data.rs` uploads token ids as I64, so read them as i64: `to_vec::<T>`
             // sizes its copy from `T`, not the tensor's dtype.
             let ids_tensor = input_ids.contiguous()?;
-            let ids = ids_tensor.to_vec::<i64>();
+            let ids = ids_tensor.try_to_vec::<i64>()?;
             let seq_len = input_ids.shape().last().copied().unwrap_or(0);
             eprintln!(
                 "[Model forward] input_ids shape={:?}, first 10 tokens: {:?}",
@@ -3526,7 +3526,7 @@ where
             } else {
                 client.cast(&x_tensor, DType::F32)?.contiguous()?
             };
-            let x_vec = x_tensor.to_vec::<f32>();
+            let x_vec = x_tensor.try_to_vec::<f32>()?;
             let hidden_size = x.shape().last().copied().unwrap_or(0);
             eprintln!(
                 "[Model forward] embed_out shape={:?}, hidden_size={}",
