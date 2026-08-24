@@ -323,7 +323,7 @@ where
 
         // Convert to tensor
         let raw_tensor =
-            Tensor::<R>::try_from_slice(&ids, &[self.batch_size, self.seq_len + 1], &self.device)?;
+            Tensor::<R>::from_slice(&ids, &[self.batch_size, self.seq_len + 1], &self.device)?;
 
         // Split into inputs (0..end-1) and targets (1..end).
         // `narrow` returns a strided VIEW; downstream code reshapes these
@@ -338,7 +338,7 @@ where
         let loss_mask = match &self.speech_vocab {
             Some(vocab) => {
                 let mask = audio_target_mask(vocab, slice, self.batch_size, self.seq_len);
-                Some(Tensor::<R>::try_from_slice(
+                Some(Tensor::<R>::from_slice(
                     &mask,
                     &[self.batch_size, self.seq_len],
                     &self.device,
@@ -603,19 +603,16 @@ where
         let target_ids: Vec<i64> = batch.targets.iter().map(|&t| t as i64).collect();
 
         // Transfer to the runtime device (this is the only blocking device upload)
-        let inputs = Tensor::<R>::try_from_slice(
-            &input_ids,
-            &[batch.batch_size, batch.seq_len],
-            &self.device,
-        )?;
-        let targets = Tensor::<R>::try_from_slice(
+        let inputs =
+            Tensor::<R>::from_slice(&input_ids, &[batch.batch_size, batch.seq_len], &self.device)?;
+        let targets = Tensor::<R>::from_slice(
             &target_ids,
             &[batch.batch_size, batch.seq_len],
             &self.device,
         )?;
 
         let loss_mask = match &batch.loss_mask {
-            Some(mask) => Some(Tensor::<R>::try_from_slice(
+            Some(mask) => Some(Tensor::<R>::from_slice(
                 mask,
                 &[batch.batch_size, batch.seq_len],
                 &self.device,

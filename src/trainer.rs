@@ -1424,7 +1424,7 @@ mod tests {
     use std::sync::{Arc, Weak};
 
     fn f32_tensor(values: &[f32], device: &CpuDevice) -> Tensor<CpuRuntime> {
-        Tensor::<CpuRuntime>::try_from_slice(values, &[values.len()], device).unwrap()
+        Tensor::<CpuRuntime>::from_slice(values, &[values.len()], device).unwrap()
     }
 
     /// One micro-batch's scaled loss: `w * x + w * b`.

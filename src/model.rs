@@ -2061,11 +2061,11 @@ where
             FfnLayer::Mlp(mlp) => {
                 let out = mlp.forward(client, x)?;
                 let load_balance_loss = boostr::autograd::Var::new(
-                    Tensor::<R>::try_zeros(&[1], DType::F32, x.tensor().device())?,
+                    Tensor::<R>::zeros(&[1], DType::F32, x.tensor().device())?,
                     false,
                 );
                 let z_loss = boostr::autograd::Var::new(
-                    Tensor::<R>::try_zeros(&[1], DType::F32, x.tensor().device())?,
+                    Tensor::<R>::zeros(&[1], DType::F32, x.tensor().device())?,
                     false,
                 );
                 Ok((out, load_balance_loss, z_loss))
@@ -5036,7 +5036,7 @@ where
     // would size the copy from `f32` and read past the end of a bf16 buffer.
     let bytes = tensor.to_bytes()?;
 
-    Tensor::<boostr::CpuRuntime>::try_from_bytes(&bytes, &shape, dtype, cpu_device)
+    Tensor::<boostr::CpuRuntime>::from_bytes(&bytes, &shape, dtype, cpu_device)
         .map_err(boostr::error::Error::Numr)
 }
 
@@ -5093,23 +5093,16 @@ mod tie_word_embeddings_tests {
     fn tiny_model(tie_word_embeddings: bool) -> LitGPT<CpuRuntime> {
         let cfg = tiny_cfg(tie_word_embeddings);
         let device = CpuDevice::new();
-        let embed = Tensor::<CpuRuntime>::try_zeros(
-            &[cfg.vocab_size, cfg.hidden_size],
-            DType::F32,
-            &device,
-        )
-        .unwrap();
-        let norm =
-            Tensor::<CpuRuntime>::try_zeros(&[cfg.hidden_size], DType::F32, &device).unwrap();
+        let embed =
+            Tensor::<CpuRuntime>::zeros(&[cfg.vocab_size, cfg.hidden_size], DType::F32, &device)
+                .unwrap();
+        let norm = Tensor::<CpuRuntime>::zeros(&[cfg.hidden_size], DType::F32, &device).unwrap();
         // A distinct tensor/id from embed_tokens, standing in for whatever a
         // checkpoint load would produce for an UNTIED model. When tied,
         // `with_ids` must discard this and re-alias from embed_tokens instead.
-        let lm_head = Tensor::<CpuRuntime>::try_zeros(
-            &[cfg.vocab_size, cfg.hidden_size],
-            DType::F32,
-            &device,
-        )
-        .unwrap();
+        let lm_head =
+            Tensor::<CpuRuntime>::zeros(&[cfg.vocab_size, cfg.hidden_size], DType::F32, &device)
+                .unwrap();
 
         LitGPT::with_ids(
             &cfg,
@@ -5330,7 +5323,7 @@ mod attention_extras_reach_dense_attention_tests {
         let device = CpuDevice::new();
         let values = vec![1e-3f32; head_dim];
         let input = Var::new(
-            Tensor::<CpuRuntime>::try_from_slice(&values, &[1, 1, 1, head_dim], &device).unwrap(),
+            Tensor::<CpuRuntime>::from_slice(&values, &[1, 1, 1, head_dim], &device).unwrap(),
             false,
         );
 
@@ -5535,7 +5528,7 @@ mod head_dim_tests {
         let model = build(&explicit_head_dim_cfg());
 
         let input_ids =
-            Tensor::<CpuRuntime>::try_from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
+            Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
         let output = model
             .forward(&client, &input_ids)
             .expect("forward with explicit head_dim must succeed");
@@ -6158,7 +6151,7 @@ mod lora_tests {
 
         // i64, matching what `data.rs` uploads (it casts the u32 stream first).
         let input_ids =
-            Tensor::<CpuRuntime>::try_from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
+            Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
         let output = model.forward(&client, &input_ids).expect("forward");
         let loss =
             boostr::autograd::var_sum(&output.logits, &[0, 1, 2], false, &client).expect("reduce");
@@ -6425,7 +6418,7 @@ mod lora_tests {
 
         // i64, matching what `data.rs` uploads (it casts the u32 stream first).
         let input_ids =
-            Tensor::<CpuRuntime>::try_from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
+            Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
         let output = model.forward(&client, &input_ids).expect("forward");
         let loss =
             boostr::autograd::var_sum(&output.logits, &[0, 1, 2], false, &client).expect("reduce");
@@ -6475,7 +6468,7 @@ mod lora_tests {
                 .collect();
             params.insert(
                 lora_b.id(),
-                Tensor::<CpuRuntime>::try_from_slice(&values, &shape, device).unwrap(),
+                Tensor::<CpuRuntime>::from_slice(&values, &shape, device).unwrap(),
             );
         }
         model.rebuild_with_parameters(&params).expect("rebuild")
@@ -6484,7 +6477,7 @@ mod lora_tests {
     fn logits(model: &LitGPT<CpuRuntime>, client: &CpuClient, device: &CpuDevice) -> Vec<f32> {
         // i64, matching what `data.rs` uploads.
         let input_ids =
-            Tensor::<CpuRuntime>::try_from_slice(&[1i64, 2, 3, 4], &[1, 4], device).unwrap();
+            Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], device).unwrap();
         let output = model.forward(client, &input_ids).expect("forward");
         output
             .logits
@@ -7060,7 +7053,7 @@ mod moe_lora_tests {
     fn logits(model: &LitGPT<CpuRuntime>, client: &CpuClient, device: &CpuDevice) -> Vec<f32> {
         // i64, matching what `data.rs` uploads (it casts the u32 stream first).
         let input_ids =
-            Tensor::<CpuRuntime>::try_from_slice(&[1i64, 2, 3, 4], &[1, 4], device).unwrap();
+            Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], device).unwrap();
         let output = model.forward(client, &input_ids).expect("forward");
         output
             .logits
@@ -7113,7 +7106,7 @@ mod moe_lora_tests {
                 .collect();
             params.insert(
                 lora_b.id(),
-                Tensor::<CpuRuntime>::try_from_slice(&values, &shape, device).unwrap(),
+                Tensor::<CpuRuntime>::from_slice(&values, &shape, device).unwrap(),
             );
         }
         model.rebuild_with_parameters(&params).expect("rebuild")
@@ -7210,7 +7203,7 @@ mod moe_lora_tests {
 
         // i64, matching what `data.rs` uploads (it casts the u32 stream first).
         let input_ids =
-            Tensor::<CpuRuntime>::try_from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
+            Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
         let output = model.forward(&client, &input_ids).expect("forward");
         let loss =
             boostr::autograd::var_sum(&output.logits, &[0, 1, 2], false, &client).expect("reduce");
@@ -8125,7 +8118,7 @@ mod legacy_moe_tests {
 
         // i64, matching what `data.rs` uploads (it casts the u32 stream first).
         let input_ids =
-            Tensor::<CpuRuntime>::try_from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
+            Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
         let output = model.forward(&client, &input_ids).expect("forward");
         let loss =
             boostr::autograd::var_sum(&output.logits, &[0, 1, 2], false, &client).expect("reduce");

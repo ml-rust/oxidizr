@@ -224,13 +224,8 @@ where
 {
     let bytes = tensor.to_bytes()?;
     let cpu_device = boostr::CpuDevice::new();
-    Tensor::<boostr::CpuRuntime>::try_from_bytes(
-        &bytes,
-        tensor.shape(),
-        tensor.dtype(),
-        &cpu_device,
-    )
-    .map_err(Error::from)
+    Tensor::<boostr::CpuRuntime>::from_bytes(&bytes, tensor.shape(), tensor.dtype(), &cpu_device)
+        .map_err(Error::from)
 }
 
 fn tensor_from_cpu<R>(tensor: &Tensor<boostr::CpuRuntime>, device: &R::Device) -> Result<Tensor<R>>
@@ -238,7 +233,7 @@ where
     R: Runtime<DType = DType>,
 {
     let bytes = tensor.to_bytes()?;
-    Tensor::<R>::try_from_bytes(&bytes, tensor.shape(), tensor.dtype(), device).map_err(Error::from)
+    Tensor::<R>::from_bytes(&bytes, tensor.shape(), tensor.dtype(), device).map_err(Error::from)
 }
 
 #[cfg(test)]
