@@ -3,7 +3,7 @@ use boostr::model::SpeechVocab;
 use boostr::runtime::Runtime;
 use memmap2::Mmap;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
@@ -105,6 +105,11 @@ where
     shard_end: usize,
     /// Speech id layout. `Some` turns on audio-only loss masking.
     speech_vocab: Option<SpeechVocab>,
+    /// File this loader was opened from, `None` for in-memory data.
+    ///
+    /// Kept so [`try_with_speech_vocab`](Self::try_with_speech_vocab) can find
+    /// the corpus layout sidecar that sits beside it.
+    source_path: Option<PathBuf>,
 }
 
 enum DataSource {
@@ -136,6 +141,7 @@ where
             shard_start: 0,
             shard_end: len,
             speech_vocab: None,
+            source_path: None,
         }
     }
 
@@ -205,6 +211,7 @@ where
             shard_start: 0,
             shard_end: len,
             speech_vocab: None,
+            source_path: Some(path_ref.to_path_buf()),
         })
     }
 
@@ -212,9 +219,30 @@ where
     ///
     /// Without it the loader emits `loss_mask: None` and training scores every
     /// position, as it did before speech support existed.
+    ///
+    /// This form does NOT check the corpus layout sidecar. Prefer
+    /// [`try_with_speech_vocab`](Self::try_with_speech_vocab) for any loader
+    /// opened from a file.
     pub fn with_speech_vocab(mut self, vocab: SpeechVocab) -> Self {
         self.speech_vocab = Some(vocab);
         self
+    }
+
+    /// Enable audio-only loss masking, first checking the corpus layout sidecar.
+    ///
+    /// If the data file has a `*.layout.json` sidecar (see
+    /// [`crate::speech_corpus`]), it records the layout the corpus was PACKED
+    /// with and MUST equal `vocab`. Disagreement is a hard error: the ids would
+    /// resolve to different codebooks and the mask would select different
+    /// positions, with nothing else in the pipeline able to notice.
+    ///
+    /// A missing sidecar is not an error — corpora packed before layouts were
+    /// recorded, and plain text corpora, have none.
+    pub fn try_with_speech_vocab(self, vocab: SpeechVocab) -> Result<Self> {
+        if let Some(path) = &self.source_path {
+            crate::speech_corpus::check_corpus_layout(path, &vocab)?;
+        }
+        Ok(self.with_speech_vocab(vocab))
     }
 
     /// Configure data sharding for multi-GPU training

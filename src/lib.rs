@@ -13,5 +13,6 @@ pub mod data;
 pub mod distributed;
 pub mod model;
 pub mod prelude;
+pub mod speech_corpus;
 pub mod trainer;
 pub mod vocab;

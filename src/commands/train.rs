@@ -625,8 +625,11 @@ where
 
     // Audio-only loss masking is opt-in: without `speech_vocab` the loader emits
     // no mask and every position is scored, exactly as before.
+    // `try_with_speech_vocab` rejects a corpus whose layout sidecar disagrees
+    // with the configured layout, rather than training on ids that mean
+    // something else.
     let base_loader = match &config.model.speech_vocab {
-        Some(vocab) => base_loader.with_speech_vocab(vocab.clone()),
+        Some(vocab) => base_loader.try_with_speech_vocab(vocab.clone())?,
         None => base_loader,
     };
 
