@@ -1177,8 +1177,11 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("create temp checkpoint dir");
         for step in steps {
-            fs::write(dir.join(format!("model_512_1b_bf16_step_{step}.safetensors")), b"")
-                .expect("write checkpoint");
+            fs::write(
+                dir.join(format!("model_512_1b_bf16_step_{step}.safetensors")),
+                b"",
+            )
+            .expect("write checkpoint");
             fs::write(dir.join(format!("checkpoint_step_{step}.meta.json")), b"{}")
                 .expect("write meta");
         }
@@ -1199,7 +1202,10 @@ mod tests {
             "a step-0 checkpoint is what `oxidizr import` writes; --resume auto must find it",
         );
         assert_eq!(step, 0);
-        assert!(path.ends_with("model_512_1b_bf16_step_0.safetensors"), "{path}");
+        assert!(
+            path.ends_with("model_512_1b_bf16_step_0.safetensors"),
+            "{path}"
+        );
     }
 
     /// Step 0 must not win over later steps just because it is now eligible.
@@ -1211,7 +1217,10 @@ mod tests {
             .expect("checkpoints exist");
 
         assert_eq!(step, 120);
-        assert!(path.ends_with("model_512_1b_bf16_step_120.safetensors"), "{path}");
+        assert!(
+            path.ends_with("model_512_1b_bf16_step_120.safetensors"),
+            "{path}"
+        );
     }
 
     /// An empty directory still reports nothing, so the caller's
