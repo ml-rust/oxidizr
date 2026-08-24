@@ -1126,6 +1126,11 @@ pub fn find_latest_checkpoint(
     let mut latest_checkpoint: Option<String> = None;
     let mut latest_meta: Option<String> = None;
 
+    // The highest-step weights file found, whether or not it has a sidecar. A
+    // checkpoint present but unusable is NOT the same as no checkpoint, and the
+    // two must not collapse into the same `None` — see the error below.
+    let mut newest_weights: Option<(usize, String)> = None;
+
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -1136,6 +1141,12 @@ pub fn find_latest_checkpoint(
                 if let Some(step_part) = filename.split("_step_").last() {
                     if let Some(step_str) = step_part.strip_suffix(".safetensors") {
                         if let Ok(step) = step_str.parse::<usize>() {
+                            if newest_weights
+                                .as_ref()
+                                .is_none_or(|(newest, _)| step > *newest)
+                            {
+                                newest_weights = Some((step, path.to_string_lossy().to_string()));
+                            }
                             if latest_step.is_none_or(|latest| step > latest) {
                                 // Check if corresponding meta file exists
                                 let meta_path = format!(
@@ -1153,6 +1164,26 @@ pub fn find_latest_checkpoint(
                 }
             }
         }
+    }
+
+    // Refuse rather than silently fall back to random weights. Skipping an
+    // unusable checkpoint used to return `None`, which the caller reads as "no
+    // checkpoint here, start fresh" — so an import that produced weights but no
+    // sidecar trained a randomly-initialised model over many hours, and the
+    // resulting file overwrote the very checkpoint it should have resumed. If the
+    // newest weights on disk cannot be resumed, that is worth stopping for.
+    let orphaned_newest = newest_weights
+        .filter(|(newest_step, _)| latest_step.is_none_or(|usable| *newest_step > usable));
+    if let Some((newest_step, newest_path)) = orphaned_newest {
+        let meta_path = format!("{checkpoint_dir}/checkpoint_step_{newest_step}.meta.json");
+        return Err(anyhow::anyhow!(
+            "Cannot auto-resume: `{newest_path}` is the newest checkpoint in `{checkpoint_dir}` \
+             but its metadata sidecar `{meta_path}` is missing, so it cannot be validated \
+             against the current config.\n\
+             Re-run the import for this model to regenerate the sidecar, or pass an explicit \
+             `--resume <path>` to choose a checkpoint deliberately.\n\
+             Refusing to start from random weights while usable weights sit in this directory."
+        ));
     }
 
     match (latest_checkpoint, latest_meta, latest_step) {
@@ -1208,6 +1239,53 @@ mod tests {
         );
     }
 
+    /// Weights whose metadata sidecar is missing must STOP the run, not be
+    /// skipped. Skipping returned `None`, which the caller reads as "no
+    /// checkpoint, start fresh" — so an import that wrote weights but no sidecar
+    /// silently trained a randomly-initialised model and then overwrote the very
+    /// checkpoint it should have resumed from. This is that exact directory:
+    /// `checkpoints/qwen3-1.7b/` holds a 3.4 GB step-0 import and no sidecar.
+    #[test]
+    fn resume_auto_refuses_weights_without_a_meta_sidecar() {
+        let dir = checkpoint_dir_with_steps("orphan", &[]);
+        fs::write(
+            Path::new(&dir).join("model_512_1b_bf16_step_0.safetensors"),
+            b"",
+        )
+        .expect("write orphaned checkpoint");
+
+        let Err(err) = find_latest_checkpoint(&dir) else {
+            panic!("weights without a sidecar must be an error, never a silent fresh start");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("metadata sidecar"),
+            "the error must name what is missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("random weights"),
+            "the error must say why refusing beats starting fresh, got: {msg}"
+        );
+    }
+
+    /// An orphaned NEWER checkpoint must not be silently passed over in favour of
+    /// an older eligible one — resuming from step 5 while step 120 sits unusable
+    /// on disk loses 115 steps of work without saying so.
+    #[test]
+    fn resume_auto_refuses_when_the_newest_checkpoint_is_orphaned() {
+        let dir = checkpoint_dir_with_steps("orphan-newer", &[5]);
+        fs::write(
+            Path::new(&dir).join("model_512_1b_bf16_step_120.safetensors"),
+            b"",
+        )
+        .expect("write orphaned newer checkpoint");
+
+        let Err(err) = find_latest_checkpoint(&dir) else {
+            panic!("an orphaned newer checkpoint must be an error, not a silent downgrade");
+        };
+        assert!(err.to_string().contains("step_120"), "{err}");
+    }
+
     /// Step 0 must not win over later steps just because it is now eligible.
     #[test]
     fn resume_auto_prefers_the_highest_step() {
@@ -1228,23 +1306,6 @@ mod tests {
     #[test]
     fn resume_auto_reports_nothing_for_an_empty_directory() {
         let dir = checkpoint_dir_with_steps("empty", &[]);
-        assert!(find_latest_checkpoint(&dir)
-            .expect("scan succeeds")
-            .is_none());
-    }
-
-    /// A checkpoint without its metadata sidecar stays ineligible at step 0,
-    /// exactly as at any other step — the fix widened which STEPS qualify, not
-    /// which FILES.
-    #[test]
-    fn resume_auto_skips_a_step_0_checkpoint_with_no_metadata() {
-        let dir = checkpoint_dir_with_steps("nometa", &[]);
-        fs::write(
-            Path::new(&dir).join("model_512_1b_bf16_step_0.safetensors"),
-            b"",
-        )
-        .expect("write checkpoint");
-
         assert!(find_latest_checkpoint(&dir)
             .expect("scan succeeds")
             .is_none());
