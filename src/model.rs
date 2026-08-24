@@ -2061,11 +2061,11 @@ where
             FfnLayer::Mlp(mlp) => {
                 let out = mlp.forward(client, x)?;
                 let load_balance_loss = boostr::autograd::Var::new(
-                    Tensor::<R>::zeros(&[1], DType::F32, x.tensor().device()),
+                    Tensor::<R>::try_zeros(&[1], DType::F32, x.tensor().device())?,
                     false,
                 );
                 let z_loss = boostr::autograd::Var::new(
-                    Tensor::<R>::zeros(&[1], DType::F32, x.tensor().device()),
+                    Tensor::<R>::try_zeros(&[1], DType::F32, x.tensor().device())?,
                     false,
                 );
                 Ok((out, load_balance_loss, z_loss))
