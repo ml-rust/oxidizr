@@ -6,7 +6,7 @@ use crate::distributed::{
 use crate::prelude::{
     cross_entropy, cross_entropy_masked, DType, Error, FusedAdamW, Result, Tensor,
 };
-use boostr::autograd::{backward, var_add, var_mul_scalar, var_reshape, GradStore, Var};
+use boostr::autograd::{backward_wrt, var_add, var_mul_scalar, var_reshape, GradStore, Var};
 use boostr::ops::{FusedOptimizerOps, TensorOps};
 use boostr::optimizer::AdamWConfig;
 use boostr::readback::scalar_f32;
@@ -190,10 +190,26 @@ where
     /// workaround for Candle's lack of in-place gradient modification) is gone.
     ///
     /// Both clips norm over `self.parameter_ids` — the tensors the optimizer
-    /// actually steps. The grad store returned by `backward()` is far larger:
-    /// it holds the loss node's own `dL/dL = 1` seed, every activation, and a
-    /// gradient for every matmul operand including frozen ones. On a LoRA run
-    /// that is 11975 entries against 128 parameters.
+    /// actually steps, and now also the only keys the merged grad store holds.
+    /// `backward_wrt` still retains the loss node's `dL/dL = 1` seed and every
+    /// activation on a path to a trainable parameter, but that per-micro-batch
+    /// store is filtered to `parameter_ids` on the way into the merged store
+    /// and then dropped.
+    ///
+    /// # Gradient Accumulation Strategy
+    /// Each micro-batch runs its own forward AND backward, and its parameter
+    /// gradients are summed into one store. By linearity,
+    /// `grad(sum_k scaled_loss_k) == sum_k grad(scaled_loss_k)`, so this
+    /// computes what chaining the micro-batch losses into one graph and running
+    /// a single backward computed — but only one micro-batch's activations are
+    /// alive at a time, instead of `gradient_accumulation` of them.
+    ///
+    /// Float addition is not associative, so the accumulation ORDER matters:
+    /// gradients now land in micro-batch order rather than in the merged
+    /// graph's reverse-topological order. A parameter reached from several
+    /// micro-batches can therefore differ in its last bits, and the reported
+    /// `grad_norm` with it. The reported loss cannot move: it is the same
+    /// device `add` over the same scalars in the same micro-batch order.
     pub fn training_step<D: DataLoader<R>>(
         &mut self,
         model: &crate::model::LitGPT<R>,
@@ -215,7 +231,6 @@ where
             self.optimizer.set_lr(self.base_learning_rate);
         }
 
-        let mut total_loss_for_logging = 0.0;
         #[allow(unused_assignments)]
         let mut last_grad_norm = 0.0;
         let accum_steps = self.config.gradient_accumulation;
@@ -229,11 +244,19 @@ where
         // Global gradient clipping and normalization are applied below before optimizer.step()
         let _max_grad_value = self.config.max_grad_value;
 
-        // Accumulated loss Var across micro-batches.
-        // We keep the autograd graph intact, then call backward once on the total loss.
-        let mut accumulated_loss: Option<Var<R>> = None;
+        // Accumulated scaled-loss scalar across micro-batches, held as a plain
+        // `Tensor` and never as a `Var`. A `Var` carries its `grad_fn`, and a
+        // chain of them pins every micro-batch's saved activations at once -
+        // exactly the peak this loop exists to avoid.
+        let mut accumulated_loss: Option<Tensor<R>> = None;
 
-        // Gradient Accumulation Loop - only forward passes, accumulate losses
+        // Parameter gradients summed across micro-batches. Backward runs once
+        // per micro-batch and its store is folded in here, so only one
+        // micro-batch's graph is ever alive.
+        let mut accumulated_grads: GradStore<R> = GradStore::new();
+
+        // Gradient Accumulation Loop - forward and backward, one micro-batch
+        // at a time
         for _micro_batch_idx in 0..accum_steps {
             let data_start = if profile { Some(Instant::now()) } else { None };
             let batch = data_loader.next_batch()?;
@@ -283,9 +306,10 @@ where
                             reason: format!(
                                 "GPU out of memory during forward pass{}\n\n\
                                 The model requires more VRAM than available. Try:\n\
-                                • Reduce batch_size (current: {})\n\
+                                • Halve batch_size (current: {}) and double gradient_accumulation \
+                                  - peak memory now tracks batch_size alone, and the effective \
+                                  batch size is unchanged\n\
                                 • Reduce max_seq_len in config\n\
-                                • Increase gradient_accumulation to maintain effective batch size\n\
                                 • Use a smaller model configuration\n\
                                 • Free GPU memory from other processes (check with: nvidia-smi)",
                                 size_info, self.batch_size
@@ -416,11 +440,13 @@ where
             // Scale loss for gradient accumulation
             let scaled_loss = var_mul_scalar(&loss, 1.0 / accum_steps as f64, &self.client)?;
 
-            // Accumulate scaled loss (keeps computation graph for single backward)
-            accumulated_loss = Some(match accumulated_loss {
-                None => scaled_loss,
-                Some(acc) => var_add(&acc, &scaled_loss, &self.client)?,
-            });
+            // Only the scalar tensor is kept, never the `Var`, so nothing here
+            // pins this micro-batch's graph.
+            accumulated_loss = Some(accumulate_loss_scalar(
+                accumulated_loss,
+                scaled_loss.tensor(),
+                &self.client,
+            )?);
 
             // Track loss tensor for later logging (defer GPU->CPU transfer)
             // We'll do the transfer after backward when we need to log anyway
@@ -430,15 +456,95 @@ where
                     start.elapsed().as_secs_f64() * 1000.0
                 );
             }
+
+            // ===== Backward for THIS micro-batch =====
+            // Linearity: grad(sum_k scaled_loss_k) == sum_k grad(scaled_loss_k).
+            // Summing per-micro-batch gradients therefore computes the same
+            // thing as one backward over the chained loss, while holding one
+            // micro-batch's activations instead of `accum_steps` of them.
+            // Wrap in catch_unwind to provide user-friendly OOM error instead of panic
+            let bwd_start = if profile { Some(Instant::now()) } else { None };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Prune to the trainable parameters. Every other node's gradient is
+                // unreadable by the optimizer and would only inflate peak memory -
+                // a frozen weight under LoRA costs a full-size gradient per step.
+                backward_and_merge(
+                    scaled_loss,
+                    &self.parameter_ids,
+                    &mut accumulated_grads,
+                    &self.client,
+                )
+            })) {
+                Ok(result) => result?,
+                Err(panic_info) => {
+                    // Extract panic message
+                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+
+                    // Check if it's an OOM error
+                    if panic_msg.contains("can't allocate buffer")
+                        || panic_msg.contains("out of memory")
+                    {
+                        // Extract the requested size if present
+                        let size_info = if let Some(start) = panic_msg.find("size:") {
+                            let size_str = &panic_msg[start + 5..];
+                            if let Some(size) = size_str.split_whitespace().next() {
+                                if let Ok(bytes) = size.parse::<u64>() {
+                                    format!(" ({:.1} MB)", bytes as f64 / 1_000_000.0)
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                        return Err(Error::TrainingError {
+                            reason: format!(
+                                "GPU out of memory during backward pass{}\n\n\
+                                The model requires more VRAM than available. Try:\n\
+                                • Halve batch_size (current: {}) and double gradient_accumulation \
+                                  - peak memory now tracks batch_size alone, and the effective \
+                                  batch size is unchanged\n\
+                                • Reduce max_seq_len in config\n\
+                                • Use a smaller model configuration\n\
+                                • Free GPU memory from other processes (check with: nvidia-smi)",
+                                size_info, self.batch_size
+                            ),
+                        });
+                    }
+
+                    // Re-panic for other errors
+                    std::panic::resume_unwind(panic_info);
+                }
+            }
+            if let Some(start) = bwd_start {
+                eprintln!(
+                    "[PROFILE] backward: {:.3}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+
+            // `logits`, `loss`, the aux/z-loss Vars and every `grad_fn` they
+            // hold are dropped here, at the end of the iteration. This
+            // micro-batch's saved activations are released before the next
+            // micro-batch's forward pass allocates anything.
         }
 
         // Transfer loss to CPU for logging (single sync point)
         let loss_sync_start = if profile { Some(Instant::now()) } else { None };
-        if let Some(ref acc_loss) = accumulated_loss {
-            // Transfer the accumulated loss value
-            total_loss_for_logging =
-                scalar_f32(&self.client, acc_loss.tensor())? as f64 * accum_steps as f64;
-        }
+        let acc_loss = accumulated_loss.ok_or_else(|| Error::TrainingError {
+            reason: "No loss accumulated".to_string(),
+        })?;
+        let total_loss_for_logging =
+            scalar_f32(&self.client, &acc_loss)? as f64 * accum_steps as f64;
         if let Some(start) = loss_sync_start {
             eprintln!(
                 "[PROFILE] loss_sync: {:.3}ms",
@@ -446,74 +552,10 @@ where
             );
         }
 
-        // ===== AFTER ACCUMULATION LOOP: Single backward pass =====
-        // All micro-batches have been processed, now do backward on accumulated loss
-
-        let total_loss = accumulated_loss.ok_or_else(|| Error::TrainingError {
-            reason: "No loss accumulated".to_string(),
-        })?;
-
-        // Single backward pass over all micro-batches
-        // Wrap in catch_unwind to provide user-friendly OOM error instead of panic
-        let bwd_start = if profile { Some(Instant::now()) } else { None };
-        let grads = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            backward(&total_loss, &self.client)
-        })) {
-            Ok(result) => result?,
-            Err(panic_info) => {
-                // Extract panic message
-                let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "Unknown panic".to_string()
-                };
-
-                // Check if it's an OOM error
-                if panic_msg.contains("can't allocate buffer")
-                    || panic_msg.contains("out of memory")
-                {
-                    // Extract the requested size if present
-                    let size_info = if let Some(start) = panic_msg.find("size:") {
-                        let size_str = &panic_msg[start + 5..];
-                        if let Some(size) = size_str.split_whitespace().next() {
-                            if let Ok(bytes) = size.parse::<u64>() {
-                                format!(" ({:.1} MB)", bytes as f64 / 1_000_000.0)
-                            } else {
-                                String::new()
-                            }
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        String::new()
-                    };
-
-                    return Err(Error::TrainingError {
-                        reason: format!(
-                            "GPU out of memory during backward pass{}\n\n\
-                            The model requires more VRAM than available. Try:\n\
-                            • Reduce batch_size (current: {})\n\
-                            • Reduce max_seq_len in config\n\
-                            • Increase gradient_accumulation to maintain effective batch size\n\
-                            • Use a smaller model configuration\n\
-                            • Free GPU memory from other processes (check with: nvidia-smi)",
-                            size_info, self.batch_size
-                        ),
-                    });
-                }
-
-                // Re-panic for other errors
-                std::panic::resume_unwind(panic_info);
-            }
-        };
-        if let Some(start) = bwd_start {
-            eprintln!(
-                "[PROFILE] backward: {:.3}ms",
-                start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
+        // ===== AFTER ACCUMULATION LOOP =====
+        // Every micro-batch has already run its own backward and folded its
+        // parameter gradients into `accumulated_grads`.
+        let grads = accumulated_grads;
 
         // Check parameter/gradient matching at step 1.
         // Gradients must be keyed by the same stable TensorIds used in self.params.
@@ -529,13 +571,23 @@ where
                     params_without_grads.push(self.parameter_name(*id).to_string());
                 }
             }
+            // `Grads retained` counts entries in the merged store, which now
+            // holds parameter gradients only: each micro-batch's backward store
+            // is filtered to `parameter_ids` before being folded in. It
+            // therefore equals `Params with grads` and is bounded by
+            // `Total params` — do not compare it against logs from before
+            // backward moved inside the accumulation loop, where it also
+            // counted every activation on a path to a parameter.
             eprintln!(
-                "[GRAD CHECK] Total params: {}, Grads returned: {}, Params with grads: {}",
+                "[GRAD CHECK] Total params: {}, Grads retained: {}, Params with grads: {}",
                 total_params, grads_count, params_with_grads
             );
             if !params_without_grads.is_empty() {
+                // A warning, never an error: under top-k MoE routing an unrouted
+                // expert legitimately receives no gradient on a given step.
                 eprintln!(
-                    "[GRAD CHECK] Params WITHOUT gradients ({}):",
+                    "[GRAD CHECK] Params WITHOUT gradients this step ({}) — expected for \
+                     unrouted MoE experts, a bug for anything else:",
                     params_without_grads.len()
                 );
                 for name in &params_without_grads {
@@ -1265,6 +1317,66 @@ where
     Ok(scalar_f32(client, &total)?.is_finite())
 }
 
+/// Fold one micro-batch's scaled loss into the running reported-loss scalar.
+///
+/// This is the same `add`, over the same operands, in the same micro-batch
+/// order that the old chain of loss `Var`s performed on its forward pass, so
+/// the logged loss is bit-identical to the merged-graph version. Float addition
+/// is not associative: reordering or reassociating this sum changes the number
+/// the run reports.
+///
+/// The running total is a plain `Tensor`, never a `Var`. A `Var` would carry
+/// its `grad_fn`, and a chain of them would pin every micro-batch's saved
+/// activations at once.
+fn accumulate_loss_scalar<R, C>(
+    accumulated: Option<Tensor<R>>,
+    scaled_loss: &Tensor<R>,
+    client: &C,
+) -> Result<Tensor<R>>
+where
+    R: Runtime<DType = DType>,
+    C: RuntimeClient<R> + TensorOps<R>,
+{
+    match accumulated {
+        None => Ok(scaled_loss.clone()),
+        Some(acc) => Ok(client.add(&acc, scaled_loss)?),
+    }
+}
+
+/// Run backward for one micro-batch and fold its parameter gradients into
+/// `accumulated`.
+///
+/// `scaled_loss` is taken BY VALUE, so this function owns the handle it is
+/// given and releases it before merging. A `&Var` parameter would leave the
+/// caller holding the micro-batch's `grad_fn` chain, which is what made every
+/// micro-batch's activations coexist in the first place.
+///
+/// Only `parameter_ids` are carried forward. Every other entry `backward_wrt`
+/// retains belongs to an activation whose `TensorId` is minted fresh each
+/// micro-batch, so merging those would pile up gradients nothing can ever read
+/// and give back the memory this design saves.
+fn backward_and_merge<R, C>(
+    scaled_loss: Var<R>,
+    parameter_ids: &[TensorId],
+    accumulated: &mut GradStore<R>,
+    client: &C,
+) -> Result<()>
+where
+    R: Runtime<DType = DType>,
+    C: RuntimeClient<R> + TensorOps<R>,
+{
+    let mut micro_grads = backward_wrt(&scaled_loss, parameter_ids, client)?;
+    drop(scaled_loss);
+
+    for id in parameter_ids {
+        if let Some(grad) = micro_grads.remove(*id) {
+            accumulated.try_accumulate(*id, grad, |existing, new| client.add(&existing, &new))?;
+        }
+    }
+
+    Ok(())
+}
+
 fn scalar_loss_var<R>(loss: &Var<R>) -> Result<Var<R>>
 where
     R: Runtime<DType = DType>,
@@ -1307,10 +1419,220 @@ fn format_duration(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boostr::autograd::{var_mul, GradFn};
     use boostr::{CpuClient, CpuDevice, CpuRuntime};
+    use std::sync::{Arc, Weak};
 
     fn f32_tensor(values: &[f32], device: &CpuDevice) -> Tensor<CpuRuntime> {
         Tensor::<CpuRuntime>::from_slice(values, &[values.len()], device)
+    }
+
+    /// One micro-batch's scaled loss: `w * x + w * b`.
+    ///
+    /// `w` is reached by two paths inside a single graph, so intra-graph
+    /// accumulation happens too, and by every micro-batch, so the
+    /// cross-micro-batch merge is what decides its final value.
+    fn scaled_micro_batch_loss(
+        w: &Var<CpuRuntime>,
+        b: &Var<CpuRuntime>,
+        x: f32,
+        scale: f64,
+        client: &CpuClient,
+        device: &CpuDevice,
+    ) -> Var<CpuRuntime> {
+        let input = Var::new(f32_tensor(&[x], device), false);
+        let wx = var_mul(w, &input, client).expect("w * x");
+        let wb = var_mul(w, b, client).expect("w * b");
+        let loss = var_add(&wx, &wb, client).expect("w * x + w * b");
+        var_mul_scalar(&loss, scale, client).expect("scale by 1/accum_steps")
+    }
+
+    /// The whole justification for moving backward inside the accumulation
+    /// loop: `grad(sum_k scaled_loss_k) == sum_k grad(scaled_loss_k)`. Running
+    /// backward per micro-batch and summing the parameter gradients must equal
+    /// one backward over the chained loss, or the memory fix has silently
+    /// changed what the run trains.
+    #[test]
+    fn per_micro_batch_backward_matches_one_backward_over_the_summed_loss() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+
+        let w = Var::new(f32_tensor(&[0.75], &device), true);
+        let b = Var::new(f32_tensor(&[0.5], &device), true);
+        let ids = vec![w.id(), b.id()];
+        let inputs = [1.0f32, 2.0, 3.0];
+        let scale = 1.0 / inputs.len() as f64;
+
+        // The production path: one backward per micro-batch, gradients merged.
+        let mut merged = GradStore::<CpuRuntime>::new();
+        for x in inputs {
+            let scaled = scaled_micro_batch_loss(&w, &b, x, scale, &client, &device);
+            backward_and_merge(scaled, &ids, &mut merged, &client).expect("backward and merge");
+        }
+
+        // The reference: one graph, one backward - what the loop used to do.
+        let mut chained: Option<Var<CpuRuntime>> = None;
+        for x in inputs {
+            let scaled = scaled_micro_batch_loss(&w, &b, x, scale, &client, &device);
+            chained = Some(match chained {
+                None => scaled,
+                Some(acc) => var_add(&acc, &scaled, &client).expect("chain the losses"),
+            });
+        }
+        let reference =
+            backward_wrt(&chained.expect("a chained loss"), &ids, &client).expect("backward");
+
+        for id in &ids {
+            let got: Vec<f32> = merged.get(*id).expect("merged gradient").to_vec();
+            let want: Vec<f32> = reference.get(*id).expect("reference gradient").to_vec();
+            assert_eq!(got.len(), want.len(), "gradient shape for {id:?}");
+            for (g, r) in got.iter().zip(want.iter()) {
+                assert!(
+                    (g - r).abs() < 1e-6,
+                    "gradient for {id:?}: merged {got:?} != single-backward {want:?}"
+                );
+            }
+        }
+    }
+
+    /// The reported loss is a sum of scalars, and float addition is not
+    /// associative. `accumulate_loss_scalar` must reproduce the old `var_add`
+    /// chain's forward value bit for bit - same operands, same order, same op.
+    ///
+    /// The values are chosen so the order is visible in the result: added
+    /// smallest-first the two halves of an ULP carry into `1.0 + 2^-23`, added
+    /// largest-first each one rounds away to nothing.
+    #[test]
+    fn accumulated_loss_scalar_is_bit_identical_to_the_var_add_chain() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+
+        let half_ulp = 2f32.powi(-24);
+        let values = [half_ulp, half_ulp, 1.0f32];
+
+        let mut via_tensor: Option<Tensor<CpuRuntime>> = None;
+        let mut via_var: Option<Var<CpuRuntime>> = None;
+        for value in values {
+            let scaled = Var::new(f32_tensor(&[value], &device), true);
+            via_tensor = Some(
+                accumulate_loss_scalar(via_tensor, scaled.tensor(), &client)
+                    .expect("accumulate the loss scalar"),
+            );
+            via_var = Some(match via_var {
+                None => scaled,
+                Some(acc) => var_add(&acc, &scaled, &client).expect("chain the losses"),
+            });
+        }
+
+        let tensor_sum: Vec<f32> = via_tensor.expect("a loss scalar").to_vec();
+        let var_sum: Vec<f32> = via_var.expect("a loss Var").tensor().to_vec();
+        assert_eq!(
+            tensor_sum[0].to_bits(),
+            var_sum[0].to_bits(),
+            "tensor accumulation {} != var_add chain {}",
+            tensor_sum[0],
+            var_sum[0]
+        );
+        // Pin the order itself, not just the agreement between the two paths:
+        // summing largest-first would give exactly 1.0 here.
+        assert_eq!(
+            tensor_sum[0].to_bits(),
+            (1.0f32 + 2f32.powi(-23)).to_bits(),
+            "micro-batch order was not preserved: got {}",
+            tensor_sum[0]
+        );
+    }
+
+    /// The memory win itself. A test that only checks numbers passes with the
+    /// leak intact, so this one holds a `Weak` to the innermost node of micro-
+    /// batch k's graph and asserts it is dead before micro-batch k+1's forward
+    /// pass runs.
+    ///
+    /// The probe is `w * x`, whose `Arc<dyn GradFn>` is held by the `wx` `Var`
+    /// itself AND cloned into every downstream node's `grad_fn`. It can only
+    /// die once the entire micro-batch graph - and with it every saved
+    /// activation - has been released.
+    #[test]
+    fn each_micro_batch_graph_dies_before_the_next_forward() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+
+        let w = Var::new(f32_tensor(&[0.75], &device), true);
+        let b = Var::new(f32_tensor(&[0.5], &device), true);
+        let ids = vec![w.id(), b.id()];
+        let inputs = [1.0f32, 2.0, 3.0];
+        let scale = 1.0 / inputs.len() as f64;
+
+        let mut merged = GradStore::<CpuRuntime>::new();
+        let mut previous: Option<Weak<dyn GradFn<CpuRuntime>>> = None;
+
+        for (k, x) in inputs.into_iter().enumerate() {
+            if let Some(prev) = &previous {
+                assert!(
+                    prev.upgrade().is_none(),
+                    "micro-batch {} still held its graph when micro-batch {k} started its forward",
+                    k - 1
+                );
+            }
+
+            // Mirrors the loop body of `training_step`: every Var below is an
+            // iteration local, so the graph dies at the end of the iteration.
+            let input = Var::new(f32_tensor(&[x], &device), false);
+            let wx = var_mul(&w, &input, &client).expect("w * x");
+            let wb = var_mul(&w, &b, &client).expect("w * b");
+            let loss = var_add(&wx, &wb, &client).expect("w * x + w * b");
+            let scaled = var_mul_scalar(&loss, scale, &client).expect("scale");
+
+            previous = Some(Arc::downgrade(wx.grad_fn().expect("wx has a grad_fn")));
+
+            backward_and_merge(scaled, &ids, &mut merged, &client).expect("backward and merge");
+        }
+
+        let last = previous.expect("a probed graph");
+        assert!(
+            last.upgrade().is_none(),
+            "the final micro-batch's graph outlived the accumulation loop"
+        );
+    }
+
+    /// A parameter only one micro-batch touches - an unrouted MoE expert on
+    /// every other micro-batch - must still hold its gradient after the merge.
+    /// A merge that inserted instead of accumulating, or that rebuilt the store
+    /// per micro-batch, would drop it.
+    #[test]
+    fn every_parameter_keeps_a_gradient_across_the_accumulation_loop() {
+        let device = CpuDevice::new();
+        let client = CpuClient::new(device.clone());
+
+        let w = Var::new(f32_tensor(&[0.75], &device), true);
+        let b = Var::new(f32_tensor(&[0.5], &device), true);
+        let rare = Var::new(f32_tensor(&[2.0], &device), true);
+        let ids = vec![w.id(), b.id(), rare.id()];
+        let inputs = [1.0f32, 2.0, 3.0];
+
+        let mut merged = GradStore::<CpuRuntime>::new();
+        for (k, x) in inputs.into_iter().enumerate() {
+            let input = Var::new(f32_tensor(&[x], &device), false);
+            let wx = var_mul(&w, &input, &client).expect("w * x");
+            let tail = if k == 0 {
+                var_mul(&rare, &b, &client).expect("rare * b")
+            } else {
+                b.clone()
+            };
+            let loss = var_add(&wx, &tail, &client).expect("w * x + tail");
+            let scaled = var_mul_scalar(&loss, 1.0 / inputs.len() as f64, &client).expect("scale");
+            backward_and_merge(scaled, &ids, &mut merged, &client).expect("backward and merge");
+        }
+
+        for id in &ids {
+            assert!(
+                merged.get(*id).is_some(),
+                "parameter {id:?} received no gradient across the accumulation loop"
+            );
+        }
+        // The merged store holds parameter entries only - this is what
+        // `[GRAD CHECK] Grads retained` now counts.
+        assert_eq!(merged.len(), ids.len(), "non-parameter gradients were kept");
     }
 
     #[test]
