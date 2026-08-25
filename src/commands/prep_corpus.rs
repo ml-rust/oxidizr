@@ -10,7 +10,7 @@
 //! Three files are written, all derived from `--output`:
 //!
 //! - `corpus.bin` — the packed `u32` stream the trainer memory-maps,
-//! - `corpus.layout.json` — the [`SpeechVocab`] sidecar
+//! - `corpus.layout.json` — the [`SpeechLayout`] sidecar
 //!   [`write_speech_corpus`] writes, without which the ids are unreadable,
 //! - `corpus.manifest.json` — one record per utterance: source file, sample
 //!   range, seconds, transcript, token and frame counts.
@@ -31,7 +31,7 @@
 //! dtypes already match, so an f32 checkpoint pays nothing for the call.
 
 use anyhow::{Context, Result};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ use boostr::model::audio::{
     SpeechCorpusBuilder, TextTokenizer, Utterance, VadSegmentOptions, WhisperBundle,
     MAX_UTTERANCE_SECS, PRETRAINED_TOKENIZER_NAMES,
 };
-use boostr::model::SpeechVocab;
+use boostr::model::SpeechLayout;
 use boostr::runtime::Runtime;
 use boostr::{DType, MatmulOps, TypeConversionOps};
 
@@ -51,6 +51,20 @@ use crate::speech_corpus::write_speech_corpus;
 /// Extensions a directory walk accepts. Everything else in the directory —
 /// transcripts, `.DS_Store`, a nested folder — is ignored.
 const AUDIO_EXTENSIONS: [&str; 6] = ["flac", "wav", "mp3", "ogg", "m4a", "opus"];
+
+/// Which speech id layout the corpus is packed into.
+///
+/// Not a detail: the layout decides what every audio id MEANS, and a `.bin` is
+/// headerless, so the wrong one trains a base on ids that address different
+/// embedding rows with no error anywhere. The sidecar records the choice; see
+/// [`crate::speech_corpus`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LayoutArg {
+    /// boostr's own layout, over a derived `SpeechVocab`.
+    Native,
+    /// The `Multilingual-Expressive-TTS-1.7B` layout.
+    ExpressiveTts,
+}
 
 /// Prep-corpus command arguments
 #[derive(Args, Debug)]
@@ -92,9 +106,25 @@ pub struct PrepCorpusArgs {
     pub neucodec: String,
 
     /// Base text tokenizer: a splintr vocabulary name (cl100k_base,
-    /// o200k_base, llama3, deepseek_v3) or a path to a tokenizer.json
+    /// o200k_base, llama3, deepseek_v3) or a path to a tokenizer.json.
+    /// Under --layout expressive-tts this MUST be the base checkpoint's own
+    /// tokenizer.json: the ids line up with that vocabulary and no other
     #[arg(long = "tokenizer")]
     pub tokenizer: String,
+
+    /// Speech id layout to pack into. expressive-tts matches the
+    /// Multilingual-Expressive-TTS-1.7B base, the only layout with a real base
+    /// checkpoint today. native is boostr's own layout, for training a speech
+    /// LM from scratch on boostr, where nothing constrains the id space
+    #[arg(long = "layout", value_enum, default_value = "expressive-tts")]
+    pub layout: LayoutArg,
+
+    /// Speaker name, rendered as the literal prefix "{speaker}: " before the
+    /// transcript is tokenized. A consistent value is how the base conditions
+    /// on speaker identity, so a voice-cloning corpus should set it. Omitted
+    /// leaves each transcript exactly as Whisper produced it
+    #[arg(long = "speaker")]
+    pub speaker: Option<String>,
 
     /// Whisper language code, e.g. "ms". Omitted lets Whisper auto-detect
     #[arg(long = "language")]
@@ -108,6 +138,28 @@ pub struct PrepCorpusArgs {
     /// this may not exceed it
     #[arg(long = "max-utterance-secs", default_value = "30.0")]
     pub max_utterance_secs: f32,
+
+    /// Silence needed to END an utterance, in milliseconds.
+    ///
+    /// The VAD default of 100 ms splits on breath, not on sentences: ordinary
+    /// speech pauses 100-300 ms mid-sentence, so a 100 ms threshold yields
+    /// fragments like "In my" and "just now". 400-500 ms lands utterances on
+    /// sentence boundaries, which is what a TTS corpus wants
+    #[arg(long = "min-silence-ms", default_value = "100")]
+    pub min_silence_ms: u32,
+
+    /// Speech probability above which a chunk counts as speech, 0-1 exclusive.
+    ///
+    /// Raise it for noisy recordings, lower it if quiet speech is being dropped
+    #[arg(long = "vad-threshold", default_value = "0.5")]
+    pub vad_threshold: f32,
+
+    /// Audio kept either side of a detected utterance, in milliseconds.
+    ///
+    /// Too little clips consonants at the edges; too much drags in neighbouring
+    /// speech
+    #[arg(long = "speech-pad-ms", default_value = "30")]
+    pub speech_pad_ms: u32,
 
     /// Pad the packed stream to a multiple of this many tokens
     #[arg(long = "pad-to-multiple")]
@@ -128,6 +180,10 @@ struct Plan<'a> {
     whisper_dir: &'a Path,
     neucodec_path: &'a Path,
     tokenizer: TextTokenizer<'a>,
+    /// Chosen here, resolved into a [`SpeechLayout`] only by the builder: the
+    /// native layout's `SpeechVocab` is derived from the loaded tokenizer and
+    /// encoder, neither of which exists yet at plan time.
+    layout: LayoutArg,
     opts: CorpusOptions<'a>,
 }
 
@@ -260,6 +316,15 @@ fn check_max_utterance_secs(secs: f32) -> Result<()> {
 /// Turn the parsed arguments into a checked plan.
 fn plan(args: &PrepCorpusArgs) -> Result<Plan<'_>> {
     check_max_utterance_secs(args.max_utterance_secs)?;
+    // The segmenter rejects a non-finite or out-of-range threshold, but only
+    // once the checkpoints have loaded. Catch it here instead of after a 3 GB
+    // Whisper load.
+    if !args.vad_threshold.is_finite() || args.vad_threshold <= 0.0 || args.vad_threshold > 1.0 {
+        return Err(anyhow::anyhow!(
+            "--vad-threshold {} is not usable: it must be in (0, 1]",
+            args.vad_threshold
+        ));
+    }
 
     let files = collect_inputs(Path::new(&args.input))?;
     let tokenizer = resolve_tokenizer(&args.tokenizer)?;
@@ -268,9 +333,13 @@ fn plan(args: &PrepCorpusArgs) -> Result<Plan<'_>> {
     let opts = CorpusOptions {
         vad: VadSegmentOptions {
             max_speech_duration_s: args.max_utterance_secs,
+            min_silence_duration_ms: args.min_silence_ms,
+            threshold: args.vad_threshold,
+            speech_pad_ms: args.speech_pad_ms,
             ..defaults.vad
         },
         language: args.language.as_deref(),
+        speaker: args.speaker.as_deref(),
         min_utterance_secs: args.min_utterance_secs,
         pad_to_multiple: args.pad_to_multiple,
         ..defaults
@@ -283,6 +352,7 @@ fn plan(args: &PrepCorpusArgs) -> Result<Plan<'_>> {
         whisper_dir: Path::new(&args.whisper),
         neucodec_path: Path::new(&args.neucodec),
         tokenizer,
+        layout: args.layout,
         opts,
     })
 }
@@ -308,12 +378,21 @@ where
     let codec = NeuCodecEncoder::<R>::from_safetensors(plan.neucodec_path, device)?;
 
     println!("  Tokenizer: {:?}", plan.tokenizer);
-    Ok(SpeechCorpusBuilder::new(
-        vad,
-        whisper,
-        codec,
-        plan.tokenizer,
-    )?)
+    println!("  Layout:    {}", layout_name(plan.layout));
+    Ok(match plan.layout {
+        LayoutArg::Native => SpeechCorpusBuilder::new(vad, whisper, codec, plan.tokenizer)?,
+        LayoutArg::ExpressiveTts => {
+            SpeechCorpusBuilder::new_expressive_tts(vad, whisper, codec, plan.tokenizer)?
+        }
+    })
+}
+
+/// The layout's name as the sidecar and boostr's errors spell it.
+const fn layout_name(layout: LayoutArg) -> &'static str {
+    match layout {
+        LayoutArg::Native => "boostr-native",
+        LayoutArg::ExpressiveTts => "expressive-tts-1.7b",
+    }
 }
 
 /// Decode every recording, prepare its utterances, then pack and write once.
@@ -323,7 +402,7 @@ where
 /// per backend.
 fn drive(
     plan: &Plan<'_>,
-    vocab: &SpeechVocab,
+    layout: &SpeechLayout,
     utterances_of: &dyn Fn(&[f32]) -> Result<Vec<Utterance>>,
     pack: &dyn Fn(&[Utterance]) -> Result<Vec<u32>>,
 ) -> Result<()> {
@@ -388,7 +467,7 @@ fn drive(
     }
 
     println!("  Writing corpus...");
-    write_speech_corpus(plan.output, &tokens, vocab)?;
+    write_speech_corpus(plan.output, &tokens, layout)?;
     write_manifest(plan, &sources, &utterances, tokens.len())?;
 
     println!("\n✅ Corpus complete!");
@@ -466,6 +545,8 @@ pub fn run_prep_corpus(args: PrepCorpusArgs) -> Result<()> {
         "Language:   {}",
         plan.opts.language.unwrap_or("auto-detect")
     );
+    println!("Layout:     {}", layout_name(plan.layout));
+    println!("Speaker:    {}", plan.opts.speaker.unwrap_or("none"));
     println!(
         "Utterance:  {:.2} s .. {:.2} s\n",
         plan.opts.min_utterance_secs, plan.opts.vad.max_speech_duration_s
@@ -507,7 +588,7 @@ where
 
     drive(
         plan,
-        builder.vocab(),
+        builder.layout(),
         &|samples: &[f32]| {
             builder
                 .utterances(&client, samples, opts)
@@ -520,7 +601,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The subcommand's arguments behind a parser, so the tests exercise the
+    /// real clap surface — defaults and value-enum errors included — rather
+    /// than a struct literal that would define its own defaults.
+    #[derive(Parser, Debug)]
+    struct Cli {
+        #[command(flatten)]
+        args: PrepCorpusArgs,
+    }
+
+    /// Parse the required flags plus `extra`.
+    fn parse(extra: &[&str]) -> std::result::Result<PrepCorpusArgs, clap::Error> {
+        parse_in("recording.wav", extra)
+    }
+
+    /// Same, but with a caller-chosen `--input`, for the tests that need the
+    /// path to exist on disk so `plan()` can walk it.
+    fn parse_in(input: &str, extra: &[&str]) -> std::result::Result<PrepCorpusArgs, clap::Error> {
+        let mut argv = vec![
+            "prep-corpus",
+            "--input",
+            input,
+            "--output",
+            "corpus.bin",
+            "--vad",
+            "silero_vad_16k.safetensors",
+            "--whisper",
+            "whisper-large-v3",
+            "--neucodec",
+            "neucodec",
+            "--tokenizer",
+            "cl100k_base",
+        ];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv).map(|cli| cli.args)
+    }
 
     /// A fresh directory under the system temp dir. `tempfile` is not a
     /// dependency of this crate, and `tests/speech_corpus.rs` already builds
@@ -703,6 +821,60 @@ mod tests {
     }
 
     #[test]
+    fn the_default_layout_is_the_base_checkpoints_own() {
+        // expressive-tts is the only layout with a real base checkpoint, so a
+        // corpus prepared without thinking about layouts is the one that base
+        // can read.
+        let args = parse(&[]).expect("the required flags alone must parse");
+        assert_eq!(args.layout, LayoutArg::ExpressiveTts);
+    }
+
+    #[test]
+    fn both_layouts_parse() {
+        assert_eq!(
+            parse(&["--layout", "native"])
+                .expect("native must parse")
+                .layout,
+            LayoutArg::Native
+        );
+        assert_eq!(
+            parse(&["--layout", "expressive-tts"])
+                .expect("expressive-tts must parse")
+                .layout,
+            LayoutArg::ExpressiveTts
+        );
+    }
+
+    #[test]
+    fn an_unknown_layout_is_rejected_with_the_accepted_ones() {
+        let message = parse(&["--layout", "mamba"])
+            .expect_err("an unknown layout must not fall back to a default")
+            .to_string();
+
+        assert!(message.contains("mamba"), "{message}");
+        assert!(message.contains("native"), "{message}");
+        assert!(message.contains("expressive-tts"), "{message}");
+    }
+
+    #[test]
+    fn the_speaker_reaches_the_corpus_options() {
+        let dir = scratch_dir("speaker");
+        let path = touch(&dir, "recording.wav");
+        let input = path.to_string_lossy().into_owned();
+
+        let args = parse_in(&input, &["--speaker", "Rahman"]).expect("a speaker name must parse");
+        let planned = plan(&args).expect("a named audio file must plan");
+
+        assert_eq!(planned.opts.speaker, Some("Rahman"));
+
+        // And absent by default: the native layout has never prefixed anything.
+        let bare = parse_in(&input, &[]).expect("the required flags alone must parse");
+        assert_eq!(plan(&bare).unwrap().opts.speaker, None);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn the_manifest_sits_beside_the_corpus() {
         assert_eq!(
             manifest_path(Path::new("data/speech/corpus.bin")),
@@ -727,5 +899,62 @@ mod tests {
             manifest_path(output),
             PathBuf::from("out/ms-speech.manifest.json")
         );
+    }
+
+    /// The VAD knobs must actually reach `VadSegmentOptions`. `min_silence_ms`
+    /// is the one that decides whether utterances are sentences or fragments.
+    #[test]
+    fn the_vad_flags_reach_the_segment_options() {
+        let dir = scratch_dir("vad-flags");
+        let path = touch(&dir, "recording.wav");
+        let input = path.to_string_lossy().into_owned();
+
+        let args = parse_in(
+            &input,
+            &[
+                "--min-silence-ms",
+                "450",
+                "--vad-threshold",
+                "0.6",
+                "--speech-pad-ms",
+                "80",
+            ],
+        )
+        .expect("the vad flags must parse");
+        let planned = plan(&args).expect("a named audio file must plan");
+
+        assert_eq!(planned.opts.vad.min_silence_duration_ms, 450);
+        assert_eq!(planned.opts.vad.threshold, 0.6);
+        assert_eq!(planned.opts.vad.speech_pad_ms, 80);
+
+        // Defaults match the VAD's own, so omitting them changes nothing.
+        let bare = parse_in(&input, &[]).expect("required flags alone must parse");
+        let bare = plan(&bare).expect("plan");
+        assert_eq!(bare.opts.vad.min_silence_duration_ms, 100);
+        assert_eq!(bare.opts.vad.threshold, 0.5);
+        assert_eq!(bare.opts.vad.speech_pad_ms, 30);
+    }
+
+    /// An out-of-range threshold is refused BEFORE a 3 GB Whisper load.
+    #[test]
+    fn a_nonsensical_vad_threshold_is_refused_up_front() {
+        let dir = scratch_dir("vad-threshold");
+        let path = touch(&dir, "recording.wav");
+        let input = path.to_string_lossy().into_owned();
+
+        // A negative value needs the `=` form: clap reads a bare `-0.2` as a flag.
+        for bad in [
+            "--vad-threshold=0",
+            "--vad-threshold=1.5",
+            "--vad-threshold=-0.2",
+            "--vad-threshold=nan",
+        ] {
+            let args =
+                parse_in(&input, &[bad]).expect("clap accepts any f32; the range check is ours");
+            assert!(
+                plan(&args).is_err(),
+                "--vad-threshold {bad} must be refused"
+            );
+        }
     }
 }

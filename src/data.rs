@@ -1,5 +1,5 @@
 use crate::prelude::{DType, Error, Result, Tensor};
-use boostr::model::SpeechVocab;
+use boostr::model::{SpeechLayout, SpeechVocab};
 use boostr::runtime::Runtime;
 use memmap2::Mmap;
 use std::fs::File;
@@ -232,15 +232,21 @@ where
     ///
     /// If the data file has a `*.layout.json` sidecar (see
     /// [`crate::speech_corpus`]), it records the layout the corpus was PACKED
-    /// with and MUST equal `vocab`. Disagreement is a hard error: the ids would
+    /// with and MUST match `vocab`. Disagreement is a hard error: the ids would
     /// resolve to different codebooks and the mask would select different
     /// positions, with nothing else in the pipeline able to notice.
+    ///
+    /// Masking is driven by a [`SpeechVocab`], so the layout this checks against
+    /// is [`SpeechLayout::Native`]. A corpus packed under any other layout —
+    /// `expressive-tts-1.7b`, say — therefore fails here, which is correct: its
+    /// audio ids are not the ones `vocab` describes.
     ///
     /// A missing sidecar is not an error — corpora packed before layouts were
     /// recorded, and plain text corpora, have none.
     pub fn try_with_speech_vocab(self, vocab: SpeechVocab) -> Result<Self> {
         if let Some(path) = &self.source_path {
-            crate::speech_corpus::check_corpus_layout(path, &vocab)?;
+            let layout = SpeechLayout::Native(vocab.clone());
+            crate::speech_corpus::check_corpus_layout(path, &layout)?;
         }
         Ok(self.with_speech_vocab(vocab))
     }
