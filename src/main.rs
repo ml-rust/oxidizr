@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use oxidizr::commands::{self, ImportArgs, MergeArgs, PackArgs, TrainArgs};
+use oxidizr::commands::{self, ImportArgs, MergeArgs, PackArgs, PrepCorpusArgs, TrainArgs};
 
 #[cfg(feature = "huggingface")]
 use oxidizr::commands::PushArgs;
@@ -87,6 +87,9 @@ enum Commands {
     /// Merge LoRA adapters into base weights, writing a plain checkpoint
     Merge(MergeArgs),
 
+    /// Turn audio recordings into a packed speech-LM training corpus
+    PrepCorpus(PrepCorpusArgs),
+
     /// Push a packaged model to HuggingFace Hub
     #[cfg(feature = "huggingface")]
     Push(PushArgs),
@@ -124,6 +127,7 @@ fn main() -> Result<()> {
         Some(Commands::Import(args)) => commands::run_import(args),
         Some(Commands::Pack(args)) => commands::run_pack(args),
         Some(Commands::Merge(args)) => commands::run_merge(args),
+        Some(Commands::PrepCorpus(args)) => commands::run_prep_corpus(args),
         #[cfg(feature = "huggingface")]
         Some(Commands::Push(args)) => commands::run_push(args),
         None => {
@@ -163,6 +167,15 @@ fn main() -> Result<()> {
             );
                 println!(
                     "                                     Merge LoRA adapters into base weights"
+                );
+                println!(
+                    "  oxidizr prep-corpus -i <audio-dir> -o <corpus.bin> --vad <vad.safetensors>"
+                );
+                println!(
+                    "                      --whisper <dir> --neucodec <ckpt> --tokenizer <name>"
+                );
+                println!(
+                    "                                     Build a speech-LM corpus from audio"
                 );
                 #[cfg(feature = "huggingface")]
                 println!("  oxidizr push                       Push model to HuggingFace");
