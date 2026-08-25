@@ -38,6 +38,30 @@ nccl = ["cuda", "boostr/nccl"]
 # HuggingFace Hub integration for model publishing
 huggingface = ["dep:hf-hub"]
 
+# Bundled tokenizer vocabularies, forwarded to boostr and on to splintr. These
+# are what make `prep-corpus --tokenizer <name>` work for a name: the
+# vocabulary DATA is feature-gated (2.6-6.4 MB per family) and none is bundled
+# by default. `--tokenizer <path-to-tokenizer.json>` needs none of them, and is
+# the better choice for a real checkpoint because it carries its added tokens.
+vocab-cl100k = ["boostr/vocab-cl100k"]
+vocab-o200k = ["boostr/vocab-o200k"]
+vocab-gpt-oss = ["boostr/vocab-gpt-oss"]
+vocab-phi4 = ["boostr/vocab-phi4"]
+vocab-olmo2 = ["boostr/vocab-olmo2"]
+vocab-llama3 = ["boostr/vocab-llama3"]
+vocab-llama2 = ["boostr/vocab-llama2"]
+vocab-deepseek = ["boostr/vocab-deepseek"]
+vocab-qwen = ["boostr/vocab-qwen"]
+vocab-glm = ["boostr/vocab-glm"]
+vocab-gemma2 = ["boostr/vocab-gemma2"]
+vocab-gemma3 = ["boostr/vocab-gemma3"]
+vocab-gemma4 = ["boostr/vocab-gemma4"]
+vocab-kimi = ["boostr/vocab-kimi"]
+vocab-mistral = ["boostr/vocab-mistral"]
+vocab-modernbert = ["boostr/vocab-modernbert"]
+# Every bundled vocabulary at once.
+vocabs = ["boostr/vocabs"]
+
 [dependencies]
 # boostr: Complete ML framework replacing Candle
 # Provides: Tensor, Device, DType, Linear, Embedding, VarBuilder, etc.
