@@ -33,6 +33,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -92,15 +93,15 @@ pub struct PrepCorpusArgs {
     pub output: String,
 
     /// Silero VAD checkpoint (silero_vad_16k.safetensors)
-    #[arg(long = "vad")]
-    pub vad: String,
+    #[arg(long = "vad", required_unless_present = "scripted")]
+    pub vad: Option<String>,
 
     /// Whisper checkpoint directory (config.json + *.safetensors). fp16
     /// checkpoints such as whisper-large-v3 are cast to f32 on load. On CPU
     /// large-v3 costs roughly five minutes per 30 s of audio — build with
     /// --features cuda for a real corpus
-    #[arg(long = "whisper")]
-    pub whisper: String,
+    #[arg(long = "whisper", required_unless_present = "scripted")]
+    pub whisper: Option<String>,
 
     /// NeuCodec checkpoint (file, or the directory holding model.safetensors)
     #[arg(long = "neucodec")]
@@ -166,6 +167,24 @@ pub struct PrepCorpusArgs {
     #[arg(long = "pad-to-multiple")]
     pub pad_to_multiple: Option<usize>,
 
+    /// TSV mapping each recording to the exact text that was read, turning this
+    /// into a SCRIPTED run: no VAD, no Whisper, one utterance per file.
+    ///
+    /// Columns `file` (basename, with or without `.wav`) and `text`; any other
+    /// columns are ignored, so a recorder's own manifest can be passed as-is.
+    ///
+    /// Use this whenever the text is known, which for prompted recording is
+    /// always. ASR over 52 prompted takes scored 31.6% WER against the prompts
+    /// that produced them, mostly because `--language` forces one language on a
+    /// code-switching corpus and translates the rest: "Before we go further,
+    /// save what you have right now" came back in Malay. That pairs English
+    /// audio with Malay text, and nothing downstream can notice.
+    ///
+    /// Skips loading the VAD and Whisper checkpoints entirely, so `--vad` and
+    /// `--whisper` are not required with it.
+    #[arg(long = "scripted", value_name = "TSV")]
+    pub scripted: Option<String>,
+
     /// Clean up each recording before segmenting it: rumble filter, spectral
     /// denoise, tone shaping, then loudness normalization under a peak ceiling.
     ///
@@ -211,8 +230,11 @@ pub struct PrepCorpusArgs {
 struct Plan<'a> {
     files: Vec<PathBuf>,
     output: &'a Path,
-    vad_path: &'a Path,
-    whisper_dir: &'a Path,
+    /// Absent in a scripted run, which loads neither checkpoint.
+    vad_path: Option<&'a Path>,
+    whisper_dir: Option<&'a Path>,
+    /// `file stem -> exact transcript`, present only for a scripted run.
+    scripted: Option<HashMap<String, String>>,
     neucodec_path: &'a Path,
     tokenizer: TextTokenizer<'a>,
     /// Chosen here, resolved into a [`SpeechLayout`] only by the builder: the
@@ -362,6 +384,36 @@ fn plan(args: &PrepCorpusArgs) -> Result<Plan<'_>> {
     }
 
     let files = collect_inputs(Path::new(&args.input))?;
+
+    // Read the transcripts at PLAN time, before any checkpoint is touched: a
+    // malformed TSV should cost nothing, and a recording with no transcript
+    // must be reported before a multi-gigabyte load, not after.
+    let scripted = match &args.scripted {
+        Some(path) => {
+            let map = read_scripted(Path::new(path))?;
+            let missing: Vec<String> = files
+                .iter()
+                .filter_map(|f| f.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .filter(|stem| !map.contains_key(stem))
+                .collect();
+            if !missing.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "--scripted {} has no transcript for {} recording(s): {}{}",
+                    path,
+                    missing.len(),
+                    missing
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if missing.len() > 5 { ", ..." } else { "" }
+                ));
+            }
+            Some(map)
+        }
+        None => None,
+    };
     let tokenizer = resolve_tokenizer(&args.tokenizer)?;
 
     let defaults = CorpusOptions::default();
@@ -393,13 +445,73 @@ fn plan(args: &PrepCorpusArgs) -> Result<Plan<'_>> {
     Ok(Plan {
         files,
         output: Path::new(&args.output),
-        vad_path: Path::new(&args.vad),
-        whisper_dir: Path::new(&args.whisper),
+        vad_path: args.vad.as_deref().map(Path::new),
+        whisper_dir: args.whisper.as_deref().map(Path::new),
+        scripted,
         neucodec_path: Path::new(&args.neucodec),
         tokenizer,
         layout: args.layout,
         opts,
     })
+}
+
+/// Read a `--scripted` TSV into `file stem -> transcript`.
+///
+/// Columns `file` and `text` are required; everything else is ignored so a
+/// recorder's own manifest can be passed unchanged. The `.wav` suffix is
+/// optional in the `file` column, and matching is by stem, so a manifest that
+/// names `C07_take3.wav` matches the recording of that name.
+fn read_scripted(path: &Path) -> Result<HashMap<String, String>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading --scripted {}", path.display()))?;
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("--scripted {} is empty", path.display()))?
+        .split('\t')
+        .collect();
+    let col = |name: &str| {
+        header.iter().position(|h| h.trim() == name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--scripted {} has no `{name}` column; found [{}]",
+                path.display(),
+                header.join(", ")
+            )
+        })
+    };
+    let (fi, ti) = (col("file")?, col("text")?);
+
+    let mut out = HashMap::new();
+    for (n, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cells: Vec<&str> = line.split('\t').collect();
+        let (Some(file), Some(t)) = (cells.get(fi), cells.get(ti)) else {
+            return Err(anyhow::anyhow!(
+                "--scripted {} line {} has {} column(s), needs at least {}",
+                path.display(),
+                n + 2,
+                cells.len(),
+                fi.max(ti) + 1
+            ));
+        };
+        let stem = Path::new(file.trim())
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if stem.is_empty() || t.trim().is_empty() {
+            continue;
+        }
+        out.insert(stem, t.trim().to_string());
+    }
+    if out.is_empty() {
+        return Err(anyhow::anyhow!(
+            "--scripted {} lists no usable rows",
+            path.display()
+        ));
+    }
+    Ok(out)
 }
 
 /// Load the three checkpoints and the tokenizer into one builder.
@@ -412,12 +524,41 @@ where
     R: Runtime<DType = DType>,
     C: TypeConversionOps<R>,
 {
-    println!("  VAD:       {}", plan.vad_path.display());
-    let vad = SileroVad::<R>::from_safetensors(plan.vad_path, device)?;
+    // A scripted run loads neither the VAD nor Whisper: it has the transcript
+    // and each recording is one utterance, so there is nothing for them to do
+    // and no reason to spend the load time or the memory.
+    if plan.scripted.is_some() {
+        println!("  NeuCodec:  {}", plan.neucodec_path.display());
+        let codec = NeuCodecEncoder::<R>::from_safetensors(plan.neucodec_path, device)?;
+        println!("  Tokenizer: {:?}", plan.tokenizer);
+        println!("  Layout:    {}", layout_name(plan.layout));
+        println!("  Mode:      scripted (no VAD, no ASR)");
+        return match plan.layout {
+            LayoutArg::ExpressiveTts => {
+                SpeechCorpusBuilder::new_scripted_expressive_tts(codec, plan.tokenizer)
+                    .map_err(Into::into)
+            }
+            LayoutArg::Native => Err(anyhow::anyhow!(
+                "--scripted currently supports --layout expressive-tts only: the native \
+                 layout derives its SpeechVocab from the loaded models, and a scripted \
+                 run does not load them"
+            )),
+        };
+    }
 
-    println!("  Whisper:   {}", plan.whisper_dir.display());
+    let vad_path = plan
+        .vad_path
+        .ok_or_else(|| anyhow::anyhow!("--vad is required without --scripted"))?;
+    let whisper_dir = plan
+        .whisper_dir
+        .ok_or_else(|| anyhow::anyhow!("--whisper is required without --scripted"))?;
+
+    println!("  VAD:       {}", vad_path.display());
+    let vad = SileroVad::<R>::from_safetensors(vad_path, device)?;
+
+    println!("  Whisper:   {}", whisper_dir.display());
     let whisper =
-        WhisperBundle::<R>::from_dir_with_dtype(plan.whisper_dir, device, client, DType::F32)?;
+        WhisperBundle::<R>::from_dir_with_dtype(whisper_dir, device, client, DType::F32)?;
 
     println!("  NeuCodec:  {}", plan.neucodec_path.display());
     let codec = NeuCodecEncoder::<R>::from_safetensors(plan.neucodec_path, device)?;
@@ -448,7 +589,7 @@ const fn layout_name(layout: LayoutArg) -> &'static str {
 fn drive(
     plan: &Plan<'_>,
     layout: &SpeechLayout,
-    utterances_of: &dyn Fn(&[f32]) -> Result<Vec<Utterance>>,
+    utterances_of: &dyn Fn(&Path, &[f32]) -> Result<Vec<Utterance>>,
     pack: &dyn Fn(&[Utterance]) -> Result<Vec<u32>>,
 ) -> Result<()> {
     let sample_rate = plan.opts.sample_rate;
@@ -469,7 +610,7 @@ fn drive(
         let samples = decode_audio_file_mono_at(file, decode_rate)
             .with_context(|| format!("Failed to decode '{}'", file.display()))?;
 
-        let prepared = utterances_of(&samples)
+        let prepared = utterances_of(file, &samples)
             .with_context(|| format!("Failed to prepare utterances from '{}'", file.display()))?;
 
         let speech_secs: f64 = prepared
@@ -634,10 +775,26 @@ where
     drive(
         plan,
         builder.layout(),
-        &|samples: &[f32]| {
-            builder
+        &|file: &Path, samples: &[f32]| match &plan.scripted {
+            // Scripted: the transcript is known, so the whole recording is one
+            // utterance and neither the segmenter nor the recognizer runs.
+            // `read_scripted` already proved every file has an entry.
+            Some(map) => {
+                let stem = file
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let text = map.get(&stem).ok_or_else(|| {
+                    anyhow::anyhow!("no transcript for {stem} (checked at plan time)")
+                })?;
+                builder
+                    .scripted_utterance(&client, samples, text, opts)
+                    .map(|u| vec![u])
+                    .map_err(anyhow::Error::from)
+            }
+            None => builder
                 .utterances(&client, samples, opts)
-                .map_err(anyhow::Error::from)
+                .map_err(anyhow::Error::from),
         },
         &|utterances: &[Utterance]| builder.pack(utterances, opts).map_err(anyhow::Error::from),
     )
