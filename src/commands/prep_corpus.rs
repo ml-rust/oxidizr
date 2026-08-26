@@ -557,8 +557,7 @@ where
     let vad = SileroVad::<R>::from_safetensors(vad_path, device)?;
 
     println!("  Whisper:   {}", whisper_dir.display());
-    let whisper =
-        WhisperBundle::<R>::from_dir_with_dtype(whisper_dir, device, client, DType::F32)?;
+    let whisper = WhisperBundle::<R>::from_dir_with_dtype(whisper_dir, device, client, DType::F32)?;
 
     println!("  NeuCodec:  {}", plan.neucodec_path.display());
     let codec = NeuCodecEncoder::<R>::from_safetensors(plan.neucodec_path, device)?;
