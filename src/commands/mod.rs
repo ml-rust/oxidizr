@@ -11,6 +11,7 @@
 pub mod import;
 pub mod merge;
 pub mod pack;
+#[cfg(feature = "audio")]
 pub mod prep_corpus;
 pub mod train;
 
@@ -20,6 +21,7 @@ pub mod push;
 pub use import::{run_import, ImportArgs};
 pub use merge::{run_merge, MergeArgs};
 pub use pack::{run_pack, PackArgs};
+#[cfg(feature = "audio")]
 pub use prep_corpus::{run_prep_corpus, PrepCorpusArgs};
 pub use train::{run_train, TrainArgs};
 

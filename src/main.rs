@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use oxidizr::commands::{self, ImportArgs, MergeArgs, PackArgs, PrepCorpusArgs, TrainArgs};
+#[cfg(feature = "audio")]
+use oxidizr::commands::PrepCorpusArgs;
+use oxidizr::commands::{self, ImportArgs, MergeArgs, PackArgs, TrainArgs};
 
 #[cfg(feature = "huggingface")]
 use oxidizr::commands::PushArgs;
@@ -88,6 +90,7 @@ enum Commands {
     Merge(MergeArgs),
 
     /// Turn audio recordings into a packed speech-LM training corpus
+    #[cfg(feature = "audio")]
     PrepCorpus(PrepCorpusArgs),
 
     /// Push a packaged model to HuggingFace Hub
@@ -127,6 +130,7 @@ fn main() -> Result<()> {
         Some(Commands::Import(args)) => commands::run_import(args),
         Some(Commands::Pack(args)) => commands::run_pack(args),
         Some(Commands::Merge(args)) => commands::run_merge(args),
+        #[cfg(feature = "audio")]
         Some(Commands::PrepCorpus(args)) => commands::run_prep_corpus(args),
         #[cfg(feature = "huggingface")]
         Some(Commands::Push(args)) => commands::run_push(args),

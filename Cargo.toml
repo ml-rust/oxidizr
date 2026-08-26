@@ -38,6 +38,15 @@ nccl = ["cuda", "boostr/nccl"]
 # HuggingFace Hub integration for model publishing
 huggingface = ["dep:hf-hub"]
 
+# Speech corpus preparation: the `prep-corpus` command, which needs boostr's
+# VAD, Whisper, NeuCodec and enhancement chain. Off by default — a text-only
+# training build has no use for four codec decoders and 21k lines of audio.
+#
+# The layout sidecar (`speech_corpus`) is NOT gated: a text-only build still
+# has to read `foo.layout.json` to refuse a speech corpus packed under a
+# different layout, and that code is pure JSON with no audio dependency.
+audio = ["boostr/audio"]
+
 # Bundled tokenizer vocabularies, forwarded to boostr and on to splintr. These
 # are what make `prep-corpus --tokenizer <name>` work for a name: the
 # vocabulary DATA is feature-gated (2.6-6.4 MB per family) and none is bundled

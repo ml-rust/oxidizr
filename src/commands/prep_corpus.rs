@@ -36,6 +36,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use boostr::model::audio::enhance::EnhanceOptions;
 use boostr::model::audio::neucodec::{NeuCodecClient, NeuCodecEncoder};
 use boostr::model::audio::{
     check_max_speech_duration, decode_audio_file_mono_at, CorpusOptions, SileroVad,
@@ -164,6 +165,40 @@ pub struct PrepCorpusArgs {
     /// Pad the packed stream to a multiple of this many tokens
     #[arg(long = "pad-to-multiple")]
     pub pad_to_multiple: Option<usize>,
+
+    /// Clean up each recording before segmenting it: rumble filter, spectral
+    /// denoise, tone shaping, then loudness normalization under a peak ceiling.
+    ///
+    /// Leave this off for audio that is already treated. Turn it on for raw
+    /// recordings — a reference cut from an untreated take was measured to
+    /// clone at -36 LUFS against -14 LUFS from the same segment enhanced,
+    /// because the model inherits the level and the noise floor of what it is
+    /// given.
+    ///
+    /// Runs over the whole recording, before the VAD, never per utterance: the
+    /// denoiser reads its noise profile from the pauses between phrases, and
+    /// one gain per recording keeps the relative loudness between utterances
+    /// that per-clip normalization would erase.
+    #[arg(long = "enhance")]
+    pub enhance: bool,
+
+    /// Loudness target for --enhance, in LUFS.
+    #[arg(
+        long = "enhance-target-lufs",
+        default_value = "-18.0",
+        requires = "enhance"
+    )]
+    pub enhance_target_lufs: f64,
+
+    /// Low-shelf gain for --enhance, in dB. Restores the weight the rumble
+    /// filter and the denoiser take off the bottom.
+    #[arg(long = "enhance-bass-db", default_value = "3.0", requires = "enhance")]
+    pub enhance_bass_db: f64,
+
+    /// Skip the denoiser while keeping the rest of --enhance. Use when the
+    /// recording is quiet but clean, or when a gate must not touch the signal.
+    #[arg(long = "enhance-no-denoise", requires = "enhance")]
+    pub enhance_no_denoise: bool,
 
     /// Override target device: "gpu" or "cpu" (default gpu when built with
     /// the cuda feature)
@@ -342,6 +377,16 @@ fn plan(args: &PrepCorpusArgs) -> Result<Plan<'_>> {
         speaker: args.speaker.as_deref(),
         min_utterance_secs: args.min_utterance_secs,
         pad_to_multiple: args.pad_to_multiple,
+        enhance: args.enhance.then(|| EnhanceOptions {
+            target_lufs: args.enhance_target_lufs,
+            bass_boost_db: args.enhance_bass_db,
+            denoise: if args.enhance_no_denoise {
+                None
+            } else {
+                EnhanceOptions::default().denoise
+            },
+            ..EnhanceOptions::default()
+        }),
         ..defaults
     };
 
