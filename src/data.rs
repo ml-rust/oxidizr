@@ -1,5 +1,5 @@
 use crate::prelude::{DType, Error, Result, Tensor};
-use boostr::model::{SpeechLayout, SpeechVocab};
+use boostr::model::SpeechLayout;
 use boostr::runtime::Runtime;
 use memmap2::Mmap;
 use std::fs::File;
@@ -40,7 +40,7 @@ pub struct Batch<R: Runtime<DType = DType>> {
 /// Shared by `LitDataLoader::next_batch` and `PrefetchDataLoader::prefetch_worker`
 /// so the two shift paths cannot diverge.
 fn audio_target_mask(
-    vocab: &SpeechVocab,
+    layout: &SpeechLayout,
     slice: &[u32],
     batch_size: usize,
     seq_len: usize,
@@ -50,7 +50,7 @@ fn audio_target_mask(
         let row_start = b * (seq_len + 1);
         for s in 0..seq_len {
             let target = slice[row_start + s + 1];
-            mask.push(if vocab.is_audio(target) { 1.0 } else { 0.0 });
+            mask.push(if layout.is_audio(target) { 1.0 } else { 0.0 });
         }
     }
     mask
@@ -104,10 +104,10 @@ where
     shard_start: usize,
     shard_end: usize,
     /// Speech id layout. `Some` turns on audio-only loss masking.
-    speech_vocab: Option<SpeechVocab>,
+    speech_layout: Option<SpeechLayout>,
     /// File this loader was opened from, `None` for in-memory data.
     ///
-    /// Kept so [`try_with_speech_vocab`](Self::try_with_speech_vocab) can find
+    /// Kept so [`try_with_speech_layout`](Self::try_with_speech_layout) can find
     /// the corpus layout sidecar that sits beside it.
     source_path: Option<PathBuf>,
 }
@@ -140,7 +140,7 @@ where
             device,
             shard_start: 0,
             shard_end: len,
-            speech_vocab: None,
+            speech_layout: None,
             source_path: None,
         }
     }
@@ -210,7 +210,7 @@ where
             device,
             shard_start: 0,
             shard_end: len,
-            speech_vocab: None,
+            speech_layout: None,
             source_path: Some(path_ref.to_path_buf()),
         })
     }
@@ -221,10 +221,10 @@ where
     /// position, as it did before speech support existed.
     ///
     /// This form does NOT check the corpus layout sidecar. Prefer
-    /// [`try_with_speech_vocab`](Self::try_with_speech_vocab) for any loader
+    /// [`try_with_speech_layout`](Self::try_with_speech_layout) for any loader
     /// opened from a file.
-    pub fn with_speech_vocab(mut self, vocab: SpeechVocab) -> Self {
-        self.speech_vocab = Some(vocab);
+    pub fn with_speech_layout(mut self, layout: SpeechLayout) -> Self {
+        self.speech_layout = Some(layout);
         self
     }
 
@@ -236,19 +236,17 @@ where
     /// resolve to different codebooks and the mask would select different
     /// positions, with nothing else in the pipeline able to notice.
     ///
-    /// Masking is driven by a [`SpeechVocab`], so the layout this checks against
-    /// is [`SpeechLayout::Native`]. A corpus packed under any other layout —
-    /// `expressive-tts-1.7b`, say — therefore fails here, which is correct: its
-    /// audio ids are not the ones `vocab` describes.
+    /// Masking is driven by the layout itself, so EITHER layout can be checked
+    /// here: a corpus packed as `expressive-tts-1.7b` is accepted when that is
+    /// what the run configures, and rejected when it is not.
     ///
     /// A missing sidecar is not an error — corpora packed before layouts were
     /// recorded, and plain text corpora, have none.
-    pub fn try_with_speech_vocab(self, vocab: SpeechVocab) -> Result<Self> {
+    pub fn try_with_speech_layout(self, layout: SpeechLayout) -> Result<Self> {
         if let Some(path) = &self.source_path {
-            let layout = SpeechLayout::Native(vocab.clone());
             crate::speech_corpus::check_corpus_layout(path, &layout)?;
         }
-        Ok(self.with_speech_vocab(vocab))
+        Ok(self.with_speech_layout(layout))
     }
 
     /// Configure data sharding for multi-GPU training
@@ -341,9 +339,9 @@ where
 
         // Built from the same `slice`, over the post-shift target window, so it
         // lines up element-for-element with `targets` above.
-        let loss_mask = match &self.speech_vocab {
-            Some(vocab) => {
-                let mask = audio_target_mask(vocab, slice, self.batch_size, self.seq_len);
+        let loss_mask = match &self.speech_layout {
+            Some(layout) => {
+                let mask = audio_target_mask(layout, slice, self.batch_size, self.seq_len);
                 Some(Tensor::<R>::from_slice(
                     &mask,
                     &[self.batch_size, self.seq_len],
@@ -561,9 +559,9 @@ where
             // Same helper as the synchronous path, over the same post-shift
             // target window, so the two loaders cannot produce different masks.
             let loss_mask = loader
-                .speech_vocab
+                .speech_layout
                 .as_ref()
-                .map(|vocab| audio_target_mask(vocab, slice, loader.batch_size, loader.seq_len));
+                .map(|layout| audio_target_mask(layout, slice, loader.batch_size, loader.seq_len));
 
             // Prepare inputs and targets (still on CPU as Vec<u32>)
             let mut inputs = Vec::with_capacity(loader.batch_size * loader.seq_len);
@@ -758,7 +756,7 @@ mod tests {
 
     fn loader(tokens: Vec<u32>, batch_size: usize, seq_len: usize) -> LitDataLoader<CpuRuntime> {
         LitDataLoader::<CpuRuntime>::new(tokens, batch_size, seq_len, CpuDevice::new())
-            .with_speech_vocab(toy_vocab())
+            .with_speech_layout(SpeechLayout::Native(toy_vocab()))
     }
 
     /// The mask must answer "is the token being PREDICTED audio", so it is built
@@ -806,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn no_speech_vocab_means_no_loss_mask() {
+    fn no_speech_layout_means_no_loss_mask() {
         let base = audio_base();
         let tokens = vec![0, 1, base, base + 1, 2, 3];
         let mut l = LitDataLoader::<CpuRuntime>::new(tokens, 1, 5, CpuDevice::new());

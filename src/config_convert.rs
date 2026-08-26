@@ -8,7 +8,7 @@
 //! to boostr once instead of hand-ported into every oxidizr consumer.
 
 use crate::config::{
-    OxidizrModelConfig, RopeScalingSpec, MLP_LORA_TARGETS, SUPPORTED_LORA_TARGETS,
+    OxidizrModelConfig, RopeScalingSpec, SpeechLayoutSpec, MLP_LORA_TARGETS, SUPPORTED_LORA_TARGETS,
 };
 use crate::prelude::Result;
 use boostr::error::Error;
@@ -109,24 +109,35 @@ fn to_rope_scaling(spec: &RopeScalingSpec) -> RopeScalingConfig {
 /// every model type but only the `llama` (`AttentionOnly`) path actually
 /// reads `sliding_window`, and only `llama`/`hybrid` read `rope_scaling` —
 /// the rest would silently do nothing.
-/// `speech_vocab` must describe exactly the id space the embedding table covers.
+/// `speech_layout` must describe exactly the id space the embedding table covers.
 ///
 /// A mismatch means the audio range the loss mask selects and the row count the
 /// model allocates disagree, which masks the wrong positions without ever
 /// erroring at runtime.
-fn validate_speech_vocab(cfg: &OxidizrModelConfig) -> Result<()> {
-    let Some(vocab) = &cfg.speech_vocab else {
+fn validate_speech_layout(cfg: &OxidizrModelConfig) -> Result<()> {
+    let Some(spec) = &cfg.speech_layout else {
         return Ok(());
     };
-    let total = vocab.total_size();
+    let layout = spec.layout();
+    let total = layout.total_size();
     if total != cfg.vocab_size {
+        let fix = match spec {
+            SpeechLayoutSpec::Native { .. } => {
+                "fix the native vocab (text_vocab_size + control_region_size + codec tokens)"
+            }
+            // The expressive_tts layout is fixed by that checkpoint, so the
+            // vocab_size is the side that is wrong here, never the layout.
+            SpeechLayoutSpec::ExpressiveTts => {
+                "the expressive_tts layout is fixed by the checkpoint, so vocab_size is what \
+                 must change"
+            }
+        };
         return Err(model_error(format!(
-            "speech_vocab.total_size() is {total} but vocab_size is {}: the audio id \
+            "speech_layout ({}) covers {total} ids but vocab_size is {}: the audio id \
              range and the embedding table disagree, so audio-only loss masking \
-             would score the wrong positions. Set vocab_size to {total}, or fix \
-             speech_vocab (text_vocab_size + control_region_size + codec tokens) \
-             to total {}.",
-            cfg.vocab_size, cfg.vocab_size
+             would score the wrong positions. Set vocab_size to {total}, or {fix}.",
+            layout.name(),
+            cfg.vocab_size,
         )));
     }
     Ok(())
@@ -403,7 +414,7 @@ impl OxidizrModelConfig {
         let has_mamba = !ssm_layers.is_empty();
         let mamba3 = self.mamba3_enabled.unwrap_or(false);
         validate_attention_extras(self, &shape)?;
-        validate_speech_vocab(self)?;
+        validate_speech_layout(self)?;
         validate_lora(self, &shape)?;
 
         let moe = to_moe(self)?;

@@ -108,7 +108,7 @@ fn scratch_dir(name: &str) -> PathBuf {
 fn mask_of(path: &Path, vocab: SpeechVocab, seq_len: usize) -> Vec<f32> {
     let mut loader = LitDataLoader::<CpuRuntime>::from_file(path, 1, seq_len, CpuDevice::new())
         .unwrap()
-        .try_with_speech_vocab(vocab)
+        .try_with_speech_layout(SpeechLayout::Native(vocab))
         .unwrap();
     let batch = loader.next_batch().unwrap();
     batch
@@ -205,7 +205,9 @@ fn layout_mismatch_is_rejected() {
 
     // The loader must refuse it too, not just the free function.
     let loader = LitDataLoader::<CpuRuntime>::from_file(&bin, 1, 4, CpuDevice::new()).unwrap();
-    assert!(loader.try_with_speech_vocab(other_vocab()).is_err());
+    assert!(loader
+        .try_with_speech_layout(SpeechLayout::Native(other_vocab()))
+        .is_err());
 
     fs::remove_dir_all(&dir).unwrap();
 }

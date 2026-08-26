@@ -5081,7 +5081,7 @@ mod tie_word_embeddings_tests {
             rope_scaling: None,
             sliding_window: None,
             qk_norm: false,
-            speech_vocab: None,
+            speech_layout: None,
             lora: None,
             dtype: crate::config::DTypePrecision::F32,
         }
@@ -5403,7 +5403,7 @@ mod head_dim_tests {
             rope_scaling: None,
             sliding_window: None,
             qk_norm: false,
-            speech_vocab: None,
+            speech_layout: None,
             lora: None,
             dtype: crate::config::DTypePrecision::F32,
         }
@@ -5653,7 +5653,7 @@ mod frozen_parameter_tests {
             rope_scaling: None,
             sliding_window: None,
             qk_norm: false,
-            speech_vocab: None,
+            speech_layout: None,
             lora: None,
             dtype: crate::config::DTypePrecision::F32,
         }
@@ -5929,7 +5929,7 @@ mod lora_tests {
             rope_scaling: None,
             sliding_window: None,
             qk_norm: false,
-            speech_vocab: None,
+            speech_layout: None,
             lora,
             dtype: crate::config::DTypePrecision::F32,
         }
@@ -6667,7 +6667,7 @@ mod lora_freeze_base_tests {
             rope_scaling: None,
             sliding_window: None,
             qk_norm: false,
-            speech_vocab: None,
+            speech_layout: None,
             lora: Some(lora),
             dtype: crate::config::DTypePrecision::F32,
         }
@@ -6961,7 +6961,7 @@ mod moe_lora_tests {
             rope_scaling: None,
             sliding_window: None,
             qk_norm: false,
-            speech_vocab: None,
+            speech_layout: None,
             lora,
             dtype: crate::config::DTypePrecision::F32,
         }
@@ -7417,7 +7417,7 @@ mod checkpoint_completeness_tests {
             rope_scaling: None,
             sliding_window: None,
             qk_norm: false,
-            speech_vocab: None,
+            speech_layout: None,
             lora,
             dtype: crate::config::DTypePrecision::F32,
         }
@@ -7965,7 +7965,7 @@ mod legacy_moe_tests {
             rope_scaling: None,
             sliding_window: None,
             qk_norm: false,
-            speech_vocab: None,
+            speech_layout: None,
             lora,
             dtype: crate::config::DTypePrecision::F32,
         }

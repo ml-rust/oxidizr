@@ -1,4 +1,4 @@
-use boostr::model::SpeechVocab;
+use boostr::model::{SpeechLayout, SpeechVocab};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -183,14 +183,28 @@ pub struct OxidizrModelConfig {
     ///
     /// Present turns ON audio-only loss masking: the data loader emits a
     /// per-token mask and the trainer scores only positions whose target is an
-    /// audio id, judged by `SpeechVocab::is_audio`. Absent leaves text-only
+    /// audio id, judged by `SpeechLayout::is_audio`. Absent leaves text-only
     /// training byte-identical.
+    ///
+    /// Accepts BOTH layouts, because a corpus can be packed under either and
+    /// the mask has to select the positions its packer actually wrote audio
+    /// into. Naming only the native vocabulary here — as this field once did —
+    /// left a corpus packed as `expressive_tts` unable to express masking at
+    /// all, so it had to train with loss on its text tokens, where the text is
+    /// the conditioning and not the target.
+    ///
+    /// YAML:
+    ///
+    /// ```yaml
+    /// speech_layout:
+    ///   kind: expressive_tts
+    /// ```
     ///
     /// `skip_serializing_if` keeps the key out of the JSON that
     /// `compute_model_config_hash` hashes, so every pre-existing checkpoint
     /// keeps its hash and still passes resume validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speech_vocab: Option<SpeechVocab>,
+    pub speech_layout: Option<SpeechLayoutSpec>,
 
     /// Model precision (f32/f16/bf16) - default F32
     /// Mixed precision: SSM (Mamba/Mamba2) and RMSNorm always use F32 internally
@@ -253,6 +267,34 @@ pub const SUPPORTED_LORA_TARGETS: [&str; 7] = [
 /// These are the only targets the MLA attention path can honor, since MLA
 /// carries no `q_proj`/`k_proj`/`v_proj`/`o_proj` to wrap.
 pub const MLP_LORA_TARGETS: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
+
+/// How a config names a speech-LM id layout.
+///
+/// A tagged enum rather than a bare [`SpeechVocab`]: the native layout carries
+/// a vocabulary that must be written out in full, while `expressive_tts` is a
+/// fixed layout whose ids come from that checkpoint's `added_tokens.json` and
+/// which therefore takes no parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SpeechLayoutSpec {
+    /// boostr's own layout: text, a reserved control region, then audio.
+    Native {
+        #[serde(flatten)]
+        vocab: SpeechVocab,
+    },
+    /// The `Multilingual-Expressive-TTS-1.7B` layout.
+    ExpressiveTts,
+}
+
+impl SpeechLayoutSpec {
+    /// The layout this names.
+    pub fn layout(&self) -> SpeechLayout {
+        match self {
+            Self::Native { vocab } => SpeechLayout::Native(vocab.clone()),
+            Self::ExpressiveTts => SpeechLayout::expressive_tts(),
+        }
+    }
+}
 
 /// LoRA adapter parameters. See [`OxidizrModelConfig::lora`] for why this
 /// lives on the model config.
@@ -557,7 +599,7 @@ pub struct TrainerConfig {
     /// On `TrainerConfig`, not `OxidizrModelConfig`: `compute_model_config_hash`
     /// hashes `OxidizrModelConfig` to gate checkpoint-resume compatibility, and
     /// a seed changes neither tensor shapes nor which tensors exist — only the
-    /// values they start from. Unlike `lora`/`speech_vocab`, which alter the
+    /// values they start from. Unlike `lora`/`speech_layout`, which alter the
     /// parameter set and so must be reflected (or explicitly stripped) in that
     /// hash, `seed` belongs with the other optimizer/run knobs on
     /// `TrainerConfig` and needs no stripping because it was never in the
@@ -687,7 +729,7 @@ impl LitConfig {
                 rope_scaling: None,
                 sliding_window: None,
                 qk_norm: false,
-                speech_vocab: None,
+                speech_layout: None,
                 lora: None,
                 dtype: DTypePrecision::F32,
             },
@@ -775,7 +817,7 @@ impl LitConfig {
                 rope_scaling: None,
                 sliding_window: None,
                 qk_norm: false,
-                speech_vocab: None,
+                speech_layout: None,
                 lora: None,
                 dtype: DTypePrecision::F32,
             },
@@ -1380,28 +1422,55 @@ mod tests {
             .expect("valid vocab")
     }
 
-    /// `speech_vocab` is a new field on an existing struct, so an unset value
-    /// must be omitted from the hashed JSON entirely; serializing it as `null`
-    /// would change the hash of every pre-existing checkpoint's config.
+    /// `speech_layout` is an optional field, so an unset value must be omitted
+    /// from the hashed JSON entirely; serializing it as `null` would change the
+    /// hash of every pre-existing checkpoint's config.
     #[test]
-    fn speech_vocab_unset_does_not_change_the_config_hash() {
+    fn speech_layout_unset_does_not_change_the_config_hash() {
         let cfg = LitConfig::nano_baseline().model;
-        assert!(cfg.speech_vocab.is_none());
+        assert!(cfg.speech_layout.is_none());
 
         let value = serde_json::to_value(&cfg).unwrap();
         let map = value.as_object().unwrap();
         assert!(
-            !map.contains_key("speech_vocab"),
-            "speech_vocab must be omitted from JSON when unset"
+            !map.contains_key("speech_layout"),
+            "speech_layout must be omitted from JSON when unset"
         );
     }
 
     #[test]
-    fn speech_vocab_set_changes_the_config_hash() {
+    fn speech_layout_set_changes_the_config_hash() {
         let mut cfg = LitConfig::nano_baseline().model;
         let before = compute_model_config_hash(&cfg);
-        cfg.speech_vocab = Some(toy_speech_vocab());
+        cfg.speech_layout = Some(SpeechLayoutSpec::Native {
+            vocab: toy_speech_vocab(),
+        });
         assert_ne!(before, compute_model_config_hash(&cfg));
+    }
+
+    /// The two layouts must not hash the same: a checkpoint trained under one
+    /// would otherwise pass `--resume` against the other, and every audio id
+    /// would land in the wrong codebook.
+    #[test]
+    fn the_two_speech_layouts_hash_differently() {
+        let mut cfg = LitConfig::nano_baseline().model;
+        cfg.speech_layout = Some(SpeechLayoutSpec::ExpressiveTts);
+        let expressive = compute_model_config_hash(&cfg);
+        cfg.speech_layout = Some(SpeechLayoutSpec::Native {
+            vocab: toy_speech_vocab(),
+        });
+        assert_ne!(expressive, compute_model_config_hash(&cfg));
+    }
+
+    /// `expressive_tts` takes no parameters, so it must round-trip from the
+    /// one-line YAML the model configs actually write.
+    #[test]
+    fn expressive_tts_parses_from_its_tag_alone() {
+        let spec: SpeechLayoutSpec = serde_yaml::from_str("kind: expressive_tts").expect("parse");
+        assert_eq!(spec, SpeechLayoutSpec::ExpressiveTts);
+        assert_eq!(spec.layout().name(), "expressive-tts-1.7b");
+        // The layout the checkpoint actually uses, not a placeholder.
+        assert_eq!(spec.layout().total_size(), 217_208);
     }
 
     /// `qk_norm` is a new field on an existing struct, and the hash covers the

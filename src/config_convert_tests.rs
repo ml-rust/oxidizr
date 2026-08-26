@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{LitConfig, RopeScalingSpec};
+use crate::config::{LitConfig, RopeScalingSpec, SpeechLayoutSpec};
 
 fn dense_baseline() -> OxidizrModelConfig {
     LitConfig::nano_baseline().model
@@ -370,23 +370,55 @@ fn toy_speech_vocab() -> boostr::model::SpeechVocab {
 }
 
 #[test]
-fn speech_vocab_matching_vocab_size_is_accepted() {
+fn speech_layout_matching_vocab_size_is_accepted() {
     let cfg = OxidizrModelConfig {
         vocab_size: 40,
-        speech_vocab: Some(toy_speech_vocab()),
+        speech_layout: Some(SpeechLayoutSpec::Native {
+            vocab: toy_speech_vocab(),
+        }),
         ..dense_baseline()
     };
     cfg.to_boostr().unwrap();
 }
 
 #[test]
-fn speech_vocab_total_size_mismatch_is_rejected() {
+fn speech_layout_total_size_mismatch_is_rejected() {
     let cfg = OxidizrModelConfig {
         vocab_size: 41,
-        speech_vocab: Some(toy_speech_vocab()),
+        speech_layout: Some(SpeechLayoutSpec::Native {
+            vocab: toy_speech_vocab(),
+        }),
         ..dense_baseline()
     };
     let err = cfg.to_boostr().unwrap_err().to_string();
     assert!(err.contains("40"), "error must name total_size(): {err}");
     assert!(err.contains("41"), "error must name vocab_size: {err}");
+}
+
+/// The expressive_tts layout covers 217,208 ids, so a config naming it with any
+/// other `vocab_size` is the config that is wrong - the layout is fixed by the
+/// checkpoint and cannot be adjusted to fit.
+#[test]
+fn expressive_tts_layout_requires_its_own_vocab_size() {
+    let cfg = OxidizrModelConfig {
+        vocab_size: 217_208,
+        speech_layout: Some(SpeechLayoutSpec::ExpressiveTts),
+        ..dense_baseline()
+    };
+    cfg.to_boostr().expect("217208 is the layout's own size");
+
+    let cfg = OxidizrModelConfig {
+        vocab_size: 151_936,
+        speech_layout: Some(SpeechLayoutSpec::ExpressiveTts),
+        ..dense_baseline()
+    };
+    let err = cfg.to_boostr().unwrap_err().to_string();
+    assert!(
+        err.contains("217208"),
+        "error must name the layout size: {err}"
+    );
+    assert!(
+        err.contains("vocab_size is what"),
+        "error must say which side to fix: {err}"
+    );
 }

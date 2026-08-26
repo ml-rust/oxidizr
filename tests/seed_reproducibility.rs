@@ -48,7 +48,7 @@ fn tiny_model_config() -> OxidizrModelConfig {
         rope_scaling: None,
         sliding_window: None,
         qk_norm: false,
-        speech_vocab: None,
+        speech_layout: None,
         lora: None,
         dtype: DTypePrecision::F32,
     }
