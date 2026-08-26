@@ -101,6 +101,8 @@ fn to_rope_scaling(spec: &RopeScalingSpec) -> RopeScalingConfig {
         attention_factor: spec.attention_factor,
         beta_fast: spec.beta_fast,
         beta_slow: spec.beta_slow,
+        short_factor: None,
+        long_factor: None,
     }
 }
 

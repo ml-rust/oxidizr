@@ -5269,6 +5269,8 @@ mod attention_extras_reach_dense_attention_tests {
             attention_factor: None,
             beta_fast: None,
             beta_slow: None,
+            short_factor: None,
+            long_factor: None,
         };
         let scaled =
             RotaryEmbedding::<CpuRuntime>::new(head_dim, 8, 10000.0, Some(&scaling), &device)
