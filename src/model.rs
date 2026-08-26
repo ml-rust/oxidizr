@@ -956,6 +956,9 @@ where
             q_norm: self.q_norm.as_ref(),
             k_norm: self.k_norm.as_ref(),
             use_alibi: false,
+            // This block always rotates; NoPE is a VoxCPM2 `residual_lm`
+            // trait, not a trainer one.
+            skip_rope: false,
             sliding_window: self.sliding_window,
             // Ignored by `attention_core_flash`; stated for honesty.
             kernel: boostr::model::AttentionKernel::Flash,
@@ -965,8 +968,8 @@ where
             &q,
             &k,
             &v,
-            &self.rope.cos,
-            &self.rope.sin,
+            Some(&self.rope.cos),
+            Some(&self.rope.sin),
             &spec,
         )?;
 
