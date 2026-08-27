@@ -666,7 +666,7 @@ where
     if !proj.is_adapted() {
         return Ok(false);
     }
-    *proj = MaybeLora::Plain(proj.merge_into_base(client)?);
+    *proj = MaybeLora::Plain(proj.merge_into_base(client)?.into());
     Ok(true)
 }
 
@@ -924,7 +924,9 @@ where
             + boostr::TensorOps<R>
             + boostr::BinaryOps<R>
             + boostr::ScalarOps<R>
-            + boostr::NormalizationOps<R>,
+            + boostr::NormalizationOps<R>
+            + boostr::TypeConversionOps<R>
+            + boostr::QuantMatmulOps<R>,
         R::Client: boostr::FlashAttentionOps<R>
             + boostr::TensorOps<R>
             + boostr::BinaryOps<R>
@@ -1086,7 +1088,7 @@ where
         let base = boostr::nn::Linear::with_ids(weight, weight_id, None, INITIALIZED_TRAINABLE);
 
         let Some(lora) = lora.filter(|lora| lora.targets(name)) else {
-            return Ok(MaybeLora::Plain(base));
+            return Ok(MaybeLora::Plain(base.into()));
         };
         let [out_features, in_features] = expected_shape else {
             return Err(boostr::error::Error::ModelError {
@@ -1150,7 +1152,7 @@ where
             boostr::nn::Linear::with_ids(weight.0, weight.1, None, frozen.trainable(weight.1));
 
         let Some(lora) = lora else {
-            return Ok(MaybeLora::Plain(base));
+            return Ok(MaybeLora::Plain(base.into()));
         };
         let [out_features, in_features] = expected_shape else {
             return Err(boostr::error::Error::ModelError {
@@ -1313,7 +1315,8 @@ where
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
             + boostr::BinaryOps<R>
-            + boostr::TypeConversionOps<R>,
+            + boostr::TypeConversionOps<R>
+            + boostr::QuantMatmulOps<R>,
         R::Client: boostr::TensorOps<R>
             + boostr::ScalarOps<R>
             + boostr::BinaryOps<R>
@@ -1327,7 +1330,14 @@ where
 
         // DEBUG: Check weight norms
         if std::env::var("DEBUG_MLP").is_ok() {
-            let gate_w = Self::tensor_to_f32_vec(client, self.gate_proj.weight().tensor())?;
+            let gate_weight =
+                self.gate_proj
+                    .weight()
+                    .ok_or_else(|| boostr::error::Error::ModelError {
+                        reason: "DEBUG_MLP: gate_proj has no Var-wrapped weight (quantized base)"
+                            .into(),
+                    })?;
+            let gate_w = Self::tensor_to_f32_vec(client, gate_weight.tensor())?;
             let w_std = {
                 let mean = gate_w.iter().sum::<f32>() / gate_w.len() as f32;
                 (gate_w.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / gate_w.len() as f32)
@@ -1336,7 +1346,7 @@ where
             let w_norm: f32 = gate_w.iter().map(|v| v * v).sum::<f32>().sqrt();
             eprintln!(
                 "[MLP weights] gate_proj.weight: shape={:?}, std={:.6e}, norm={:.4}",
-                self.gate_proj.weight().tensor().shape(),
+                gate_weight.tensor().shape(),
                 w_std,
                 w_norm
             );
@@ -1856,7 +1866,9 @@ where
             + boostr::IndexingOps<R>
             + boostr::CompareOps<R>
             + boostr::BinaryOps<R>
-            + boostr::UnaryOps<R>,
+            + boostr::UnaryOps<R>
+            + boostr::TypeConversionOps<R>
+            + boostr::QuantMatmulOps<R>,
         R::Client: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
@@ -2049,7 +2061,8 @@ where
             + boostr::CompareOps<R>
             + boostr::BinaryOps<R>
             + boostr::UnaryOps<R>
-            + boostr::TypeConversionOps<R>,
+            + boostr::TypeConversionOps<R>
+            + boostr::QuantMatmulOps<R>,
         R::Client: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
@@ -3148,7 +3161,8 @@ where
                 compute_dtype,
                 client,
             )?;
-            (lm_head.weight().tensor().clone(), lm_head.weight().id())
+            let lm_head_weight = lm_head.weight();
+            (lm_head_weight.tensor().clone(), lm_head_weight.id())
         };
 
         let model = Self::with_ids(
@@ -3219,12 +3233,12 @@ where
             return Ok(FrozenParams::new());
         };
         if !lora.freeze_base {
-            return Ok(self.adapted_base_ids());
+            return self.adapted_base_ids();
         }
 
         let mut frozen = FrozenParams::new();
         let mut matched = vec![false; lora.train_modules.len()];
-        for (name, id, _) in self.named_parameters() {
+        for (name, id, _) in self.named_parameters()? {
             // The adapter is the thing LoRA trains. It is never frozen, and it
             // never satisfies a `train_modules` entry either — an entry naming
             // a segment that only adapters carry has matched nothing real.
@@ -3255,7 +3269,7 @@ where
                      so 'norm' matches 'norm.weight' but not 'input_layernorm.weight'. \
                      This model's segments are: {}.",
                     unmatched.join(", "),
-                    self.parameter_name_segments().join(", ")
+                    self.parameter_name_segments()?.join(", ")
                 ),
             });
         }
@@ -3268,9 +3282,9 @@ where
     ///
     /// Built only to populate the `train_modules` error, so an entry that
     /// matched nothing is answered with the list it could have named.
-    fn parameter_name_segments(&self) -> Vec<String> {
+    fn parameter_name_segments(&self) -> Result<Vec<String>> {
         let mut segments: Vec<String> = self
-            .named_parameters()
+            .named_parameters()?
             .into_iter()
             .flat_map(|(name, _, _)| {
                 let mut parts: Vec<String> = name.split('.').map(|part| part.to_string()).collect();
@@ -3281,7 +3295,7 @@ where
             .collect();
         segments.sort();
         segments.dedup();
-        segments
+        Ok(segments)
     }
 
     /// The base-weight ids of every LoRA-adapted projection: attention, MLP,
@@ -3290,21 +3304,29 @@ where
     /// This is the minimum LoRA needs to be correct — training a projection
     /// and its own adapter at once trains the same function twice — and is
     /// the whole frozen set under `freeze_base: false`.
-    fn adapted_base_ids(&self) -> FrozenParams {
+    fn adapted_base_ids(&self) -> Result<FrozenParams> {
         let mut frozen = FrozenParams::new();
-        let mut freeze_adapted = |proj: &MaybeLora<R>| {
+        let mut freeze_adapted = |proj: &MaybeLora<R>| -> Result<()> {
             if proj.adapters().is_some() {
-                frozen.freeze(proj.weight().id());
+                let weight = proj
+                    .weight()
+                    .ok_or_else(|| boostr::error::Error::ModelError {
+                        reason: "LoRA-adapted projection has no Var-wrapped base weight \
+                                 (quantized base) while collecting frozen ids"
+                            .into(),
+                    })?;
+                frozen.freeze(weight.id());
             }
+            Ok(())
         };
         for layer in &self.layers {
             match &layer.block_type {
                 BlockType::LegacyAttention { attn, ffn, .. } => {
                     for proj in [&attn.q_proj, &attn.k_proj, &attn.v_proj, &attn.o_proj] {
-                        freeze_adapted(proj);
+                        freeze_adapted(proj)?;
                     }
                     for proj in Self::ffn_projections(ffn) {
-                        freeze_adapted(proj);
+                        freeze_adapted(proj)?;
                     }
                 }
                 // The MLA path's FFN shares `FfnLayer`, so an adapter reaching
@@ -3312,13 +3334,13 @@ where
                 // halves.
                 BlockType::Attention { ffn, .. } => {
                     for proj in Self::ffn_projections(ffn) {
-                        freeze_adapted(proj);
+                        freeze_adapted(proj)?;
                     }
                 }
                 _ => {}
             }
         }
-        frozen
+        Ok(frozen)
     }
 
     /// Every adaptable projection an FFN holds, in `named_parameters` order:
@@ -3697,11 +3719,13 @@ where
     /// frozen base weight would "load" into numerical garbage.
     pub fn named_parameters(
         &self,
-    ) -> Vec<(
-        String,
-        boostr::autograd::TensorId,
-        &boostr::autograd::Var<R>,
-    )> {
+    ) -> Result<
+        Vec<(
+            String,
+            boostr::autograd::TensorId,
+            &boostr::autograd::Var<R>,
+        )>,
+    > {
         let mut params = Vec::new();
         Self::push_named_param(
             &mut params,
@@ -3709,7 +3733,7 @@ where
             self.embed_tokens.weight(),
         );
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            Self::extend_block_named_trainable(&mut params, layer_idx, layer);
+            Self::extend_block_named_trainable(&mut params, layer_idx, layer)?;
         }
         Self::push_named_param(&mut params, "norm.weight".to_string(), self.norm.weight());
         // Tied: lm_head shares embed_tokens's weight/TensorId, so it has no
@@ -3723,21 +3747,24 @@ where
                 self.lm_head.weight(),
             );
         }
-        params
+        Ok(params)
     }
 
     /// The subset of [`LitGPT::named_parameters`] the optimizer owns.
     pub fn named_trainable_parameters(
         &self,
-    ) -> Vec<(
-        String,
-        boostr::autograd::TensorId,
-        &boostr::autograd::Var<R>,
-    )> {
-        self.named_parameters()
+    ) -> Result<
+        Vec<(
+            String,
+            boostr::autograd::TensorId,
+            &boostr::autograd::Var<R>,
+        )>,
+    > {
+        Ok(self
+            .named_parameters()?
             .into_iter()
             .filter(|(_, _, var)| var.requires_grad())
-            .collect()
+            .collect())
     }
 
     fn rebuild_block_with_parameters(
@@ -4312,7 +4339,15 @@ where
         proj: &MaybeLora<R>,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
     ) -> Result<AttnProjWithIds<R>> {
-        let weight = Self::tensor_with_stable_id(proj.weight(), params)?;
+        let proj_weight = proj
+            .weight()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: format!(
+                    "'{name}' has no Var-wrapped base weight (quantized base) while \
+                     rebuilding LitGPT"
+                ),
+            })?;
+        let weight = Self::tensor_with_stable_id(proj_weight, params)?;
         let Some((lora_a, lora_b)) = proj.adapters() else {
             return Ok(AttnProjWithIds { weight, lora: None });
         };
@@ -4504,12 +4539,21 @@ where
         )>,
         prefix: &str,
         proj: &'a MaybeLora<R>,
-    ) {
-        Self::push_named_param(params, format!("{prefix}.weight"), proj.weight());
+    ) -> Result<()> {
+        let weight = proj
+            .weight()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: format!(
+                    "'{prefix}' has no Var-wrapped base weight (quantized base) while \
+                     collecting named parameters"
+                ),
+            })?;
+        Self::push_named_param(params, format!("{prefix}.weight"), weight);
         if let Some((lora_a, lora_b)) = proj.adapters() {
             Self::push_named_param(params, format!("{prefix}.lora_a"), lora_a);
             Self::push_named_param(params, format!("{prefix}.lora_b"), lora_b);
         }
+        Ok(())
     }
 
     /// Name one MoE expert's three projections under `prefix`, e.g.
@@ -4524,14 +4568,15 @@ where
         )>,
         prefix: &str,
         expert: &'a boostr::nn::moe::expert::Expert<R>,
-    ) {
+    ) -> Result<()> {
         for (name, proj) in [
             ("gate_proj", expert.gate_proj()),
             ("up_proj", expert.up_proj()),
             ("down_proj", expert.down_proj()),
         ] {
-            Self::push_named_projection(params, &format!("{prefix}.{name}"), proj);
+            Self::push_named_projection(params, &format!("{prefix}.{name}"), proj)?;
         }
+        Ok(())
     }
 
     fn extend_named_from_module<'a>(
@@ -4561,7 +4606,7 @@ where
         )>,
         layer_idx: usize,
         layer: &'a Block<R>,
-    ) {
+    ) -> Result<()> {
         let prefix = format!("layers.{layer_idx}");
         match &layer.block_type {
             BlockType::Mamba { block, norm } => {
@@ -4623,7 +4668,7 @@ where
                     format!("{prefix}.post_attention_layernorm.weight"),
                     post_attention_layernorm.weight(),
                 );
-                Self::extend_ffn_named_trainable(params, &prefix, ffn);
+                Self::extend_ffn_named_trainable(params, &prefix, ffn)?;
             }
             BlockType::LegacyAttention {
                 attn,
@@ -4646,7 +4691,7 @@ where
                         params,
                         &format!("{prefix}.self_attn.{name}"),
                         proj,
-                    );
+                    )?;
                 }
                 // `q_norm.weight` / `k_norm.weight` under the same `self_attn`
                 // prefix, matching HuggingFace's Qwen3 names exactly. Present
@@ -4666,9 +4711,10 @@ where
                     format!("{prefix}.post_attention_layernorm.weight"),
                     post_attention_layernorm.weight(),
                 );
-                Self::extend_ffn_named_trainable(params, &prefix, ffn);
+                Self::extend_ffn_named_trainable(params, &prefix, ffn)?;
             }
         }
+        Ok(())
     }
 
     fn extend_ffn_named_trainable<'a>(
@@ -4679,7 +4725,7 @@ where
         )>,
         layer_prefix: &str,
         ffn: &'a FfnLayer<R>,
-    ) {
+    ) -> Result<()> {
         match ffn {
             FfnLayer::Mlp(mlp) => {
                 for (name, proj) in [
@@ -4691,7 +4737,7 @@ where
                         params,
                         &format!("{layer_prefix}.mlp.{name}"),
                         proj,
-                    );
+                    )?;
                 }
             }
             FfnLayer::Moe(moe) => {
@@ -4705,17 +4751,18 @@ where
                         params,
                         &format!("{layer_prefix}.moe.experts.{expert_idx}"),
                         expert,
-                    );
+                    )?;
                 }
                 if let Some(shared_expert) = moe.moe.shared_expert() {
                     Self::extend_named_expert(
                         params,
                         &format!("{layer_prefix}.moe.shared_expert"),
                         shared_expert,
-                    );
+                    )?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Check if tensor contains NaN/Inf values (debug helper)
@@ -4760,7 +4807,7 @@ where
     R::Client: boostr::RuntimeClient<R> + boostr::TensorOps<R> + boostr::TypeConversionOps<R>,
 {
     let cpu_device = boostr::CpuDevice::new();
-    let parameters = model.named_parameters();
+    let parameters = model.named_parameters()?;
     let mut tensors = HashMap::with_capacity(parameters.len());
 
     for (name, id, var) in &parameters {
@@ -4961,7 +5008,7 @@ where
     // random-initializes any tensor the varmap lacks. Without this check an
     // incomplete checkpoint loads "successfully" and produces garbage.
     let expected = model
-        .named_parameters()
+        .named_parameters()?
         .into_iter()
         .map(|(name, _, _)| name)
         .collect::<Vec<_>>();
@@ -5143,6 +5190,7 @@ mod tie_word_embeddings_tests {
         let model = tiny_model(true);
         let names: Vec<String> = model
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .collect();
@@ -5155,6 +5203,7 @@ mod tie_word_embeddings_tests {
         let model = tiny_model(false);
         let names: Vec<String> = model
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .collect();
@@ -5480,6 +5529,7 @@ mod head_dim_tests {
     ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
         model
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(_, id, var)| (id, var.tensor().clone()))
             .collect()
@@ -5507,6 +5557,7 @@ mod head_dim_tests {
         let model = build(&explicit_head_dim_cfg());
         let shapes: HashMap<String, Vec<usize>> = model
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, var)| (name, var.tensor().shape().to_vec()))
             .collect();
@@ -5543,6 +5594,7 @@ mod head_dim_tests {
 
         let (_, q_proj_id, _) = model
             .named_parameters()
+            .unwrap()
             .into_iter()
             .find(|(name, _, _)| name == "layers.0.self_attn.q_proj.weight")
             .expect("q_proj must exist");
@@ -5601,7 +5653,7 @@ mod head_dim_tests {
         let attn = build_attention_only(&non_divisible_model_cfg(Some(4)))
             .expect("an explicit head_dim must skip the hidden_size/num_heads divisibility check");
         assert_eq!(
-            attn.q_proj.weight().tensor().shape(),
+            attn.q_proj.weight().unwrap().tensor().shape(),
             &[12, 10],
             "q_proj must be [num_heads(3) * head_dim(4), hidden_size(10)] = [12, 10]"
         );
@@ -5677,7 +5729,10 @@ mod frozen_parameter_tests {
     /// would hide a frozen parameter and prove nothing.
     fn q_proj_var(model: &LitGPT<CpuRuntime>) -> &boostr::autograd::Var<CpuRuntime> {
         match &model.layers[0].block_type {
-            BlockType::LegacyAttention { attn, .. } => attn.q_proj.weight(),
+            BlockType::LegacyAttention { attn, .. } => attn
+                .q_proj
+                .weight()
+                .expect("q_proj must have a dense weight in this test"),
             _ => panic!("freeze-test config must produce a LegacyAttention block"),
         }
     }
@@ -5685,6 +5740,7 @@ mod frozen_parameter_tests {
     fn named_id(model: &LitGPT<CpuRuntime>, name: &str) -> boostr::autograd::TensorId {
         model
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .find(|(param_name, _, _)| param_name == name)
             .map(|(_, id, _)| id)
@@ -5797,6 +5853,7 @@ mod frozen_parameter_tests {
         let model = model_with_q_proj_frozen();
         let names: Vec<String> = model
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .collect();
@@ -5821,6 +5878,7 @@ mod frozen_parameter_tests {
         let before_ids = trainable_ids(&model);
         let before_names: Vec<String> = model
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .collect();
@@ -5831,6 +5889,7 @@ mod frozen_parameter_tests {
 
         let after_names: Vec<String> = rebuilt
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .collect();
@@ -5966,6 +6025,7 @@ mod lora_tests {
     fn names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
         model
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .collect()
@@ -6074,7 +6134,7 @@ mod lora_tests {
                 "every targeted projection must be adapted"
             );
             assert!(
-                !proj.weight().requires_grad(),
+                !proj.weight().unwrap().requires_grad(),
                 "a wrapped base must be reconstructed with requires_grad = false"
             );
         }
@@ -6112,7 +6172,7 @@ mod lora_tests {
             assert!(a_after.requires_grad(), "lora_a must stay trainable");
             assert!(b_after.requires_grad(), "lora_b must stay trainable");
             assert!(
-                !after.weight().requires_grad(),
+                !after.weight().unwrap().requires_grad(),
                 "the wrapped base must stay frozen"
             );
         }
@@ -6192,7 +6252,7 @@ mod lora_tests {
         );
         for proj in projections(&model) {
             assert!(proj.adapters().is_none(), "no adapter without a lora block");
-            assert!(proj.weight().requires_grad());
+            assert!(proj.weight().unwrap().requires_grad());
         }
         let listed = names(&model);
         for target in TARGETS {
@@ -6342,7 +6402,7 @@ mod lora_tests {
                 "every targeted MLP projection must be adapted"
             );
             assert!(
-                !proj.weight().requires_grad(),
+                !proj.weight().unwrap().requires_grad(),
                 "a wrapped MLP base must be reconstructed with requires_grad = false"
             );
         }
@@ -6372,7 +6432,7 @@ mod lora_tests {
             assert!(a_after.requires_grad(), "lora_a must stay trainable");
             assert!(b_after.requires_grad(), "lora_b must stay trainable");
             assert!(
-                !after.weight().requires_grad(),
+                !after.weight().unwrap().requires_grad(),
                 "the wrapped MLP base must stay frozen"
             );
         }
@@ -6500,6 +6560,7 @@ mod lora_tests {
     ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
         model
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(_, id, var)| (id, var.tensor().clone()))
             .collect()
@@ -6533,6 +6594,7 @@ mod lora_tests {
     fn sorted_parameter_names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
         let mut names: Vec<String> = model
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .collect();
@@ -6709,6 +6771,7 @@ mod lora_freeze_base_tests {
         sorted(
             model
                 .named_trainable_parameters()
+                .unwrap()
                 .into_iter()
                 .map(|(name, _, _)| name)
                 .collect(),
@@ -6719,6 +6782,7 @@ mod lora_freeze_base_tests {
         sorted(
             model
                 .named_parameters()
+                .unwrap()
                 .into_iter()
                 .map(|(name, _, _)| name)
                 .collect(),
@@ -6996,6 +7060,7 @@ mod moe_lora_tests {
     fn names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
         model
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .collect()
@@ -7073,6 +7138,7 @@ mod moe_lora_tests {
     ) -> HashMap<boostr::autograd::TensorId, Tensor<CpuRuntime>> {
         model
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(_, id, var)| (id, var.tensor().clone()))
             .collect()
@@ -7147,7 +7213,7 @@ mod moe_lora_tests {
         for (prefix, proj) in expert_projections(&model) {
             assert!(proj.adapters().is_some(), "{prefix} must be adapted");
             assert!(
-                !proj.weight().requires_grad(),
+                !proj.weight().unwrap().requires_grad(),
                 "{prefix}.weight is a wrapped base and must be frozen"
             );
         }
@@ -7191,7 +7257,7 @@ mod moe_lora_tests {
                 "{prefix}.lora_b must stay trainable"
             );
             assert!(
-                !after.weight().requires_grad(),
+                !after.weight().unwrap().requires_grad(),
                 "{prefix}.weight must stay frozen"
             );
         }
@@ -7243,6 +7309,7 @@ mod moe_lora_tests {
         let model = with_nonzero_adapters(build(Some(lora_cfg())), &device);
         let saved: Vec<(String, Vec<f32>)> = model
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, var)| {
                 (
@@ -7275,6 +7342,7 @@ mod moe_lora_tests {
 
         let restored: Vec<(String, Vec<f32>)> = reloaded
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, var)| {
                 (
@@ -7341,6 +7409,7 @@ mod moe_lora_tests {
         );
         let mut plain: Vec<String> = build(None)
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .collect();
@@ -7466,6 +7535,7 @@ mod checkpoint_completeness_tests {
     fn all_values(model: &LitGPT<CpuRuntime>) -> BTreeMap<String, Vec<f32>> {
         model
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, var)| (name, values(var.tensor())))
             .collect()
@@ -7504,6 +7574,7 @@ mod checkpoint_completeness_tests {
         let cpu_device = CpuDevice::new();
         let tensors: HashMap<String, Tensor<CpuRuntime>> = model
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, var)| {
                 (
@@ -7602,6 +7673,7 @@ mod checkpoint_completeness_tests {
         let frozen_names = |model: &LitGPT<CpuRuntime>| {
             model
                 .named_parameters()
+                .unwrap()
                 .into_iter()
                 .filter(|(_, _, var)| !var.requires_grad())
                 .map(|(name, _, _)| name)
@@ -7699,6 +7771,7 @@ mod checkpoint_completeness_tests {
     fn base_tensors(cfg: &OxidizrModelConfig) -> HashMap<String, Tensor<CpuRuntime>> {
         build(cfg)
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, var)| (name, var.tensor().clone()))
             .collect()
@@ -7708,6 +7781,7 @@ mod checkpoint_completeness_tests {
     fn adapter_names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
         let mut names: Vec<String> = model
             .named_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .filter(|name| name.ends_with(".lora_a") || name.ends_with(".lora_b"))
@@ -7998,6 +8072,7 @@ mod legacy_moe_tests {
     fn names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
         model
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, _, _)| name)
             .collect()
@@ -8131,6 +8206,7 @@ mod legacy_moe_tests {
 
         let named: HashMap<String, boostr::autograd::TensorId> = model
             .named_trainable_parameters()
+            .unwrap()
             .into_iter()
             .map(|(name, id, _)| (name, id))
             .collect();

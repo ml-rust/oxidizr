@@ -279,7 +279,7 @@ where
     let mut model = LitGPT::<R>::new(&config.model, &mut vb, &client)?;
 
     let expected: HashSet<String> = model
-        .named_parameters()
+        .named_parameters()?
         .into_iter()
         .map(|(name, _, _)| name)
         .collect();
@@ -348,7 +348,7 @@ where
     // `named_parameters`, not the trainable subset: a LoRA config freezes the
     // base, and the checkpoint must still carry every frozen weight.
     let params: HashMap<TensorId, Tensor<R>> = model
-        .named_parameters()
+        .named_parameters()?
         .into_iter()
         .map(|(_, id, var)| (id, var.tensor().clone()))
         .collect();
@@ -431,7 +431,7 @@ where
     R: Runtime<DType = DType>,
     R::Client: RuntimeClient<R> + boostr::TensorOps<R> + boostr::TypeConversionOps<R>,
 {
-    let named = model.named_parameters();
+    let named = model.named_parameters()?;
     let norms: Vec<(String, Tensor<R>)> = named
         .iter()
         .filter(|(name, _, _)| {

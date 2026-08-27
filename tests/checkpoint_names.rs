@@ -111,6 +111,7 @@ fn build(cfg: &OxidizrModelConfig) -> LitGPT<CpuRuntime> {
 fn sorted_names(model: &LitGPT<CpuRuntime>) -> Vec<String> {
     let mut names: Vec<String> = model
         .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
         .into_iter()
         .map(|(name, _, _)| name)
         .collect();
@@ -304,6 +305,7 @@ fn freezing_part_of_the_base_does_not_change_the_name_set() {
     ];
     let ids: Vec<TensorId> = model
         .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
         .into_iter()
         .filter(|(name, _, _)| to_freeze.contains(&name.as_str()))
         .map(|(_, id, _)| id)
@@ -356,6 +358,7 @@ fn dense_checkpoint_round_trips_through_save_and_load() {
     // subset) is the straightforward, correct input.
     let params: HashMap<TensorId, Tensor<CpuRuntime>> = model
         .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
         .into_iter()
         .map(|(_, id, var)| (id, var.tensor().clone()))
         .collect();
@@ -394,6 +397,7 @@ fn dense_checkpoint_round_trips_through_save_and_load() {
 fn parameter_map(model: &LitGPT<CpuRuntime>) -> HashMap<TensorId, Tensor<CpuRuntime>> {
     model
         .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
         .into_iter()
         .map(|(_, id, var)| (id, var.tensor().clone()))
         .collect()
@@ -485,6 +489,7 @@ fn rebuilding_preserves_the_qk_norm_parameter_ids() {
     let model = build(&qk_norm_cfg());
     let before: Vec<(String, TensorId)> = model
         .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
         .into_iter()
         .map(|(name, id, _)| (name, id))
         .collect();
@@ -494,6 +499,7 @@ fn rebuilding_preserves_the_qk_norm_parameter_ids() {
         .expect("rebuilding a qk_norm model from its own parameters must succeed");
     let after: Vec<(String, TensorId)> = rebuilt
         .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
         .into_iter()
         .map(|(name, id, _)| (name, id))
         .collect();
@@ -546,6 +552,7 @@ fn named_f32_values(model: &LitGPT<CpuRuntime>) -> Vec<(String, Vec<f32>)> {
     let client = CpuClient::new(CpuDevice::new());
     let mut out: Vec<(String, Vec<f32>)> = model
         .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
         .into_iter()
         .map(|(name, _, var)| (name, f32_values(&client, var.tensor())))
         .collect();
@@ -629,7 +636,10 @@ fn a_bf16_checkpoint_round_trips_without_losing_values() {
     let _ = std::fs::remove_file(&path);
     result.expect("a bf16 checkpoint must load back into a bf16 model");
 
-    for (_, _, var) in reloaded.named_parameters() {
+    for (_, _, var) in reloaded
+        .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
+    {
         assert_eq!(
             var.tensor().dtype(),
             DType::BF16,
@@ -660,7 +670,10 @@ fn checkpoints_load_across_a_dtype_change_in_both_directions() {
     let result = load_checkpoint_into_model(&mut bf16_model, &f32_path);
     let _ = std::fs::remove_file(&f32_path);
     result.expect("an F32 checkpoint must still load into a bf16-configured model");
-    for (name, _, var) in bf16_model.named_parameters() {
+    for (name, _, var) in bf16_model
+        .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
+    {
         assert_eq!(
             var.tensor().dtype(),
             DType::BF16,
@@ -678,7 +691,10 @@ fn checkpoints_load_across_a_dtype_change_in_both_directions() {
     let result = load_checkpoint_into_model(&mut f32_target, &bf16_path);
     let _ = std::fs::remove_file(&bf16_path);
     result.expect("a bf16 checkpoint must load into an F32-configured model");
-    for (name, _, var) in f32_target.named_parameters() {
+    for (name, _, var) in f32_target
+        .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
+    {
         assert_eq!(
             var.tensor().dtype(),
             DType::F32,

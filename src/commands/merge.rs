@@ -126,7 +126,7 @@ where
     // The merged model's own `Var`s hold every value to write: the optimizer
     // is not in play here, so each parameter is its own source.
     let params: HashMap<TensorId, Tensor<R>> = model
-        .named_parameters()
+        .named_parameters()?
         .into_iter()
         .map(|(_, id, var)| (id, var.tensor().clone()))
         .collect();

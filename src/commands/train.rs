@@ -666,7 +666,7 @@ where
     let parameter_ids: Vec<TensorId> = trainable.iter().map(|(id, _)| *id).collect();
     let mut params = parameter_tensor_map::<R>(trainable);
     let parameter_names: Vec<(String, TensorId)> = model
-        .named_trainable_parameters()
+        .named_trainable_parameters()?
         .into_iter()
         .map(|(name, id, _)| (name, id))
         .collect();

@@ -108,6 +108,7 @@ fn build(cfg: &LitConfig) -> LitGPT<CpuRuntime> {
 fn named_values(model: &LitGPT<CpuRuntime>) -> Vec<(String, Vec<f32>)> {
     model
         .named_parameters()
+        .expect("named_parameters must succeed on a dense model")
         .into_iter()
         .map(|(name, _id, var)| {
             let values = var
