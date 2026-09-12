@@ -81,7 +81,8 @@ where
         + boostr::CompareOps<R>
         + boostr::TypeConversionOps<R>
         + boostr::ReduceOps<R>
-        + boostr::ShapeOps<R>,
+        + boostr::ShapeOps<R>
+        + boostr::DequantOps<R>,
 {
     println!("🔗 Oxidizr LoRA Merge");
     println!("=====================\n");

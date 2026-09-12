@@ -276,7 +276,8 @@ where
         + boostr::NormalizationOps<R>
         + boostr::QuantMatmulOps<R>
         + boostr::RoPEOps<R>
-        + boostr::TypeConversionOps<R>,
+        + boostr::TypeConversionOps<R>
+        + boostr::DequantOps<R>,
 {
     // Use run directory from env var (set by wrapper script) or create new one
     let run_dir = match std::env::var("OXIDIZED_RUN_DIR") {

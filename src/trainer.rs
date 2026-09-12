@@ -90,7 +90,8 @@ where
         + boostr::NormalizationOps<R>
         + boostr::QuantMatmulOps<R>
         + boostr::RoPEOps<R>
-        + boostr::TypeConversionOps<R>,
+        + boostr::TypeConversionOps<R>
+        + boostr::DequantOps<R>,
 {
     pub fn new(
         config: TrainerConfig,

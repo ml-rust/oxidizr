@@ -326,7 +326,7 @@ where
             + boostr::QuantMatmulOps<R>
             + boostr::RoPEOps<R>
             + boostr::TypeConversionOps<R>,
-        R::Client: boostr::TensorOps<R> + boostr::ScalarOps<R>,
+        R::Client: boostr::TensorOps<R> + boostr::ScalarOps<R> + boostr::DequantOps<R>,
     {
         self.mla.forward(client, x)
     }
@@ -661,7 +661,8 @@ where
         + boostr::TensorOps<R>
         + boostr::BinaryOps<R>
         + boostr::ScalarOps<R>,
-    R::Client: boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R>,
+    R::Client:
+        boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R> + boostr::DequantOps<R>,
 {
     if !proj.is_adapted() {
         return Ok(false);
@@ -930,7 +931,8 @@ where
         R::Client: boostr::FlashAttentionOps<R>
             + boostr::TensorOps<R>
             + boostr::BinaryOps<R>
-            + boostr::ScalarOps<R>,
+            + boostr::ScalarOps<R>
+            + boostr::DequantOps<R>,
     {
         let shape = x.shape();
         if shape.len() != 3 {
@@ -1320,7 +1322,8 @@ where
         R::Client: boostr::TensorOps<R>
             + boostr::ScalarOps<R>
             + boostr::BinaryOps<R>
-            + boostr::TypeConversionOps<R>,
+            + boostr::TypeConversionOps<R>
+            + boostr::DequantOps<R>,
     {
         // SwiGLU: silu(gate) * up, delegated to boostr/numr's fused Var op.
         let gate_linear = self.gate_proj.forward(client, x)?;
@@ -1804,7 +1807,10 @@ where
             + boostr::TensorOps<R>
             + boostr::BinaryOps<R>
             + boostr::ScalarOps<R>,
-        R::Client: boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R>,
+        R::Client: boostr::TensorOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::ScalarOps<R>
+            + boostr::DequantOps<R>,
     {
         let mut merged = 0usize;
         let mut experts = Vec::with_capacity(self.moe.experts().len());
@@ -1876,7 +1882,8 @@ where
             + boostr::ReduceOps<R>
             + boostr::ShapeOps<R>
             + boostr::BinaryOps<R>
-            + boostr::UnaryOps<R>,
+            + boostr::UnaryOps<R>
+            + boostr::DequantOps<R>,
     {
         let shape = x.shape();
         if shape.len() != 3 {
@@ -2071,7 +2078,8 @@ where
             + boostr::ShapeOps<R>
             + boostr::BinaryOps<R>
             + boostr::UnaryOps<R>
-            + boostr::TypeConversionOps<R>,
+            + boostr::TypeConversionOps<R>
+            + boostr::DequantOps<R>,
     {
         match self {
             FfnLayer::Mlp(mlp) => {
@@ -2640,7 +2648,8 @@ where
             + boostr::CompareOps<R>
             + boostr::ConvOps<R>
             + boostr::FlashAttentionOps<R>
-            + boostr::TypeConversionOps<R>,
+            + boostr::TypeConversionOps<R>
+            + boostr::DequantOps<R>,
     {
         match &self.block_type {
             BlockType::Mamba { block, norm } => {
@@ -3512,7 +3521,8 @@ where
             + boostr::ConvOps<R>
             + boostr::FlashAttentionOps<R>
             + boostr::IndexingOps<R>
-            + boostr::TypeConversionOps<R>,
+            + boostr::TypeConversionOps<R>
+            + boostr::DequantOps<R>,
     {
         // Token IDs are integer indices, not differentiable inputs. The graph
         // starts at boostr's Embedding output and stays Var-based thereafter.
@@ -3652,7 +3662,10 @@ where
             + boostr::TensorOps<R>
             + boostr::BinaryOps<R>
             + boostr::ScalarOps<R>,
-        R::Client: boostr::TensorOps<R> + boostr::BinaryOps<R> + boostr::ScalarOps<R>,
+        R::Client: boostr::TensorOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::ScalarOps<R>
+            + boostr::DequantOps<R>,
     {
         let mut merged = 0usize;
         for layer in &mut self.layers {
