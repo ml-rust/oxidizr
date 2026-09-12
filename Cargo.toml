@@ -45,7 +45,7 @@ huggingface = ["dep:hf-hub"]
 # The layout sidecar (`speech_corpus`) is NOT gated: a text-only build still
 # has to read `foo.layout.json` to refuse a speech corpus packed under a
 # different layout, and that code is pure JSON with no audio dependency.
-audio = ["boostr/audio"]
+audio = ["boostr/audio", "boostr/whisper", "boostr/silero-vad", "boostr/neucodec"]
 
 # Bundled tokenizer vocabularies, forwarded to boostr and on to splintr. These
 # are what make `prep-corpus --tokenizer <name>` work for a name: the
