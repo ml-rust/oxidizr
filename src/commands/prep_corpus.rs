@@ -37,12 +37,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use boostr::model::audio::enhance::EnhanceOptions;
 use boostr::model::audio::neucodec::{NeuCodecClient, NeuCodecEncoder};
-use boostr::model::audio::{
-    check_max_speech_duration, decode_audio_file_mono_at, CorpusOptions, SileroVad,
-    SpeechCorpusBuilder, TextTokenizer, Utterance, VadSegmentOptions, WhisperBundle,
-    MAX_UTTERANCE_SECS, PRETRAINED_TOKENIZER_NAMES,
+use boostr::model::audio::{SileroVad, VadSegmentOptions, WhisperBundle};
+use boostr_audio::enhance::EnhanceOptions;
+use boostr_audio::{
+    check_max_speech_duration, decode_audio_file_mono_at, CorpusOptions, SpeechCorpusBuilder,
+    TextTokenizer, Utterance, MAX_UTTERANCE_SECS, PRETRAINED_TOKENIZER_NAMES,
 };
 use boostr::model::SpeechLayout;
 use boostr::runtime::Runtime;

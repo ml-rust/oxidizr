@@ -183,10 +183,21 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "splintr",
- "symphonia",
  "thiserror 2.0.17",
  "tracing",
  "zip",
+]
+
+[[package]]
+name = "boostr-audio"
+version = "0.1.0"
+dependencies = [
+ "boostr",
+ "numr",
+ "splintr",
+ "symphonia",
+ "thiserror 2.0.17",
+ "tracing",
 ]
 
 [[package]]
@@ -1490,6 +1501,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "boostr",
+ "boostr-audio",
  "chrono",
  "clap",
  "dialoguer",
