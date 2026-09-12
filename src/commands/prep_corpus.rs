@@ -580,6 +580,12 @@ const fn layout_name(layout: LayoutArg) -> &'static str {
     }
 }
 
+/// Turns one decoded recording (path, mono samples) into its utterances.
+///
+/// A named type: the closure signature is the backend seam, and clippy's
+/// `type_complexity` lint fires on it inline.
+type UtterancesOf<'a> = dyn Fn(&Path, &[f32]) -> Result<Vec<Utterance>> + 'a;
+
 /// Decode every recording, prepare its utterances, then pack and write once.
 ///
 /// Runtime-free: the two model-touching steps arrive as closures, so this — the
@@ -588,7 +594,7 @@ const fn layout_name(layout: LayoutArg) -> &'static str {
 fn drive(
     plan: &Plan<'_>,
     layout: &SpeechLayout,
-    utterances_of: &dyn Fn(&Path, &[f32]) -> Result<Vec<Utterance>>,
+    utterances_of: &UtterancesOf<'_>,
     pack: &dyn Fn(&[Utterance]) -> Result<Vec<u32>>,
 ) -> Result<()> {
     let sample_rate = plan.opts.sample_rate;
