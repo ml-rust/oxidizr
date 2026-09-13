@@ -523,6 +523,7 @@ fn load_builder<R, C>(
 ) -> Result<SpeechCorpusBuilder<R>>
 where
     R: Runtime<DType = DType>,
+    R::Client: NeuCodecClient<R>,
     C: TypeConversionOps<R>,
 {
     // A scripted run loads neither the VAD nor Whisper: it has the transcript
