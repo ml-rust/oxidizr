@@ -5282,6 +5282,7 @@ mod attention_extras_reach_dense_attention_tests {
             audio: None,
             gdn: None,
             qwen35_attention: None,
+            hadamard: None,
         }
     }
 
@@ -5521,6 +5522,7 @@ mod head_dim_tests {
             audio: None,
             gdn: None,
             qwen35_attention: None,
+            hadamard: None,
         }
     }
 

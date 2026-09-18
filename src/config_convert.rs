@@ -448,6 +448,7 @@ impl OxidizrModelConfig {
             audio: None,
             gdn: None,
             qwen35_attention: None,
+            hadamard: None,
         };
 
         config.validate().map_err(|e| model_error(e.to_string()))?;
