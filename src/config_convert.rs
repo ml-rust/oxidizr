@@ -446,6 +446,8 @@ impl OxidizrModelConfig {
             // have no boostr equivalent.
             vision: None,
             audio: None,
+            gdn: None,
+            qwen35_attention: None,
         };
 
         config.validate().map_err(|e| model_error(e.to_string()))?;

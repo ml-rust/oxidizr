@@ -5280,6 +5280,8 @@ mod attention_extras_reach_dense_attention_tests {
             grow_vocab: false,
             vision: None,
             audio: None,
+            gdn: None,
+            qwen35_attention: None,
         }
     }
 
@@ -5517,6 +5519,8 @@ mod head_dim_tests {
             grow_vocab: false,
             vision: None,
             audio: None,
+            gdn: None,
+            qwen35_attention: None,
         }
     }
 
