@@ -5283,6 +5283,7 @@ mod attention_extras_reach_dense_attention_tests {
             gdn: None,
             qwen35_attention: None,
             hadamard: None,
+            quant_formats: Vec::new(),
         }
     }
 
@@ -5523,6 +5524,7 @@ mod head_dim_tests {
             gdn: None,
             qwen35_attention: None,
             hadamard: None,
+            quant_formats: Vec::new(),
         }
     }
 
