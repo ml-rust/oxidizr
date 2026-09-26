@@ -1,0 +1,75 @@
+model:
+  name: g2p-char
+
+  hidden_size: 256
+  num_layers: 4
+  num_heads: 4
+
+  head_dim: 64
+
+  kv_heads: null
+
+  kv_latent_dim: null
+  q_latent_dim: null
+  d_rope: null
+
+  num_experts: null
+  experts_per_tok: null
+  shared_expert_enabled: null
+  intermediate_size: 1024
+
+  mamba_layers: null
+
+  qk_norm: false
+
+  tie_word_embeddings: true
+
+  vocab_size: 111
+  tokenizer_vocab: custom
+
+  max_seq_len: 128
+  rope_theta: 10000.0
+
+  dtype: bf16
+
+trainer:
+  target_device: gpu
+  learning_rate: 0.0003
+  max_steps: 0
+  num_epochs: 10
+
+  batch_size: 128
+  gradient_accumulation: 1
+
+  checkpoint_dir: "${BOOSTR_MODELS_DIR}/g2p_lm/checkpoints/g2p-char"
+
+  log_interval: 20
+  save_interval: 491
+  max_checkpoints: 10
+
+  load_balance_alpha: 0.0
+
+  max_grad_norm: 1.0
+  target_grad_norm: null
+  max_grad_value: null
+
+  adamw_beta1: 0.9
+  adamw_beta2: 0.95
+  adamw_eps: 0.000001
+  weight_decay: 0.1
+  z_loss_alpha: 0.0
+
+  warmup_steps: null
+  warmup_ratio: 0.1
+  lr_schedule: cosine
+  min_lr_ratio: 0.1
+
+  seed: 42
+
+  target_mask:
+    kind: prefix_lm
+    target_base: 61
+    always_score: [3]
+
+  group_size: 4
+  beta_kl: 0.04
