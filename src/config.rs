@@ -1,3 +1,4 @@
+use crate::schedule::LrSchedule;
 use boostr::model::{SpeechLayout, SpeechVocab};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -49,6 +50,10 @@ fn default_warmup_steps() -> Option<usize> {
 fn default_warmup_ratio() -> Option<f64> {
     Some(0.1)
 } // 10% of total steps if warmup_steps not set
+
+fn default_min_lr_ratio() -> f64 {
+    0.0
+} // Decay to zero by default when a non-constant schedule is chosen
 
 // Re-export distributed config types
 pub use crate::distributed::sync::DistributedConfig;
@@ -631,6 +636,18 @@ pub struct TrainerConfig {
     #[serde(default = "default_warmup_ratio")]
     pub warmup_ratio: Option<f64>, // Fraction of total steps for warmup (default: 0.1 = 10%)
     // Only used if warmup_steps is None
+    /// Post-warmup learning-rate decay. `constant` (the default) reproduces
+    /// the prior warmup-then-flat behavior byte for byte; `cosine`/`linear`
+    /// decay from the end of warmup to `min_lr_ratio * learning_rate` by the
+    /// run's last step. See [`crate::schedule::LrSchedule`].
+    #[serde(default)]
+    pub lr_schedule: LrSchedule,
+
+    /// Fraction of `learning_rate` the schedule decays to by the last step.
+    /// Unused when `lr_schedule` is `constant`.
+    #[serde(default = "default_min_lr_ratio")]
+    pub min_lr_ratio: f64,
+
     /// Target device: "gpu" (default) or "cpu"
     #[serde(default)]
     pub target_device: TargetDevice,
@@ -782,6 +799,26 @@ impl LitConfig {
             }
         }
 
+        if self.trainer.lr_schedule.needs_total_steps()
+            && self.trainer.max_steps == 0
+            && self.trainer.num_epochs == 0
+        {
+            anyhow::bail!(
+                "trainer.lr_schedule = {:?} decays the learning rate toward a total step \
+                 count, but neither trainer.max_steps nor trainer.num_epochs names one \
+                 (both are 0). Set trainer.max_steps to the run's last step, or \
+                 trainer.num_epochs to a positive number of epochs.",
+                self.trainer.lr_schedule
+            );
+        }
+        if !(0.0..=1.0).contains(&self.trainer.min_lr_ratio) {
+            anyhow::bail!(
+                "trainer.min_lr_ratio ({}) must be between 0.0 and 1.0: it names the \
+                 fraction of learning_rate the schedule decays to.",
+                self.trainer.min_lr_ratio
+            );
+        }
+
         Ok(())
     }
 
@@ -851,6 +888,8 @@ impl LitConfig {
                 // Learning rate warmup
                 warmup_steps: None,      // Use ratio instead
                 warmup_ratio: Some(0.1), // 10% warmup
+                lr_schedule: crate::schedule::LrSchedule::Constant,
+                min_lr_ratio: 0.0,
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
                 seed: None,
@@ -940,6 +979,8 @@ impl LitConfig {
                 // Learning rate warmup
                 warmup_steps: None,      // Use ratio instead
                 warmup_ratio: Some(0.1), // 10% warmup
+                lr_schedule: crate::schedule::LrSchedule::Constant,
+                min_lr_ratio: 0.0,
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
                 seed: None,
@@ -1807,6 +1848,67 @@ mod tests {
             lora.train_modules = vec!["embed_tokens".to_string()];
         }
         assert_ne!(before, compute_model_config_hash(&cfg));
+    }
+
+    /// A config with no `lr_schedule` key must parse to `Constant` — the
+    /// schedule this codebase always ran before the field existed.
+    #[test]
+    fn lr_schedule_defaults_to_constant_when_absent_from_yaml() {
+        let cfg = LitConfig::nano_baseline();
+        assert_eq!(cfg.trainer.lr_schedule, LrSchedule::Constant);
+        assert_eq!(cfg.trainer.min_lr_ratio, 0.0);
+    }
+
+    /// A non-constant schedule with no way to know the run's last step
+    /// (`max_steps` and `num_epochs` both 0) must be rejected at validation,
+    /// not left to divide by zero mid-run.
+    #[test]
+    fn a_decaying_schedule_without_max_steps_or_epochs_fails_validation() {
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.trainer.lr_schedule = LrSchedule::Cosine;
+        cfg.trainer.max_steps = 0;
+        cfg.trainer.num_epochs = 0;
+        let err = cfg.validate().expect_err("no total steps configured");
+        assert!(err.to_string().contains("trainer.max_steps"));
+        assert!(err.to_string().contains("trainer.num_epochs"));
+    }
+
+    /// The same schedule passes once `num_epochs` names a total.
+    #[test]
+    fn a_decaying_schedule_with_epochs_set_passes_validation() {
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.trainer.lr_schedule = LrSchedule::Cosine;
+        cfg.trainer.max_steps = 0;
+        cfg.trainer.num_epochs = 2;
+        cfg.validate().expect("num_epochs names a total");
+    }
+
+    /// The same schedule also passes with `max_steps` set instead.
+    #[test]
+    fn a_decaying_schedule_with_max_steps_set_passes_validation() {
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.trainer.lr_schedule = LrSchedule::Linear;
+        cfg.trainer.max_steps = 5000;
+        cfg.trainer.num_epochs = 0;
+        cfg.validate().expect("max_steps names a total");
+    }
+
+    /// A constant schedule needs no total, so 0/0 is fine for it.
+    #[test]
+    fn a_constant_schedule_needs_no_total_steps() {
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.trainer.lr_schedule = LrSchedule::Constant;
+        cfg.trainer.max_steps = 0;
+        cfg.trainer.num_epochs = 0;
+        cfg.validate().expect("constant never decays");
+    }
+
+    #[test]
+    fn min_lr_ratio_outside_zero_to_one_fails_validation() {
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.trainer.min_lr_ratio = 1.5;
+        let err = cfg.validate().expect_err("out-of-range ratio");
+        assert!(err.to_string().contains("min_lr_ratio"));
     }
 
     /// `train_modules` matches one WHOLE dot-separated segment, never a

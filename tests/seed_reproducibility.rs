@@ -76,6 +76,8 @@ fn trainer_config(seed: Option<u64>) -> TrainerConfig {
         z_loss_alpha: 0.0,
         warmup_steps: None,
         warmup_ratio: Some(0.1),
+        lr_schedule: oxidizr::schedule::LrSchedule::Constant,
+        min_lr_ratio: 0.0,
         target_device: TargetDevice::Cpu,
         distributed: DistributedConfig::default(),
         seed,

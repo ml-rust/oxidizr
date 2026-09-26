@@ -70,6 +70,10 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     // Learning rate warmup (critical for Mamba SSM parameter alignment)
     warmup_steps: usize,     // Effective warmup steps (0 = disabled)
     base_learning_rate: f64, // Base LR to warmup towards
+    /// The run's last step, for the post-warmup decay schedule to decay
+    /// across. `LitConfig::validate` guarantees this is nonzero whenever
+    /// `config.lr_schedule` needs one (see `LrSchedule::needs_total_steps`).
+    effective_total_steps: usize,
     /// Guard against a silently all-ones or nearly-all-zeros loss mask: the
     /// masked-in fraction is reported once per run, not once per step.
     mask_stats_logged: bool,
@@ -153,6 +157,16 @@ where
         // Store base learning rate for warmup calculation
         let base_learning_rate = config.learning_rate;
 
+        // The step the post-warmup decay schedule decays across: an explicit
+        // `max_steps` caps it, otherwise the epoch-derived `total_steps`
+        // applies — the same two ways `fit_headless`/`fit_normal` compute
+        // `effective_steps`.
+        let effective_total_steps = if config.max_steps == 0 {
+            total_steps
+        } else {
+            config.max_steps.min(total_steps)
+        };
+
         Ok(Self {
             config,
             params,
@@ -176,6 +190,7 @@ where
             distributed_optimizer,
             warmup_steps,
             base_learning_rate,
+            effective_total_steps,
             mask_stats_logged: false,
         })
     }
@@ -227,9 +242,18 @@ where
             let warmup_ratio = (self.global_step + 1) as f64 / self.warmup_steps as f64;
             let warmup_lr = (self.base_learning_rate * warmup_ratio).max(1e-7);
             self.optimizer.set_lr(warmup_lr);
-        } else if self.warmup_steps > 0 && self.global_step == self.warmup_steps {
-            // Restore full learning rate after warmup completes
-            self.optimizer.set_lr(self.base_learning_rate);
+        } else {
+            // Past warmup (or warmup disabled): `Constant` holds
+            // `base_learning_rate` flat, exactly as before this schedule
+            // existed; `Cosine`/`Linear` decay it toward
+            // `min_lr_ratio * base_learning_rate` by `effective_total_steps`.
+            let multiplier = self.config.lr_schedule.decay_multiplier(
+                self.global_step,
+                self.warmup_steps,
+                self.effective_total_steps,
+                self.config.min_lr_ratio,
+            );
+            self.optimizer.set_lr(self.base_learning_rate * multiplier);
         }
 
         #[allow(unused_assignments)]
@@ -711,8 +735,15 @@ where
             // During warmup: LR = base_lr * step / warmup_steps
             self.base_learning_rate * (self.global_step as f64 / self.warmup_steps as f64)
         } else {
-            // After warmup: full base learning rate
-            self.base_learning_rate
+            // After warmup: base LR times the schedule's decay multiplier
+            // (1.0, i.e. unchanged, when `lr_schedule` is `Constant`).
+            let multiplier = self.config.lr_schedule.decay_multiplier(
+                self.global_step,
+                self.warmup_steps,
+                self.effective_total_steps,
+                self.config.min_lr_ratio,
+            );
+            self.base_learning_rate * multiplier
         }
     }
 
