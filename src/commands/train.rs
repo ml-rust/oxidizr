@@ -624,14 +624,23 @@ where
         LitDataLoader::<R>::new(dummy_tokens, batch_size, seq_len, device.clone())
     };
 
-    // Audio-only loss masking is opt-in: without `speech_layout` the loader
-    // emits no mask and every position is scored, exactly as before.
-    // `try_with_speech_layout` rejects a corpus whose layout sidecar disagrees
-    // with the configured layout, rather than training on ids that mean
-    // something else.
-    let base_loader = match &config.model.speech_layout {
-        Some(spec) => base_loader.try_with_speech_layout(spec.layout())?,
-        None => base_loader,
+    // Masked loss scoring is opt-in: without either `speech_layout` or
+    // `target_mask` the loader emits no mask and every position is scored,
+    // exactly as before. `try_with_speech_layout` rejects a corpus whose
+    // layout sidecar disagrees with the configured layout, rather than
+    // training on ids that mean something else. `LitConfig::validate` already
+    // rejects a config that sets both, so the two arms below never overlap
+    // on a config that reached this point through `LitConfig::from_yaml`.
+    let base_loader = match (&config.model.speech_layout, &config.trainer.target_mask) {
+        (Some(spec), None) => base_loader.try_with_speech_layout(spec.layout())?,
+        (None, Some(spec)) => base_loader.with_target_mask(spec.target_mask()),
+        (None, None) => base_loader,
+        (Some(_), Some(_)) => {
+            anyhow::bail!(
+                "model.speech_layout and trainer.target_mask are mutually exclusive: both \
+                 configure the loader's loss mask"
+            );
+        }
     };
 
     // Get dataset size before potentially wrapping in prefetch

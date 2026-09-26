@@ -296,6 +296,55 @@ impl SpeechLayoutSpec {
     }
 }
 
+/// How a config turns on prefix-LM continuation-only loss masking: a target
+/// scores iff it lands in the continuation region, or is named in
+/// `always_score`.
+///
+/// A tagged enum (mirroring [`SpeechLayoutSpec`]) so a future mask kind slots
+/// in beside `prefix_lm` without a breaking change; `prefix_lm` is the only
+/// kind today.
+///
+/// YAML, on `trainer.target_mask`:
+///
+/// ```yaml
+/// trainer:
+///   target_mask:
+///     kind: prefix_lm
+///     target_base: 64
+///     always_score: [3]
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TargetMaskSpec {
+    /// Score a target iff its id is `>= target_base` (the continuation
+    /// region — e.g. phoneme ids in a `specials | graphemes | phonemes`
+    /// vocab), or it appears in `always_score`.
+    PrefixLm {
+        /// First id of the continuation region.
+        target_base: u32,
+        /// Ids below `target_base` that score anyway, typically `<eos>`'s id
+        /// so the model learns to emit it even though it lives in the
+        /// specials region.
+        #[serde(default)]
+        always_score: Vec<u32>,
+    },
+}
+
+impl TargetMaskSpec {
+    /// The [`crate::data::TargetMask`] this names.
+    pub fn target_mask(&self) -> crate::data::TargetMask {
+        match self {
+            Self::PrefixLm {
+                target_base,
+                always_score,
+            } => crate::data::TargetMask::PrefixLm {
+                target_base: *target_base,
+                always_score: always_score.clone(),
+            },
+        }
+    }
+}
+
 /// LoRA adapter parameters. See [`OxidizrModelConfig::lora`] for why this
 /// lives on the model config.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -607,6 +656,19 @@ pub struct TrainerConfig {
     #[serde(default)]
     pub seed: Option<u64>,
 
+    /// Prefix-LM continuation-only loss masking. Absent leaves every target
+    /// position scored, byte-identical to before this field existed.
+    ///
+    /// Mutually exclusive with `model.speech_layout`: both configure the same
+    /// `Batch::loss_mask`, and only one selection rule can apply to a given
+    /// batch. `LitConfig::validate` rejects a config that sets both.
+    ///
+    /// On `TrainerConfig`, not `OxidizrModelConfig`: unlike `speech_layout`,
+    /// this never changes which tensors exist or their shapes, so it needs no
+    /// place in `compute_model_config_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_mask: Option<TargetMaskSpec>,
+
     // GRPO (Group Relative Policy Optimization) config - Phase 2
     #[allow(dead_code)] // Phase 2: GRPO implementation
     pub group_size: usize, // Number of rollouts per prompt (e.g., 4 or 8)
@@ -687,6 +749,39 @@ impl LitConfig {
             eprintln!();
         }
 
+        if let Some(spec) = &self.trainer.target_mask {
+            if self.model.speech_layout.is_some() {
+                anyhow::bail!(
+                    "trainer.target_mask and model.speech_layout are mutually exclusive: both \
+                     configure Batch::loss_mask, and only one selection rule can apply to a \
+                     given batch. Remove one of them."
+                );
+            }
+            match spec {
+                TargetMaskSpec::PrefixLm {
+                    target_base,
+                    always_score,
+                } => {
+                    let vocab_size = self.model.vocab_size as u32;
+                    if *target_base >= vocab_size {
+                        anyhow::bail!(
+                            "trainer.target_mask.target_base ({target_base}) must be less than \
+                             model.vocab_size ({vocab_size}): every id from target_base upward \
+                             scores, so a target_base at or past vocab_size scores nothing."
+                        );
+                    }
+                    for id in always_score {
+                        if *id >= vocab_size {
+                            anyhow::bail!(
+                                "trainer.target_mask.always_score contains {id}, which is not a \
+                                 valid id under model.vocab_size ({vocab_size})."
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -759,6 +854,7 @@ impl LitConfig {
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
                 seed: None,
+                target_mask: None,
                 group_size: 4, // GRPO: 4 rollouts per prompt
                 beta_kl: 0.04, // GRPO: KL penalty coefficient
             },
@@ -847,6 +943,7 @@ impl LitConfig {
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
                 seed: None,
+                target_mask: None,
                 group_size: 4, // GRPO: 4 rollouts per prompt
                 beta_kl: 0.04, // GRPO: KL penalty coefficient
             },
@@ -1471,6 +1568,93 @@ mod tests {
         assert_eq!(spec.layout().name(), "expressive-tts-1.7b");
         // The layout the checkpoint actually uses, not a placeholder.
         assert_eq!(spec.layout().total_size(), 217_208);
+    }
+
+    /// `trainer.target_mask` round-trips from the YAML shape the prefix-LM
+    /// training doc describes: `kind`, `target_base`, and `always_score`.
+    #[test]
+    fn target_mask_parses_prefix_lm_from_yaml() {
+        let spec: TargetMaskSpec =
+            serde_yaml::from_str("kind: prefix_lm\ntarget_base: 64\nalways_score: [3]")
+                .expect("parse");
+        assert_eq!(
+            spec,
+            TargetMaskSpec::PrefixLm {
+                target_base: 64,
+                always_score: vec![3],
+            }
+        );
+    }
+
+    /// `always_score` defaults to empty so a config that only names
+    /// `target_base` still parses — not every prefix-LM vocab needs an
+    /// always-scored id below the continuation region.
+    #[test]
+    fn target_mask_always_score_defaults_to_empty() {
+        let spec: TargetMaskSpec =
+            serde_yaml::from_str("kind: prefix_lm\ntarget_base: 64").expect("parse");
+        assert_eq!(
+            spec,
+            TargetMaskSpec::PrefixLm {
+                target_base: 64,
+                always_score: vec![],
+            }
+        );
+    }
+
+    /// `trainer.target_mask` and `model.speech_layout` both drive
+    /// `Batch::loss_mask`; a config naming both is ambiguous about which rule
+    /// applies and must be rejected rather than silently picking one.
+    #[test]
+    fn target_mask_and_speech_layout_are_mutually_exclusive() {
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.model.speech_layout = Some(SpeechLayoutSpec::ExpressiveTts);
+        cfg.trainer.target_mask = Some(TargetMaskSpec::PrefixLm {
+            target_base: 64,
+            always_score: vec![3],
+        });
+        let err = cfg.validate().expect_err("mutually exclusive masks");
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    /// `target_base` names the first scored id, so it must leave at least one
+    /// id in `[target_base, vocab_size)` for the mask to ever score anything.
+    #[test]
+    fn target_mask_target_base_must_be_less_than_vocab_size() {
+        let mut cfg = LitConfig::nano_baseline();
+        let vocab_size = cfg.model.vocab_size as u32;
+        cfg.trainer.target_mask = Some(TargetMaskSpec::PrefixLm {
+            target_base: vocab_size,
+            always_score: vec![],
+        });
+        let err = cfg.validate().expect_err("target_base at vocab_size");
+        assert!(err.to_string().contains("target_base"));
+    }
+
+    /// An `always_score` id past `vocab_size` can never appear as a real
+    /// target, so naming one is a config mistake, not a no-op.
+    #[test]
+    fn target_mask_always_score_id_must_be_valid() {
+        let mut cfg = LitConfig::nano_baseline();
+        let vocab_size = cfg.model.vocab_size as u32;
+        cfg.trainer.target_mask = Some(TargetMaskSpec::PrefixLm {
+            target_base: 64,
+            always_score: vec![vocab_size],
+        });
+        let err = cfg.validate().expect_err("always_score id out of range");
+        assert!(err.to_string().contains("always_score"));
+    }
+
+    /// A valid `prefix_lm` mask (target_base inside vocab_size, no
+    /// `speech_layout`) passes validation.
+    #[test]
+    fn target_mask_prefix_lm_passes_validation_when_well_formed() {
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.trainer.target_mask = Some(TargetMaskSpec::PrefixLm {
+            target_base: 64,
+            always_score: vec![3],
+        });
+        cfg.validate().expect("well-formed target_mask validates");
     }
 
     /// `qk_norm` is a new field on an existing struct, and the hash covers the

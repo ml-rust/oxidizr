@@ -70,8 +70,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     // Learning rate warmup (critical for Mamba SSM parameter alignment)
     warmup_steps: usize,     // Effective warmup steps (0 = disabled)
     base_learning_rate: f64, // Base LR to warmup towards
-    /// Guard against a silently all-ones or nearly-all-zeros audio loss mask:
-    /// the masked-in fraction is reported once per run, not once per step.
+    /// Guard against a silently all-ones or nearly-all-zeros loss mask: the
+    /// masked-in fraction is reported once per run, not once per step.
     mask_stats_logged: bool,
 }
 
@@ -375,7 +375,7 @@ where
                         let positions = mask_contig.elem_count();
                         let total = positions.max(1);
                         eprintln!(
-                            "[loss-mask] audio-only masking on: {masked_in}/{positions} positions \
+                            "[loss-mask] masked loss scoring on: {masked_in}/{positions} positions \
                              masked in ({:.2}%) in the first batch",
                             masked_in as f64 * 100.0 / total as f64
                         );

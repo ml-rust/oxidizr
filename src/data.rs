@@ -20,40 +20,89 @@ pub struct Batch<R: Runtime<DType = DType>> {
     pub inputs: Tensor<R>,
     /// Next-token ids `[batch_size, seq_len]`, I64 (`inputs` shifted by one).
     pub targets: Tensor<R>,
-    /// `1.0` at positions whose TARGET is an audio token, else `0.0`.
-    /// Shape `[batch_size, seq_len]`, F32. `None` when audio-only masking is off.
+    /// `1.0` at positions the loss scores, else `0.0`.
+    /// Shape `[batch_size, seq_len]`, F32. `None` when masking is off (every
+    /// position is scored).
     pub loss_mask: Option<Tensor<R>>,
 }
 
-/// Build the audio-only loss mask over a raw `[batch_size, seq_len + 1]` token
-/// window.
+/// Which target ids get scored by the loss.
+///
+/// One facility for every masked-loss scheme, so a second consumer never
+/// forks a parallel copy of the mask builder. Both loaders
+/// (`LitDataLoader::next_batch` and `PrefetchDataLoader::prefetch_worker`)
+/// build their mask through [`build_target_mask`], so the two shift paths
+/// cannot diverge.
+pub enum TargetMask {
+    /// boostr's speech-LM id layout: a target scores iff it falls in the
+    /// layout's audio region ([`SpeechLayout::is_audio`]).
+    SpeechAudio(SpeechLayout),
+    /// Prefix-LM continuation scoring: a target scores iff its id is at
+    /// least `target_base` (the continuation region — e.g. phoneme ids in a
+    /// G2P vocab laid out as `specials | graphemes | phonemes`), or it
+    /// appears in `always_score`.
+    ///
+    /// `always_score` names ids the model must still learn to emit that sit
+    /// BELOW `target_base` — most notably `<eos>`, which lives in the
+    /// specials region but ends the continuation and must be scored like any
+    /// other continuation token. Without it, `<eos>` never contributes to the
+    /// loss and the model never learns to stop.
+    PrefixLm {
+        /// First id of the continuation region. Every id `>= target_base` scores.
+        target_base: u32,
+        /// Ids below `target_base` that score regardless (typically `[eos_id]`).
+        always_score: Vec<u32>,
+    },
+}
+
+impl TargetMask {
+    /// Whether a target id at this position scores in the loss.
+    fn is_scored(&self, target: u32) -> bool {
+        match self {
+            Self::SpeechAudio(layout) => layout.is_audio(target),
+            Self::PrefixLm {
+                target_base,
+                always_score,
+            } => target >= *target_base || always_score.contains(&target),
+        }
+    }
+}
+
+/// Build the loss mask over a raw `[batch_size, seq_len + 1]` token window.
 ///
 /// The mask is derived from the POST-SHIFT targets (`slice[row_start + s + 1]`),
-/// never from the inputs (`slice[row_start + s]`). Masking on inputs would ask
-/// "is the current token audio" instead of "is the token being predicted audio",
-/// shifting every masked-in span by exactly one position on every row.
+/// never from the inputs (`slice[row_start + s]`). Masking on inputs asks
+/// "is the current token scored" instead of "is the token being predicted
+/// scored", shifting every masked-in span by exactly one position on every row.
 ///
-/// Rows are GPT-style packed, so one row can hold several concatenated
-/// text->audio examples; the mask is therefore per-token, never a single
-/// boundary index per row.
+/// Rows are GPT-style packed: one row can hold several concatenated examples
+/// (speech text->audio pairs, or `<bos> ... <sep> ... <eos>` prefix-LM
+/// sequences) back to back with no document-boundary marker, so the mask is
+/// per-token, never a single boundary index per row. A row can therefore
+/// start mid-sequence; that is harmless here because scoring depends only on
+/// each target id's own value (`is_scored`), never on its position within a
+/// sequence, so a window that starts mid-prompt or mid-continuation still
+/// masks every position correctly. The loader performs no document-boundary
+/// attention masking, so attention crosses sequence boundaries the same way
+/// standard packed LM training corpora do; that is unchanged by this mask.
 ///
 /// Shared by `LitDataLoader::next_batch` and `PrefetchDataLoader::prefetch_worker`
 /// so the two shift paths cannot diverge.
-fn audio_target_mask(
-    layout: &SpeechLayout,
+fn build_target_mask(
+    mask: &TargetMask,
     slice: &[u32],
     batch_size: usize,
     seq_len: usize,
 ) -> Vec<f32> {
-    let mut mask = Vec::with_capacity(batch_size * seq_len);
+    let mut out = Vec::with_capacity(batch_size * seq_len);
     for b in 0..batch_size {
         let row_start = b * (seq_len + 1);
         for s in 0..seq_len {
             let target = slice[row_start + s + 1];
-            mask.push(if layout.is_audio(target) { 1.0 } else { 0.0 });
+            out.push(if mask.is_scored(target) { 1.0 } else { 0.0 });
         }
     }
-    mask
+    out
 }
 
 /// Common interface for all data loaders
@@ -103,8 +152,9 @@ where
     // Sharding support for multi-GPU training
     shard_start: usize,
     shard_end: usize,
-    /// Speech id layout. `Some` turns on audio-only loss masking.
-    speech_layout: Option<SpeechLayout>,
+    /// Target mask rule. `Some` turns on masked loss scoring (audio-only for
+    /// speech, continuation-only for prefix-LM).
+    target_mask: Option<TargetMask>,
     /// File this loader was opened from, `None` for in-memory data.
     ///
     /// Kept so [`try_with_speech_layout`](Self::try_with_speech_layout) can find
@@ -140,7 +190,7 @@ where
             device,
             shard_start: 0,
             shard_end: len,
-            speech_layout: None,
+            target_mask: None,
             source_path: None,
         }
     }
@@ -210,9 +260,21 @@ where
             device,
             shard_start: 0,
             shard_end: len,
-            speech_layout: None,
+            target_mask: None,
             source_path: Some(path_ref.to_path_buf()),
         })
+    }
+
+    /// Enable masked loss scoring with an arbitrary [`TargetMask`] rule.
+    ///
+    /// [`with_speech_layout`](Self::with_speech_layout) and
+    /// [`try_with_speech_layout`](Self::try_with_speech_layout) are thin
+    /// wrappers around this for the speech case. Prefix-LM continuation
+    /// scoring (`TargetMask::PrefixLm`) has no corpus-layout sidecar to
+    /// check, so it goes through this form directly.
+    pub fn with_target_mask(mut self, mask: TargetMask) -> Self {
+        self.target_mask = Some(mask);
+        self
     }
 
     /// Enable audio-only loss masking with this speech id layout.
@@ -223,9 +285,8 @@ where
     /// This form does NOT check the corpus layout sidecar. Prefer
     /// [`try_with_speech_layout`](Self::try_with_speech_layout) for any loader
     /// opened from a file.
-    pub fn with_speech_layout(mut self, layout: SpeechLayout) -> Self {
-        self.speech_layout = Some(layout);
-        self
+    pub fn with_speech_layout(self, layout: SpeechLayout) -> Self {
+        self.with_target_mask(TargetMask::SpeechAudio(layout))
     }
 
     /// Enable audio-only loss masking, first checking the corpus layout sidecar.
@@ -339,9 +400,9 @@ where
 
         // Built from the same `slice`, over the post-shift target window, so it
         // lines up element-for-element with `targets` above.
-        let loss_mask = match &self.speech_layout {
-            Some(layout) => {
-                let mask = audio_target_mask(layout, slice, self.batch_size, self.seq_len);
+        let loss_mask = match &self.target_mask {
+            Some(target_mask) => {
+                let mask = build_target_mask(target_mask, slice, self.batch_size, self.seq_len);
                 Some(Tensor::<R>::from_slice(
                     &mask,
                     &[self.batch_size, self.seq_len],
@@ -559,9 +620,9 @@ where
             // Same helper as the synchronous path, over the same post-shift
             // target window, so the two loaders cannot produce different masks.
             let loss_mask = loader
-                .speech_layout
+                .target_mask
                 .as_ref()
-                .map(|layout| audio_target_mask(layout, slice, loader.batch_size, loader.seq_len));
+                .map(|mask| build_target_mask(mask, slice, loader.batch_size, loader.seq_len));
 
             // Prepare inputs and targets (still on CPU as Vec<u32>)
             let mut inputs = Vec::with_capacity(loader.batch_size * loader.seq_len);
@@ -839,5 +900,110 @@ mod tests {
         let sync_targets: Vec<i64> = sync_batch.targets.contiguous().expect("c").to_vec();
         let prefetch_targets: Vec<i64> = prefetch_batch.targets.contiguous().expect("c").to_vec();
         assert_eq!(sync_targets, prefetch_targets);
+    }
+
+    // ------------------------------------------------------------------
+    // Prefix-LM continuation masking (`TargetMask::PrefixLm`)
+    // ------------------------------------------------------------------
+    //
+    // Toy G2P vocab: specials [0, 4) = {bos=0, dialect=1, sep=2, eos=3},
+    // graphemes [4, 12), phonemes [12, 20). `target_base = 12`, so a target
+    // scores iff it is a phoneme id or is `eos` (3), which sits below
+    // `target_base` in the specials region but still ends the continuation.
+
+    const EOS: u32 = 3;
+    const PREFIX_LM_TARGET_BASE: u32 = 12;
+
+    fn prefix_lm_loader(
+        tokens: Vec<u32>,
+        batch_size: usize,
+        seq_len: usize,
+    ) -> LitDataLoader<CpuRuntime> {
+        LitDataLoader::<CpuRuntime>::new(tokens, batch_size, seq_len, CpuDevice::new())
+            .with_target_mask(TargetMask::PrefixLm {
+                target_base: PREFIX_LM_TARGET_BASE,
+                always_score: vec![EOS],
+            })
+    }
+
+    /// A full `<bos> <dialect> w o r d <sep> p h o n e m e s <eos>` sequence:
+    /// prompt tokens (bos/dialect/graphemes/sep) never score, phoneme targets
+    /// always score, and the closing `<eos>` target scores despite being a
+    /// specials-region id below `target_base`.
+    #[test]
+    fn prefix_lm_scores_phonemes_and_eos_never_prompt() {
+        // bos, dialect, w,o,r,d (graphemes), sep, p,h,o,n,e,m,s (phonemes), eos
+        let tokens = vec![0, 1, 4, 5, 6, 7, 2, 12, 13, 14, 15, 16, 17, 18, EOS];
+        let batch = prefix_lm_loader(tokens, 1, 14).next_batch().expect("batch");
+
+        assert_eq!(
+            mask_of(&batch),
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            "targets: dialect,w,o,r,d,sep (unscored) then p,h,o,n,e,m,s,eos (scored)"
+        );
+    }
+
+    /// `target_base` is the first scored id: one below it never scores, the
+    /// id itself always does.
+    #[test]
+    fn prefix_lm_target_base_boundary_is_inclusive() {
+        let below = PREFIX_LM_TARGET_BASE - 1; // last grapheme id
+        let at_base = PREFIX_LM_TARGET_BASE; // first phoneme id
+        let tokens = vec![0, below, at_base, at_base + 1];
+        let batch = prefix_lm_loader(tokens, 1, 3).next_batch().expect("batch");
+        // targets = [below, at_base, at_base+1]
+        assert_eq!(mask_of(&batch), vec![0.0, 1.0, 1.0]);
+    }
+
+    /// A window can start mid-sequence when several `<bos>...<eos>` examples
+    /// are packed back to back with no document-boundary marker. Scoring
+    /// depends only on each target id's own value, never on where the window
+    /// starts, so a window that begins inside the first example's
+    /// continuation (not at a `<bos>`) still masks every position correctly.
+    #[test]
+    fn window_starting_mid_sequence_still_masks_by_id() {
+        // seq A: bos, dialect, w(grapheme), sep, p(phoneme), eos      (6 tokens)
+        // seq B: bos, dialect, o,r(graphemes), sep, p,h(phonemes), eos (8 tokens)
+        let tokens = vec![0, 1, 4, 2, 12, EOS, 0, 1, 5, 6, 2, 13, 14, EOS];
+        let mut loader = prefix_lm_loader(tokens, 1, 4);
+
+        // First window: slice[0..5] = [bos, dialect, w, sep, p]; starts at a
+        // sequence boundary.
+        let first = loader.next_batch().expect("first batch");
+        assert_eq!(mask_of(&first), vec![0.0, 0.0, 0.0, 1.0]);
+
+        // Second window: cursor advanced by batch_size*seq_len=4, so
+        // slice[4..9] = [p, eos, bos, dialect, o] — this window starts
+        // mid-sequence, at the phoneme right before seq A's `<eos>`, not at
+        // a `<bos>`.
+        let second = loader.next_batch().expect("second batch");
+        // targets = [eos, bos, dialect, o(grapheme)]
+        assert_eq!(mask_of(&second), vec![1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn no_target_mask_means_no_loss_mask_for_prefix_lm_ids() {
+        let tokens = vec![0, 1, 4, 2, 12, EOS];
+        let mut l = LitDataLoader::<CpuRuntime>::new(tokens, 1, 5, CpuDevice::new());
+        let batch = l.next_batch().expect("batch");
+        assert!(batch.loss_mask.is_none());
+    }
+
+    #[test]
+    fn prefetch_loader_mask_matches_sync_loader_for_prefix_lm() {
+        let tokens = vec![
+            0, 1, 4, 5, 6, 7, 2, 12, 13, 14, 15, 16, 17, 18, EOS, 0, 1, 5, 2, 13, EOS,
+        ];
+
+        let sync_batch = prefix_lm_loader(tokens.clone(), 1, 20)
+            .next_batch()
+            .expect("sync batch");
+
+        let mut prefetch =
+            PrefetchDataLoader::<CpuRuntime>::new(prefix_lm_loader(tokens, 1, 20), 1)
+                .expect("prefetch loader");
+        let prefetch_batch = prefetch.next_batch().expect("prefetch batch");
+
+        assert_eq!(mask_of(&sync_batch), mask_of(&prefetch_batch));
     }
 }

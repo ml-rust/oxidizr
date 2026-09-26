@@ -79,6 +79,7 @@ fn trainer_config(seed: Option<u64>) -> TrainerConfig {
         target_device: TargetDevice::Cpu,
         distributed: DistributedConfig::default(),
         seed,
+        target_mask: None,
         group_size: 4,
         beta_kl: 0.04,
     }
