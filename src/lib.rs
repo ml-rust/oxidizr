@@ -9,6 +9,7 @@
 pub mod commands;
 pub mod config;
 pub mod config_convert;
+pub mod config_paths;
 pub mod data;
 pub mod distributed;
 pub mod model;

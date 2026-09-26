@@ -716,7 +716,11 @@ impl LitConfig {
     /// - Type mismatches in YAML values
     pub fn from_yaml<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let content = fs::read_to_string(path)?;
-        let config: LitConfig = serde_yaml::from_str(&content)?;
+        let mut config: LitConfig = serde_yaml::from_str(&content)?;
+        config.trainer.checkpoint_dir = crate::config_paths::expand_env_vars(
+            &config.trainer.checkpoint_dir,
+            "trainer.checkpoint_dir",
+        )?;
         config.validate()?;
         Ok(config)
     }
@@ -1909,6 +1913,54 @@ mod tests {
         cfg.trainer.min_lr_ratio = 1.5;
         let err = cfg.validate().expect_err("out-of-range ratio");
         assert!(err.to_string().contains("min_lr_ratio"));
+    }
+
+    /// `LitConfig::from_yaml` must expand `${VAR}` in `checkpoint_dir` before
+    /// validation runs, so a config never carries the machine's real path.
+    #[test]
+    fn from_yaml_expands_checkpoint_dir_env_placeholders() {
+        unsafe { std::env::set_var("OXIDIZR_TEST_FROM_YAML_DIR", "/tmp/oxidizr-from-yaml-test") };
+
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.trainer.checkpoint_dir = "${OXIDIZR_TEST_FROM_YAML_DIR}/ckpt".to_string();
+        let yaml = serde_yaml::to_string(&cfg).expect("serialize");
+
+        let dir = std::env::temp_dir().join(format!(
+            "oxidizr-from-yaml-test-{}.yaml",
+            std::process::id()
+        ));
+        fs::write(&dir, yaml).expect("write temp config");
+
+        let loaded = LitConfig::from_yaml(&dir).expect("load and expand");
+        assert_eq!(
+            loaded.trainer.checkpoint_dir,
+            "/tmp/oxidizr-from-yaml-test/ckpt"
+        );
+
+        fs::remove_file(&dir).ok();
+        unsafe { std::env::remove_var("OXIDIZR_TEST_FROM_YAML_DIR") };
+    }
+
+    /// The complement: an unset variable must fail to load, naming the
+    /// variable, rather than silently keeping the literal `${...}` as a path.
+    #[test]
+    fn from_yaml_fails_when_a_checkpoint_dir_variable_is_unset() {
+        unsafe { std::env::remove_var("OXIDIZR_TEST_FROM_YAML_MISSING") };
+
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.trainer.checkpoint_dir = "${OXIDIZR_TEST_FROM_YAML_MISSING}/ckpt".to_string();
+        let yaml = serde_yaml::to_string(&cfg).expect("serialize");
+
+        let dir = std::env::temp_dir().join(format!(
+            "oxidizr-from-yaml-missing-{}.yaml",
+            std::process::id()
+        ));
+        fs::write(&dir, yaml).expect("write temp config");
+
+        let err = LitConfig::from_yaml(&dir).expect_err("variable is unset");
+        assert!(err.to_string().contains("OXIDIZR_TEST_FROM_YAML_MISSING"));
+
+        fs::remove_file(&dir).ok();
     }
 
     /// `train_modules` matches one WHOLE dot-separated segment, never a

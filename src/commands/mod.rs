@@ -10,6 +10,7 @@
 
 pub mod import;
 pub mod merge;
+pub mod overrides;
 pub mod pack;
 #[cfg(feature = "audio")]
 pub mod prep_corpus;

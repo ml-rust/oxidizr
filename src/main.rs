@@ -58,9 +58,13 @@ struct Cli {
     #[arg(long = "gpus", global = true)]
     gpus: Option<String>,
 
-    /// Gradient sync backend (shortcut for 'oxidizr train --sync-backend')
+    /// Gradient sync backend override (shortcut for 'oxidizr train --sync-backend')
     #[arg(long = "sync-backend", global = true)]
     sync_backend: Option<String>,
+
+    /// Checkpoint directory override (shortcut for 'oxidizr train --checkpoint-dir')
+    #[arg(long = "checkpoint-dir", global = true)]
+    checkpoint_dir: Option<String>,
 
     /// Prefetch batches (shortcut for 'oxidizr train --prefetch')
     #[arg(long = "prefetch", global = true)]
@@ -70,7 +74,7 @@ struct Cli {
     #[arg(long = "max-checkpoints", global = true)]
     max_checkpoints: Option<usize>,
 
-    /// Model precision (shortcut for 'oxidizr train --dtype')
+    /// Model precision override (shortcut for 'oxidizr train --dtype')
     #[arg(long = "dtype", global = true)]
     dtype: Option<String>,
 }
@@ -150,10 +154,11 @@ fn main() -> Result<()> {
                     max_steps: cli.max_steps,
                     resume: cli.resume,
                     gpus: cli.gpus,
-                    sync_backend: cli.sync_backend.unwrap_or_else(|| "cpu".to_string()),
+                    sync_backend: cli.sync_backend,
                     prefetch: cli.prefetch.unwrap_or(0),
                     max_checkpoints: cli.max_checkpoints,
-                    dtype: cli.dtype.unwrap_or_else(|| "f32".to_string()),
+                    dtype: cli.dtype,
+                    checkpoint_dir: cli.checkpoint_dir,
                 };
                 commands::run_train(args)
             } else {

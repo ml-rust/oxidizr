@@ -11,6 +11,9 @@ use boostr::tensor::TensorId;
 use clap::Args;
 use std::collections::HashMap;
 
+use crate::commands::overrides::{
+    resolve_checkpoint_dir, resolve_dtype, resolve_sync_backend, Source,
+};
 use crate::config::{
     find_latest_checkpoint, CheckpointMeta, DTypePrecision, LitConfig, OxidizrModelConfig,
 };
@@ -61,9 +64,11 @@ pub struct TrainArgs {
     #[arg(long = "gpus")]
     pub gpus: Option<String>,
 
-    /// Gradient synchronization backend: "single", "cpu", or "nccl"
-    #[arg(long = "sync-backend", default_value = "cpu")]
-    pub sync_backend: String,
+    /// Gradient synchronization backend override: "single", "cpu", or "nccl".
+    /// Overrides `trainer.distributed.backend` only when given; the config
+    /// value applies otherwise.
+    #[arg(long = "sync-backend")]
+    pub sync_backend: Option<String>,
 
     /// Enable async data prefetching (CPU-GPU overlap)
     /// Prefetches N batches in background thread while GPU trains
@@ -74,10 +79,16 @@ pub struct TrainArgs {
     #[arg(long = "max-checkpoints")]
     pub max_checkpoints: Option<usize>,
 
-    /// Model precision: f32 (default), f16, or bf16
-    /// BF16 recommended for tensor core acceleration on modern GPUs
-    #[arg(long = "dtype", default_value = "f32")]
-    pub dtype: String,
+    /// Model precision override: f32, f16, or bf16. Overrides `model.dtype`
+    /// only when given; the config value applies otherwise.
+    #[arg(long = "dtype")]
+    pub dtype: Option<String>,
+
+    /// Checkpoint directory override. Overrides `trainer.checkpoint_dir`
+    /// only when given (also expanding any `${VAR}` placeholder it names);
+    /// the config value applies otherwise.
+    #[arg(long = "checkpoint-dir")]
+    pub checkpoint_dir: Option<String>,
 }
 
 /// Parse GPU IDs from comma-separated string (e.g., "0,1,2,3")
@@ -350,17 +361,34 @@ where
     if gpu_ids.len() > 1 {
         config.trainer.distributed.enabled = true;
         config.trainer.distributed.gpu_ids = gpu_ids.clone();
-        config.trainer.distributed.backend = args.sync_backend.parse().unwrap_or_default();
-        if !headless {
-            println!(
-                "CLI override: distributed training enabled with {} GPUs: {:?}",
-                gpu_ids.len(),
-                gpu_ids
-            );
-            println!(
-                "CLI override: sync_backend = {:?}",
-                config.trainer.distributed.backend
-            );
+        let current_backend = config.trainer.distributed.backend.clone();
+        match resolve_sync_backend(args.sync_backend.as_deref(), current_backend) {
+            Ok((backend, source)) => {
+                if !headless {
+                    println!(
+                        "CLI override: distributed training enabled with {} GPUs: {:?}",
+                        gpu_ids.len(),
+                        gpu_ids
+                    );
+                    match source {
+                        Source::Cli => println!(
+                            "sync_backend = {:?} (source: --sync-backend CLI flag)",
+                            backend
+                        ),
+                        Source::Config => println!(
+                            "sync_backend = {:?} (source: trainer.distributed.backend in config)",
+                            backend
+                        ),
+                    }
+                }
+                config.trainer.distributed.backend = backend;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: {} — using config default ({:?})",
+                    e, config.trainer.distributed.backend
+                );
+            }
         }
     } else if args.gpus.is_some() {
         // Single GPU explicitly specified
@@ -378,22 +406,54 @@ where
         config.trainer.max_checkpoints = max_ckpt;
     }
 
-    // Apply dtype override
-    if let Ok(dtype) = args.dtype.parse::<DTypePrecision>() {
-        if dtype != config.model.dtype {
+    // Apply dtype override: `--dtype` wins only when given, model.dtype from
+    // the YAML applies otherwise.
+    match resolve_dtype(args.dtype.as_deref(), config.model.dtype) {
+        Ok((dtype, source)) => {
             if !headless {
-                println!(
-                    "CLI override: dtype = {} (was {})",
-                    dtype, config.model.dtype
-                );
+                match source {
+                    Source::Cli => println!(
+                        "dtype = {} (source: --dtype CLI flag, config had {})",
+                        dtype, config.model.dtype
+                    ),
+                    Source::Config => println!("dtype = {} (source: model.dtype in config)", dtype),
+                }
             }
             config.model.dtype = dtype;
         }
-    } else {
-        eprintln!(
-            "Warning: Unknown dtype '{}', using config default ({})",
-            args.dtype, config.model.dtype
-        );
+        Err(e) => {
+            eprintln!(
+                "Warning: {e}, using config default ({})",
+                config.model.dtype
+            );
+        }
+    }
+
+    // Apply checkpoint_dir override: `--checkpoint-dir` wins only when
+    // given (and is itself run through `${VAR}` expansion), the config's
+    // already-expanded `trainer.checkpoint_dir` applies otherwise.
+    match resolve_checkpoint_dir(
+        args.checkpoint_dir.as_deref(),
+        &config.trainer.checkpoint_dir,
+    ) {
+        Ok((checkpoint_dir, source)) => {
+            if !headless {
+                match source {
+                    Source::Cli => println!(
+                        "checkpoint_dir = {} (source: --checkpoint-dir CLI flag, config had {})",
+                        checkpoint_dir, config.trainer.checkpoint_dir
+                    ),
+                    Source::Config => println!(
+                        "checkpoint_dir = {} (source: trainer.checkpoint_dir in config)",
+                        checkpoint_dir
+                    ),
+                }
+            }
+            config.trainer.checkpoint_dir = checkpoint_dir;
+        }
+        Err(e) => {
+            anyhow::bail!("invalid --checkpoint-dir: {e}");
+        }
     }
 
     // Show dtype info (BF16/F16 use less memory, F32 is default)
