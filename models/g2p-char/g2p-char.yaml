@@ -1,12 +1,25 @@
+# g2p-char: character-level grapheme-to-phoneme model.
+#
+# Decoder-only transformer with dense attention and tied embeddings. The
+# vocab holds special tokens, graphemes and phonemes. Each training sequence
+# is `<bos> <us|gb> graphemes <sep> phonemes <eos>`, and only the phonemes
+# and `<eos>` are scored.
+#
+# Build the dataset with boostr-audio's `assets/g2p_lm/build_dataset.py
+# --row-tokens 129`, then train:
+#   cargo run --release --features cuda -- train \
+#     -f models/g2p-char/g2p-char.yaml \
+#     -d $BOOSTR_MODELS_DIR/g2p_lm/data/train.bin
+
 model:
   name: g2p-char
 
-  hidden_size: 256
-  num_layers: 4
-  num_heads: 4
-
+  hidden_size: 384
+  num_layers: 6
+  num_heads: 6
   head_dim: 64
 
+  # Multi-head attention: every head has its own keys and values.
   kv_heads: null
 
   kv_latent_dim: null
@@ -16,7 +29,7 @@ model:
   num_experts: null
   experts_per_tok: null
   shared_expert_enabled: null
-  intermediate_size: 1024
+  intermediate_size: 1536
 
   mamba_layers: null
 
@@ -25,8 +38,11 @@ model:
   tie_word_embeddings: true
 
   vocab_size: 111
+  # The dataset's own vocab.json, not a splintr vocabulary.
   tokenizer_vocab: custom
 
+  # Rows are max_seq_len + 1 tokens; this must match the builder's
+  # --row-tokens.
   max_seq_len: 128
   rope_theta: 10000.0
 
@@ -36,18 +52,22 @@ trainer:
   target_device: gpu
   learning_rate: 0.0003
   max_steps: 0
-  num_epochs: 10
+  num_epochs: 30
 
   batch_size: 128
   gradient_accumulation: 1
 
+  shuffle_rows: true
+
   checkpoint_dir: "${BOOSTR_MODELS_DIR}/g2p_lm/checkpoints/g2p-char"
 
+  # The vocab travels with every checkpoint; the model cannot be read
+  # without it.
   checkpoint_sidecars:
     - "${BOOSTR_MODELS_DIR}/g2p_lm/data/vocab.json"
 
   log_interval: 20
-  save_interval: 491
+  save_interval: 1596
   max_checkpoints: 10
 
   load_balance_alpha: 0.0
@@ -69,10 +89,13 @@ trainer:
 
   seed: 42
 
+  # Score phoneme ids (>= target_base) and <eos> (id 3), so the model learns
+  # to stop.
   target_mask:
     kind: prefix_lm
     target_base: 61
     always_score: [3]
 
+  # Unused; required by the config parser.
   group_size: 4
   beta_kl: 0.04

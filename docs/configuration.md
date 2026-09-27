@@ -86,6 +86,7 @@ Enable Mixture of Experts:
 | `max_steps` | Maximum training steps | 5000 |
 | `num_epochs` | Number of epochs | 2 |
 | `gradient_accumulation` | Gradient accumulation steps | 1 |
+| `shuffle_rows` | Visit rows in a per-epoch permutation seeded from `seed` and the epoch; `false` = stream order | true |
 
 ### Checkpointing
 

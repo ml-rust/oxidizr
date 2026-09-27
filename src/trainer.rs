@@ -1,7 +1,7 @@
 use crate::checkpoint_config::{checkpoint_config_exists, write_checkpoint_config};
 use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
 use crate::config::{CheckpointMeta, OxidizrModelConfig, TrainerConfig};
-use crate::data::DataLoader;
+use crate::data::{DataLoader, DataPosition, RowLayout};
 use crate::distributed::{
     create_synchronizer, AdamWConfig as DistAdamWConfig, DistributedAdamW, GradientSynchronizer,
 };
@@ -28,9 +28,11 @@ use std::time::Instant;
 /// clippy's argument-count lint; the fields themselves are unrelated to each
 /// other beyond all describing "this particular training run".
 pub struct TrainerRunConfig {
-    pub dataset_size: usize,
+    /// Row and batch counts of the loader's shard.
+    pub row_layout: RowLayout,
+    /// Loader position at `start_step`.
+    pub start_position: DataPosition,
     pub batch_size: usize,
-    pub seq_len: usize,
     pub steps_json_path: String,
     pub headless: bool,
     pub start_step: usize,
@@ -51,10 +53,9 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     device: R::Device,
     global_step: usize,
     // Training metrics
-    dataset_size: usize,
+    row_layout: RowLayout,
     total_steps: usize,
     batch_size: usize,
-    seq_len: usize,
     // JSON logging
     steps_json_path: String,
     // UI mode
@@ -63,6 +64,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     prev_grad_norm: Option<f64>,
     // Resume support
     start_step: usize,
+    /// Loader position at `start_step`; checkpoint positions count from here.
+    start_position: DataPosition,
     // Checkpoint metadata
     model_config: OxidizrModelConfig,
     data_file_path: Option<String>,
@@ -109,9 +112,9 @@ where
         run: TrainerRunConfig,
     ) -> Result<Self> {
         let TrainerRunConfig {
-            dataset_size,
+            row_layout,
+            start_position,
             batch_size,
-            seq_len,
             steps_json_path,
             headless,
             start_step,
@@ -131,10 +134,8 @@ where
             weight_decay: config.weight_decay,
         });
 
-        // Calculate total steps from dataset
-        let effective_batch_size = batch_size * seq_len * config.gradient_accumulation;
-        let steps_per_epoch = dataset_size.div_ceil(effective_batch_size); // Ceiling division
-        let total_steps = steps_per_epoch * config.num_epochs;
+        // Whole batches of `num_epochs` epochs, `gradient_accumulation` per step.
+        let total_steps = row_layout.total_steps(config.gradient_accumulation, config.num_epochs);
 
         // Initialize distributed training components if enabled
         let (synchronizer, distributed_optimizer) = if config.distributed.enabled {
@@ -178,14 +179,14 @@ where
             client,
             device,
             global_step: start_step,
-            dataset_size,
+            row_layout,
             total_steps,
             batch_size,
-            seq_len,
             steps_json_path,
             headless,
             prev_grad_norm: None,
             start_step,
+            start_position,
             model_config,
             data_file_path,
             synchronizer,
@@ -392,7 +393,7 @@ where
                     let mask_flat = mask.reshape(&[b * s])?;
                     if !self.mask_stats_logged {
                         self.mask_stats_logged = true;
-                        // The mask holds exactly 0.0/1.0 (see `data.rs`), so its sum
+                        // The mask holds exactly 0.0/1.0 (see `data/mask.rs`), so its sum
                         // IS the masked-in count. Reduce on device and transfer one
                         // scalar instead of the whole mask.
                         let mask_contig = mask_flat.contiguous()?;
@@ -807,8 +808,6 @@ where
         model: &crate::model::LitGPT<R>,
         data_loader: &mut D,
     ) -> Result<()> {
-        let tokens_per_step = self.batch_size * self.seq_len * self.config.gradient_accumulation;
-        let steps_per_epoch = self.dataset_size.div_ceil(tokens_per_step);
         let training_start = Instant::now();
 
         // max_steps=0 means unlimited (train for full epochs)
@@ -841,7 +840,7 @@ where
                     std::process::exit(1);
                 }
             };
-            let current_epoch = (step + 1) as f64 / steps_per_epoch as f64;
+            let current_epoch = self.epoch_progress(step + 1);
 
             // Log at intervals
             if step % self.config.log_interval == 0 || step == self.start_step {
@@ -867,6 +866,12 @@ where
                 println!("{{\"step\": {}, \"loss\": {:.4}, \"grad_norm\": {:.4}, \"learning_rate\": {:.6e}, \"epoch\": {:.2}, \"samples/s\": {:.2}, \"vram\": \"{}\"}}",
                     step + 1, loss, grad_norm, self.current_learning_rate(), current_epoch, samples_s, vram);
             }
+
+            let completed = step + 1;
+            if self.is_save_step(completed) {
+                self.save_checkpoint(model, completed)?;
+                println!("{{\"checkpoint\": {{\"step\": {completed}}}}}");
+            }
         }
 
         // Always save final checkpoint
@@ -888,9 +893,6 @@ where
         model: &crate::model::LitGPT<R>,
         data_loader: &mut D,
     ) -> Result<()> {
-        let tokens_per_step = self.batch_size * self.seq_len * self.config.gradient_accumulation;
-        let steps_per_epoch = self.dataset_size.div_ceil(tokens_per_step);
-
         // Respect max_steps limit (0 = unlimited, train for full epochs)
         let effective_steps = if self.config.max_steps == 0 {
             self.total_steps
@@ -982,7 +984,7 @@ where
             }
             step_start = Instant::now();
 
-            let current_epoch = (step + 1) as f64 / steps_per_epoch as f64;
+            let current_epoch = self.epoch_progress(step + 1);
 
             // Calculate samples/s as rolling average of recent steps
             // Each step processes batch_size * gradient_accumulation samples
@@ -1025,11 +1027,11 @@ where
             ));
 
             // Checkpoint messages go to scrollable area above
-            // Only save if we've done at least one new step (not immediately after resume)
-            if step > self.start_step && step % self.config.save_interval == 0 {
-                mp.println(format!("💾 Checkpoint saved: step {}", step))
+            let completed = step + 1;
+            if self.is_save_step(completed) {
+                self.save_checkpoint(model, completed)?;
+                mp.println(format!("💾 Checkpoint saved: step {completed}"))
                     .ok();
-                self.save_checkpoint(model, step)?;
             }
         }
 
@@ -1130,6 +1132,31 @@ where
             .unwrap_or("<unnamed>")
     }
 
+    /// Loader position after `completed` optimizer steps of this run.
+    ///
+    /// Every step draws exactly `gradient_accumulation` batches, including a
+    /// step skipped for a non-finite gradient norm.
+    fn data_position_after(&self, completed: usize) -> DataPosition {
+        let batches = (completed - self.start_step) * self.config.gradient_accumulation;
+        self.row_layout.advance(self.start_position, batches)
+    }
+
+    /// Fractional epochs of data drawn after `completed` optimizer steps.
+    fn epoch_progress(&self, completed: usize) -> f64 {
+        let pos = self.data_position_after(completed);
+        let rows_per_epoch = self.row_layout.batches_per_epoch() * self.row_layout.batch_size();
+        pos.epoch as f64 + pos.row as f64 / rows_per_epoch as f64
+    }
+
+    /// Whether an interval checkpoint is due once `completed` steps are done.
+    fn is_save_step(&self, completed: usize) -> bool {
+        self.config.save_interval > 0 && completed.is_multiple_of(self.config.save_interval)
+    }
+
+    /// Saves weights labelled with `step`, the count of completed optimizer
+    /// steps, so a resume from `step_N` starts at step index `N` and its
+    /// loader at the position recorded beside it.
+    ///
     /// Frozen parameters are absent from `self.params`, so the model is passed
     /// through to `save_checkpoint_from_params` as their source. Without it a
     /// LoRA run would write an adapter-only checkpoint.
@@ -1147,12 +1174,22 @@ where
 
         // Save metadata for auto-resume validation
         if let Some(ref data_path) = self.data_file_path {
-            if let Ok(meta) =
-                CheckpointMeta::new(step, &self.model_config, data_path, &checkpoint_path)
-            {
-                if let Err(e) = meta.save(&self.config.checkpoint_dir) {
-                    eprintln!("Warning: Failed to save checkpoint metadata: {}", e);
-                }
+            let position = Some(self.data_position_after(step));
+            let saved = CheckpointMeta::new(
+                step,
+                &self.model_config,
+                data_path,
+                &checkpoint_path,
+                position,
+            )
+            .and_then(|meta| meta.save(&self.config.checkpoint_dir));
+            if let Err(e) = saved {
+                eprintln!(
+                    "Warning: failed to write checkpoint_step_{step}.meta.json in {}: {e}. \
+                     `--resume auto` cannot select this checkpoint; pass its path to \
+                     `--resume` instead.",
+                    self.config.checkpoint_dir
+                );
             }
         }
 

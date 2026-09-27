@@ -73,21 +73,24 @@ The `auto` option finds the most recent checkpoint in the config's `checkpoint_d
 
 ## What's Saved
 
-Checkpoints include:
-- Model weights
-- Optimizer state
-- Training step counter
-- Random number generator state
+Each interval checkpoint writes:
+- `<prefix>_step_N.safetensors`: model weights after N completed optimizer steps
+- `checkpoint_step_N.meta.json`: step N, config and data-file hashes, dtype,
+  and `data_position` (the next batch's epoch and row slot)
 
-This ensures training continues exactly where it left off.
+AdamW moment buffers are not saved. A resumed run starts them from zero.
 
 ## Resume Behavior
 
 When resuming:
-1. Model weights loaded from checkpoint
-2. Optimizer state restored
-3. Training continues from saved step
-4. Metrics resume from checkpoint state
+1. Model weights load from the checkpoint.
+2. Training continues at step N, with the learning-rate schedule at step N.
+3. The data loader seeks to `data_position`, so the resumed run draws the
+   same rows, in the same shuffled order, as an uninterrupted run.
+
+Metadata written before `data_position` existed has none. The loader
+position then derives from N and the current `batch_size` and
+`gradient_accumulation`, and a stderr line reports it.
 
 ## Best Practices
 

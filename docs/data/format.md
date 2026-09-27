@@ -27,6 +27,23 @@ A file with 6,379 tokens:
 - Size: 6,379 × 4 = 25,516 bytes
 - Contains: Raw u32 values in sequence
 
+### Rows
+
+The loader cuts the stream into rows of `max_seq_len + 1` tokens at fixed
+offsets. Row `r` is tokens `[r × (max_seq_len + 1), (r + 1) × (max_seq_len + 1))`.
+
+- Inputs are `row[0..max_seq_len]`. Targets are `row[1..max_seq_len + 1]`.
+- A batch is `batch_size` rows. Each epoch visits every row once.
+- Row order: a per-epoch permutation seeded from `trainer.seed` when
+  `trainer.shuffle_rows` is `true` (the default), stream order when `false`.
+- Steps per epoch: `floor(rows / batch_size) / gradient_accumulation`. The
+  partial batch at an epoch's end is dropped.
+- Tokens past the last whole row are never read.
+
+A dataset of short, independent examples can be packed so no example
+straddles a row: write rows of exactly `max_seq_len + 1` tokens and pad each
+row's tail with an id the loss mask never scores.
+
 ## Reading Binary Data
 
 ### Python

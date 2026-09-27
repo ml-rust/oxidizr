@@ -17,7 +17,9 @@ use crate::commands::overrides::{
 use crate::config::{
     find_latest_checkpoint, CheckpointMeta, DTypePrecision, LitConfig, OxidizrModelConfig,
 };
-use crate::data::{create_dummy_data, LitDataLoader, PrefetchDataLoader};
+use crate::data::{
+    create_dummy_data, DataPosition, LitDataLoader, PrefetchDataLoader, RowLayout, RowOrder,
+};
 use crate::model::LitGPT;
 use crate::trainer::{LitTrainer, TrainerRunConfig};
 
@@ -150,6 +152,53 @@ fn clear_checkpoint_directory(checkpoint_dir: &str) -> Result<usize> {
     }
 
     Ok(removed_count)
+}
+
+/// `checkpoint_step_{step}.meta.json` beside an explicitly named checkpoint,
+/// if that file exists.
+fn sibling_meta_path(checkpoint: &str, step: usize) -> Option<String> {
+    let dir = std::path::Path::new(checkpoint).parent()?;
+    let meta = dir.join(format!("checkpoint_step_{step}.meta.json"));
+    meta.exists().then(|| meta.to_string_lossy().into_owned())
+}
+
+/// Loader position for a run that resumes at `start_step`.
+///
+/// Reads `data_position` from the checkpoint metadata at `meta_path`.
+/// Metadata written before row loading carries none, and an explicit
+/// `--resume <path>` can have no metadata at all. The position then follows
+/// from `start_step` under the current row layout and accumulation, and a
+/// stderr line says so.
+fn resume_data_position(
+    meta_path: Option<&str>,
+    start_step: usize,
+    layout: &RowLayout,
+    grad_accum: usize,
+) -> Result<DataPosition> {
+    if let Some(path) = meta_path {
+        let meta = CheckpointMeta::load(path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read checkpoint metadata {path}: {e}. Restore the file, or pass \
+                 the checkpoint's .safetensors path to --resume without it."
+            )
+        })?;
+        if let Some(position) = meta.data_position {
+            return Ok(position);
+        }
+    }
+    let position = layout.position_after_steps(start_step, grad_accum);
+    if start_step > 0 {
+        eprintln!(
+            "Checkpoint metadata ({}) records no data position: resuming the data stream at \
+             epoch {} row {}, derived from step {start_step} x {grad_accum} batches per step \
+             x {} rows per batch.",
+            meta_path.unwrap_or("none found"),
+            position.epoch,
+            position.row,
+            layout.batch_size()
+        );
+    }
+    Ok(position)
 }
 
 /// Get CUDA memory info in a human-readable format
@@ -488,8 +537,9 @@ where
     let mut varmap = VarMap::<R>::new();
     let mut model = LitGPT::<R>::new_seeded(&config, &mut varmap, &device, &client)?;
 
-    // Load checkpoint if resuming
-    let start_step = if let Some(ref resume_arg) = args.resume {
+    // Load checkpoint if resuming. The metadata path, when there is one,
+    // carries the loader position to resume the data stream at.
+    let (start_step, resume_meta_path) = if let Some(ref resume_arg) = args.resume {
         if resume_arg == "auto" {
             // Auto-resume: find latest checkpoint and validate
             if !headless {
@@ -564,7 +614,7 @@ where
                                         ));
                                     }
                                 }
-                                0 // Start from step 0
+                                (0, None) // Start from step 0
                             } else {
                                 println!("Aborted. Please resolve the configuration mismatch or use a different checkpoint directory.");
                                 return Err(anyhow::anyhow!("Training aborted by user"));
@@ -587,7 +637,7 @@ where
                             if !headless {
                                 println!("Resuming from step {}", step);
                             }
-                            step
+                            (step, Some(meta_path))
                         }
                     } else {
                         if !headless {
@@ -597,7 +647,7 @@ where
                         if !headless {
                             println!("Resuming from step {}", step);
                         }
-                        step
+                        (step, Some(meta_path))
                     }
                 }
                 None => {
@@ -615,7 +665,7 @@ where
                          `checkpoint_step_N.meta.json` beside it.",
                         config.trainer.checkpoint_dir
                     );
-                    0
+                    (0, None)
                 }
             }
         } else {
@@ -645,10 +695,10 @@ where
             if !headless && step > 0 {
                 println!("Resuming from step {}", step);
             }
-            step
+            (step, sibling_meta_path(resume_arg, step))
         }
     } else {
-        0
+        (0, None)
     };
 
     if !headless {
@@ -703,8 +753,25 @@ where
         }
     };
 
+    let row_order = if config.trainer.shuffle_rows {
+        RowOrder::Shuffled {
+            seed: config.trainer.seed.unwrap_or(0),
+        }
+    } else {
+        RowOrder::Stream
+    };
+    let mut base_loader = base_loader.with_row_order(row_order);
+
     // Get dataset size before potentially wrapping in prefetch
     let dataset_size = base_loader.dataset_size();
+    let row_layout = base_loader.row_layout()?;
+    let start_position = resume_data_position(
+        resume_meta_path.as_deref(),
+        start_step,
+        &row_layout,
+        config.trainer.gradient_accumulation,
+    )?;
+    base_loader.seek(start_position)?;
 
     if !headless {
         let prefetch_msg = if args.prefetch > 0 {
@@ -713,18 +780,29 @@ where
             String::new()
         };
         println!(
-            "Data loader ready with {} tokens{}\n",
-            dataset_size, prefetch_msg
+            "Data loader ready with {} tokens in {} rows of {} (row order: {:?}){}",
+            dataset_size,
+            row_layout.num_rows(),
+            seq_len + 1,
+            row_order,
+            prefetch_msg
+        );
+        println!(
+            "Data position: epoch {} row {}\n",
+            start_position.epoch, start_position.row
         );
     }
 
     // 5. Initialize Trainer
     let config_trainer = config.trainer.clone();
 
-    // For step calculation, we need total tokens per step
-    let tokens_per_step = batch_size * seq_len * config_trainer.gradient_accumulation;
-    let steps_per_epoch = dataset_size.div_ceil(tokens_per_step);
-    let total_steps = steps_per_epoch * config_trainer.num_epochs;
+    // Whole batches per epoch; the partial batch at an epoch's end is dropped.
+    let steps_per_epoch =
+        row_layout.batches_per_epoch() as f64 / config_trainer.gradient_accumulation as f64;
+    let total_steps = row_layout.total_steps(
+        config_trainer.gradient_accumulation,
+        config_trainer.num_epochs,
+    );
 
     // Effective batch size is the number of samples per optimizer step
     let effective_batch_size = batch_size * config_trainer.gradient_accumulation;
@@ -756,9 +834,9 @@ where
         client.clone(),
         device.clone(),
         TrainerRunConfig {
-            dataset_size,
+            row_layout,
+            start_position,
             batch_size,
-            seq_len,
             steps_json_path: steps_json_path.clone(),
             headless,
             start_step,
@@ -830,8 +908,11 @@ where
             (trainable_params as f64 / total_params as f64) * 100.0
         );
         println!(
-            "  Num examples = {} | Num Epochs = {} | Total steps = {}",
-            steps_per_epoch, config_trainer.num_epochs, total_steps
+            "  Rows = {} | Steps per epoch = {:.2} | Num Epochs = {} | Total steps = {}",
+            row_layout.num_rows(),
+            steps_per_epoch,
+            config_trainer.num_epochs,
+            total_steps
         );
         println!(
             "  Batch size per device = {} | Gradient accumulation = {}",

@@ -1,3 +1,4 @@
+use crate::data::DataPosition;
 use crate::schedule::LrSchedule;
 use boostr::model::{SpeechLayout, SpeechVocab};
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,9 @@ fn default_warmup_ratio() -> Option<f64> {
 fn default_min_lr_ratio() -> f64 {
     0.0
 } // Decay to zero by default when a non-constant schedule is chosen
+fn default_shuffle_rows() -> bool {
+    true
+}
 
 // Re-export distributed config types
 pub use crate::distributed::sync::DistributedConfig;
@@ -669,6 +673,9 @@ pub struct TrainerConfig {
     /// order-independent and reproducible across runs. `None` keeps the
     /// prior unseeded (RNG-driven) behavior.
     ///
+    /// Also the base seed of the per-epoch row order when `shuffle_rows` is
+    /// on. `None` there means base seed 0, so row order stays reproducible.
+    ///
     /// On `TrainerConfig`, not `OxidizrModelConfig`: `compute_model_config_hash`
     /// hashes `OxidizrModelConfig` to gate checkpoint-resume compatibility, and
     /// a seed changes neither tensor shapes nor which tensors exist — only the
@@ -692,6 +699,14 @@ pub struct TrainerConfig {
     /// place in `compute_model_config_hash`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_mask: Option<TargetMaskSpec>,
+
+    /// Row order within each epoch. `true` (the default) visits every row
+    /// once per epoch in a permutation seeded from `seed` (0 when `seed` is
+    /// unset) and the epoch index, so each epoch draws a new order and a
+    /// rerun draws the same ones. `false` visits rows in stream order every
+    /// epoch. See [`crate::data::RowOrder`].
+    #[serde(default = "default_shuffle_rows")]
+    pub shuffle_rows: bool,
 
     // GRPO (Group Relative Policy Optimization) config - Phase 2
     #[allow(dead_code)] // Phase 2: GRPO implementation
@@ -922,6 +937,7 @@ impl LitConfig {
                 distributed: DistributedConfig::default(),
                 seed: None,
                 target_mask: None,
+                shuffle_rows: true,
                 group_size: 4, // GRPO: 4 rollouts per prompt
                 beta_kl: 0.04, // GRPO: KL penalty coefficient
             },
@@ -1014,6 +1030,7 @@ impl LitConfig {
                 distributed: DistributedConfig::default(),
                 seed: None,
                 target_mask: None,
+                shuffle_rows: true,
                 group_size: 4, // GRPO: 4 rollouts per prompt
                 beta_kl: 0.04, // GRPO: KL penalty coefficient
             },
@@ -1033,6 +1050,11 @@ pub struct CheckpointMeta {
     /// Model precision used when saving checkpoint (for resume validation)
     #[serde(default = "default_dtype_string")]
     pub dtype: String,
+    /// Where the data loader stood after `step` steps: the next batch's
+    /// epoch and slot in that epoch's row order. Absent in metadata written
+    /// before row loading; resume then derives it from `step`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_position: Option<DataPosition>,
 }
 
 fn default_dtype_string() -> String {
@@ -1046,6 +1068,7 @@ impl CheckpointMeta {
         model_config: &OxidizrModelConfig,
         data_file_path: &str,
         checkpoint_file: &str,
+        data_position: Option<DataPosition>,
     ) -> anyhow::Result<Self> {
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let model_config_hash = compute_model_config_hash(model_config);
@@ -1059,6 +1082,7 @@ impl CheckpointMeta {
             data_file_hash,
             checkpoint_file: checkpoint_file.to_string(),
             dtype: model_config.dtype.to_string(),
+            data_position,
         })
     }
 

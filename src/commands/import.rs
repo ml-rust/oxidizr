@@ -368,7 +368,15 @@ where
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let meta = CheckpointMeta::new(IMPORT_STEP, &config.model, &args.data_file, &output_path)?;
+    // An imported checkpoint has trained on no data: its run starts at the
+    // stream start.
+    let meta = CheckpointMeta::new(
+        IMPORT_STEP,
+        &config.model,
+        &args.data_file,
+        &output_path,
+        Some(crate::data::DataPosition::default()),
+    )?;
     meta.save(&meta_dir.to_string_lossy())
         .with_context(|| format!("Failed to write metadata in '{}'", meta_dir.display()))?;
 

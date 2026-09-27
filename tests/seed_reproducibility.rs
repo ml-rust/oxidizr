@@ -83,6 +83,7 @@ fn trainer_config(seed: Option<u64>) -> TrainerConfig {
         distributed: DistributedConfig::default(),
         seed,
         target_mask: None,
+        shuffle_rows: true,
         group_size: 4,
         beta_kl: 0.04,
     }
