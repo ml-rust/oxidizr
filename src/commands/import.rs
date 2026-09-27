@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::checkpoint_names::from_checkpoint_name;
 use crate::config::{CheckpointMeta, LitConfig};
 use crate::model::{load_tensors_initializing_lora, save_checkpoint_from_params, LitGPT};
 use crate::prelude::{DType, Tensor, VarBuilder, VarMap};
@@ -36,10 +37,6 @@ use boostr::TypeConversionOps;
 /// The step an imported checkpoint is stamped with: nothing has been trained
 /// from it yet.
 const IMPORT_STEP: usize = 0;
-
-/// HuggingFace's prefix on every decoder parameter. `lm_head.weight` is the
-/// one tensor outside it.
-const HF_DECODER_PREFIX: &str = "model.";
 
 /// How many freshly initialized adapter names are printed in full. A rank-8
 /// adapter on seven projections of a 32-layer model is 448 names; the count
@@ -89,11 +86,6 @@ struct MappingPlan {
     skipped: Vec<SkippedTensor>,
 }
 
-/// The oxidizr name a HuggingFace tensor belongs under.
-fn oxidizr_name(hf_name: &str) -> &str {
-    hf_name.strip_prefix(HF_DECODER_PREFIX).unwrap_or(hf_name)
-}
-
 /// Decide where every HuggingFace tensor goes.
 ///
 /// `expected` is the model's own parameter-name set, so the mapping is checked
@@ -111,7 +103,7 @@ fn plan_mapping(
     let mut unrecognized = Vec::new();
 
     for hf_name in hf_names {
-        let target = oxidizr_name(hf_name);
+        let target = from_checkpoint_name(hf_name);
         if expected.contains(target) {
             if let Some(previous) = claimed.get(target) {
                 return Err(anyhow::anyhow!(

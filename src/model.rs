@@ -3529,7 +3529,7 @@ where
 
         // DEBUG: Check input_ids for duplicate tokens
         if std::env::var("DEBUG_GRAD").is_ok() {
-            // `data.rs` uploads token ids as I64, so read them as i64: `to_vec::<T>`
+            // The data loader uploads token ids as I64, so read them as i64: `to_vec::<T>`
             // sizes its copy from `T`, not the tensor's dtype.
             let ids_tensor = input_ids.contiguous()?;
             let ids = ids_tensor.try_to_vec::<i64>()?;
@@ -4839,7 +4839,10 @@ where
             }
         };
         let cpu_tensor = stage_tensor_for_safetensors::<R>(tensor, &cpu_device)?;
-        tensors.insert(name.clone(), cpu_tensor);
+        tensors.insert(
+            crate::checkpoint_names::to_checkpoint_name(name),
+            cpu_tensor,
+        );
     }
 
     let mut metadata = HashMap::new();
@@ -4865,7 +4868,38 @@ where
     let device = model.embed_tokens.weight().tensor().device().clone();
     let mut safetensors = boostr::format::SafeTensors::open(path)?;
     let loaded = safetensors.load_all::<R>(&device)?;
+    let loaded = normalize_checkpoint_names(loaded, path)?;
     load_tensors_into_model(model, loaded, path)
+}
+
+/// Rekey a raw checkpoint tensor map from on-disk names (`model.`-prefixed, or
+/// unprefixed from an older checkpoint) to [`LitGPT::named_parameters`] names.
+///
+/// Both conventions are accepted so an older, unprefixed checkpoint still
+/// resumes. If a checkpoint somehow carries both `x` and `model.x`, which
+/// oxidizr's own writer never produces, that is ambiguous rather than
+/// silently resolvable, so it is a hard error naming both keys.
+fn normalize_checkpoint_names<R: boostr::Runtime>(
+    loaded: HashMap<String, Tensor<R>>,
+    source: &str,
+) -> Result<HashMap<String, Tensor<R>>> {
+    let mut normalized: HashMap<String, Tensor<R>> = HashMap::with_capacity(loaded.len());
+    let mut origin: HashMap<String, String> = HashMap::with_capacity(loaded.len());
+    for (name, tensor) in loaded {
+        let target = crate::checkpoint_names::from_checkpoint_name(&name).to_string();
+        if let Some(previous_name) = origin.get(&target) {
+            return Err(boostr::error::Error::ModelError {
+                reason: format!(
+                    "checkpoint '{source}' carries both '{previous_name}' and '{name}', which \
+                     both normalize to the same parameter '{target}'. Remove one of the two \
+                     conflicting tensors from the file before loading it."
+                ),
+            });
+        }
+        origin.insert(target.clone(), name);
+        normalized.insert(target, tensor);
+    }
+    Ok(normalized)
 }
 
 /// Rebuild `model` from an already-loaded tensor map, keyed by oxidizr
@@ -6235,7 +6269,7 @@ mod lora_tests {
         let model = LitGPT::<CpuRuntime>::new(&cfg(Some(lora_cfg())), &mut vb, &client)
             .expect("model builds");
 
-        // i64, matching what `data.rs` uploads (it casts the u32 stream first).
+        // i64, matching what the data loader uploads (it casts the u32 stream first).
         let input_ids =
             Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
         let output = model.forward(&client, &input_ids).expect("forward");
@@ -6502,7 +6536,7 @@ mod lora_tests {
         let model = LitGPT::<CpuRuntime>::new(&cfg(Some(lora_cfg_for(&targets))), &mut vb, &client)
             .expect("model builds");
 
-        // i64, matching what `data.rs` uploads (it casts the u32 stream first).
+        // i64, matching what the data loader uploads (it casts the u32 stream first).
         let input_ids =
             Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
         let output = model.forward(&client, &input_ids).expect("forward");
@@ -6561,7 +6595,7 @@ mod lora_tests {
     }
 
     fn logits(model: &LitGPT<CpuRuntime>, client: &CpuClient, device: &CpuDevice) -> Vec<f32> {
-        // i64, matching what `data.rs` uploads.
+        // i64, matching what the data loader uploads.
         let input_ids =
             Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], device).unwrap();
         let output = model.forward(client, &input_ids).expect("forward");
@@ -6663,11 +6697,15 @@ mod lora_tests {
             !written.iter().any(|name| name.contains("lora_")),
             "a merged checkpoint must carry no adapter tensor: {written:?}"
         );
+        let mut expected: Vec<String> = sorted_parameter_names(&build(None))
+            .iter()
+            .map(|name| crate::checkpoint_names::to_checkpoint_name(name))
+            .collect();
+        expected.sort();
         assert_eq!(
-            written,
-            sorted_parameter_names(&build(None)),
+            written, expected,
             "a merged checkpoint must carry exactly the parameter set of the same config \
-             without its lora block"
+             without its lora block, under their on-disk `model.`-prefixed names"
         );
     }
 
@@ -7142,7 +7180,7 @@ mod moe_lora_tests {
     }
 
     fn logits(model: &LitGPT<CpuRuntime>, client: &CpuClient, device: &CpuDevice) -> Vec<f32> {
-        // i64, matching what `data.rs` uploads (it casts the u32 stream first).
+        // i64, matching what the data loader uploads (it casts the u32 stream first).
         let input_ids =
             Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], device).unwrap();
         let output = model.forward(client, &input_ids).expect("forward");
@@ -7293,7 +7331,7 @@ mod moe_lora_tests {
         let client = CpuClient::new(device.clone());
         let model = build(Some(lora_cfg()));
 
-        // i64, matching what `data.rs` uploads (it casts the u32 stream first).
+        // i64, matching what the data loader uploads (it casts the u32 stream first).
         let input_ids =
             Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
         let output = model.forward(&client, &input_ids).expect("forward");
@@ -7432,13 +7470,13 @@ mod moe_lora_tests {
             .named_parameters()
             .unwrap()
             .into_iter()
-            .map(|(name, _, _)| name)
+            .map(|(name, _, _)| crate::checkpoint_names::to_checkpoint_name(&name))
             .collect();
         plain.sort();
         assert_eq!(
             written, plain,
             "a merged checkpoint must carry exactly the parameter set of the same config \
-             without its lora block"
+             without its lora block, under their on-disk `model.`-prefixed names"
         );
     }
 
@@ -7574,17 +7612,18 @@ mod checkpoint_completeness_tests {
             .into_owned()
     }
 
-    /// Rewrite `path` without `drop_name`, emulating a truncated or
-    /// hand-edited checkpoint.
+    /// Rewrite `path` without `drop_name` — an oxidizr parameter name, mapped
+    /// to its on-disk key — emulating a truncated or hand-edited checkpoint.
     fn rewrite_without(path: &str, drop_name: &str) {
+        let on_disk_name = crate::checkpoint_names::to_checkpoint_name(drop_name);
         let device = CpuDevice::new();
         let mut safetensors = boostr::format::SafeTensors::open(path).expect("open checkpoint");
         let mut tensors = safetensors
             .load_all::<CpuRuntime>(&device)
             .expect("load checkpoint");
         assert!(
-            tensors.remove(drop_name).is_some(),
-            "'{drop_name}' must be present before it can be removed"
+            tensors.remove(&on_disk_name).is_some(),
+            "'{on_disk_name}' must be present before it can be removed"
         );
         boostr::format::safetensors::save_safetensors(path, &tensors, None).expect("rewrite");
     }
@@ -7687,6 +7726,28 @@ mod checkpoint_completeness_tests {
     }
 
     #[test]
+    fn saved_checkpoint_keys_are_model_prefixed_except_the_lm_head() {
+        let cfg = cfg(None);
+        let saved = build(&cfg);
+        let path = temp_path("prefix");
+        save_checkpoint_from_params(&path, &saved, &optimizer_params(&saved)).expect("save");
+
+        let on_disk = checkpoint_names(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!on_disk.is_empty(), "the checkpoint must carry tensors");
+        for name in on_disk.keys() {
+            if name == "lm_head.weight" {
+                continue;
+            }
+            assert!(
+                name.starts_with(crate::checkpoint_names::CHECKPOINT_DECODER_PREFIX),
+                "'{name}' must carry the on-disk 'model.' prefix"
+            );
+        }
+    }
+
+    #[test]
     fn frozen_parameters_stay_frozen_after_load() {
         let cfg = cfg(Some(lora_cfg()));
         let (saved, restored) = round_trip(&cfg, "frozen");
@@ -7785,6 +7846,56 @@ mod checkpoint_completeness_tests {
         assert_eq!(expected, all_values(&restored));
     }
 
+    #[test]
+    fn a_checkpoint_carrying_both_a_prefixed_and_unprefixed_name_is_rejected() {
+        let cfg = cfg(None);
+        let saved = build(&cfg);
+        let path = temp_path("collision");
+        let cpu_device = CpuDevice::new();
+        let mut tensors: HashMap<String, Tensor<CpuRuntime>> = saved
+            .named_parameters()
+            .unwrap()
+            .into_iter()
+            .map(|(name, _, var)| {
+                (
+                    crate::checkpoint_names::to_checkpoint_name(&name),
+                    stage_tensor_for_safetensors::<CpuRuntime>(var.tensor(), &cpu_device)
+                        .expect("stage tensor"),
+                )
+            })
+            .collect();
+        // Duplicate one entry under its unprefixed legacy name too, so the
+        // file carries both 'embed_tokens.weight' and
+        // 'model.embed_tokens.weight' — a collision oxidizr's own writer
+        // never produces, but a hand-edited or foreign file might.
+        let duplicate = tensors
+            .get("model.embed_tokens.weight")
+            .expect("embed_tokens.weight must be part of the parameter set")
+            .clone();
+        tensors.insert("embed_tokens.weight".to_string(), duplicate);
+        boostr::format::safetensors::save_safetensors(&path, &tensors, None).expect("save");
+
+        let mut restored = build(&cfg);
+        let result = load_checkpoint_into_model(&mut restored, &path);
+        let _ = std::fs::remove_file(&path);
+
+        let error = match result {
+            Ok(()) => panic!(
+                "a checkpoint carrying both a prefixed and unprefixed name for the same \
+                 parameter must not load silently"
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("embed_tokens.weight") && error.contains("model.embed_tokens.weight"),
+            "the error must name both conflicting keys; got: {error}"
+        );
+        assert!(
+            error.contains(&path),
+            "the error must name the checkpoint file; got: {error}"
+        );
+    }
+
     /// A pretrained BASE checkpoint's tensors, keyed by parameter name: the
     /// map an import holds after remapping HuggingFace names. Built from a
     /// `lora: None` model, so it carries every base weight and no adapter —
@@ -7839,9 +7950,10 @@ mod checkpoint_completeness_tests {
         save_checkpoint_from_params(&path, &model, &optimizer_params(&model)).expect("save");
         let on_disk = checkpoint_names(&path);
         for name in &expected_adapters {
+            let on_disk_name = crate::checkpoint_names::to_checkpoint_name(name);
             assert!(
-                on_disk.contains_key(name),
-                "the imported checkpoint must contain '{name}'; got {:?}",
+                on_disk.contains_key(&on_disk_name),
+                "the imported checkpoint must contain '{on_disk_name}'; got {:?}",
                 on_disk.keys().collect::<Vec<_>>()
             );
         }
@@ -8217,7 +8329,7 @@ mod legacy_moe_tests {
         let client = CpuClient::new(device.clone());
         let model = build(&cfg(Some(NUM_EXPERTS), None));
 
-        // i64, matching what `data.rs` uploads (it casts the u32 stream first).
+        // i64, matching what the data loader uploads (it casts the u32 stream first).
         let input_ids =
             Tensor::<CpuRuntime>::from_slice(&[1i64, 2, 3, 4], &[1, 4], &device).unwrap();
         let output = model.forward(&client, &input_ids).expect("forward");

@@ -7,6 +7,7 @@
 //! public API instead of re-implementing it.
 
 pub mod checkpoint_config;
+pub mod checkpoint_names;
 pub mod checkpoint_sidecars;
 pub mod commands;
 pub mod config;

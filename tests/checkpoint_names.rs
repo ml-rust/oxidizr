@@ -380,7 +380,12 @@ fn dense_checkpoint_round_trips_through_save_and_load() {
         .expect("saved checkpoint tensors must load");
     let mut disk_names: Vec<String> = on_disk.keys().cloned().collect();
     disk_names.sort();
-    assert_name_set(&disk_names, DENSE_GOLDEN, "on-disk checkpoint keys");
+    let disk_golden = on_disk_names(DENSE_GOLDEN);
+    assert_name_set(
+        &disk_names,
+        &as_strs(&disk_golden),
+        "on-disk checkpoint keys",
+    );
 
     let mut reloaded = build(&cfg);
     let result = load_checkpoint_into_model(&mut reloaded, &path);
@@ -390,6 +395,27 @@ fn dense_checkpoint_round_trips_through_save_and_load() {
         "a checkpoint saved from this exact config must load back into a fresh model of the \
          same config without error",
     );
+}
+
+/// The names a checkpoint file carries for `golden`'s parameters: the
+/// HuggingFace layout boostr's loaders read, with the decoder body under
+/// `model.` and `lm_head.*` at the root. Spelled out here rather than taken
+/// from `oxidizr::checkpoint_names`, so a change to that rule fails this test.
+fn on_disk_names(golden: &[&str]) -> Vec<String> {
+    golden
+        .iter()
+        .map(|name| {
+            if name.starts_with("lm_head.") {
+                name.to_string()
+            } else {
+                format!("model.{name}")
+            }
+        })
+        .collect()
+}
+
+fn as_strs(names: &[String]) -> Vec<&str> {
+    names.iter().map(String::as_str).collect()
 }
 
 /// Every parameter of `model`, keyed by `TensorId` — the shape
@@ -421,9 +447,10 @@ fn qk_norm_checkpoint_round_trips_through_save_and_load() {
         .expect("saved checkpoint tensors must load");
     let mut disk_names: Vec<String> = on_disk.keys().cloned().collect();
     disk_names.sort();
+    let disk_golden = on_disk_names(QK_NORM_GOLDEN);
     assert_name_set(
         &disk_names,
-        QK_NORM_GOLDEN,
+        &as_strs(&disk_golden),
         "on-disk qk_norm checkpoint keys",
     );
 

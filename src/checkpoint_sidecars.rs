@@ -123,7 +123,8 @@ mod tests {
         let missing_str = missing.to_str().unwrap().to_string();
 
         let err =
-            copy_checkpoint_sidecars(std::slice::from_ref(&missing_str), dir.to_str().unwrap()).unwrap_err();
+            copy_checkpoint_sidecars(std::slice::from_ref(&missing_str), dir.to_str().unwrap())
+                .unwrap_err();
         assert!(err.to_string().contains(&missing_str));
 
         std::fs::remove_dir_all(&dir).ok();
