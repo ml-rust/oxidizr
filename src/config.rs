@@ -578,6 +578,13 @@ pub struct TrainerConfig {
     pub num_epochs: usize,            // Number of epochs to train
     pub gradient_accumulation: usize, // Number of gradient accumulation steps
     pub checkpoint_dir: String,
+    /// Files that define the model's input space — a custom tokenizer vocab,
+    /// a speech-corpus layout sidecar — copied into `checkpoint_dir` whenever
+    /// `config.json` is written, so the checkpoint is never separated from
+    /// the vocab it was trained against. Each entry supports `${VAR}`
+    /// expansion the same way `checkpoint_dir` does.
+    #[serde(default)]
+    pub checkpoint_sidecars: Vec<String>,
     pub log_interval: usize,
     pub save_interval: usize,
     #[serde(default = "default_max_checkpoints")]
@@ -721,12 +728,28 @@ impl LitConfig {
             &config.trainer.checkpoint_dir,
             "trainer.checkpoint_dir",
         )?;
+        for (i, raw) in config
+            .trainer
+            .checkpoint_sidecars
+            .clone()
+            .iter()
+            .enumerate()
+        {
+            config.trainer.checkpoint_sidecars[i] = crate::config_paths::expand_env_vars(
+                raw,
+                &format!("trainer.checkpoint_sidecars[{i}]"),
+            )?;
+        }
         config.validate()?;
         Ok(config)
     }
 
     /// Validate configuration constraints
     fn validate(&self) -> anyhow::Result<()> {
+        crate::checkpoint_sidecars::validate_checkpoint_sidecars(
+            &self.trainer.checkpoint_sidecars,
+        )?;
+
         // Mamba2 constraint: hidden_size * expand == num_heads * head_dim
         if let (Some(num_heads), Some(head_dim), Some(expand)) = (
             self.model.mamba2_num_heads,
@@ -876,6 +899,7 @@ impl LitConfig {
                 num_epochs: 2,            // Train for 2 epochs
                 gradient_accumulation: 1, // Effective batch = 32
                 checkpoint_dir: "./checkpoints".to_string(),
+                checkpoint_sidecars: Vec::new(),
                 log_interval: 10,
                 save_interval: 500,
                 max_checkpoints: 10,     // Keep last 10 checkpoints
@@ -967,6 +991,7 @@ impl LitConfig {
                 num_epochs: 2, // Train for 2 epochs
                 gradient_accumulation: 1,
                 checkpoint_dir: "./checkpoints".to_string(),
+                checkpoint_sidecars: Vec::new(),
                 log_interval: 10,
                 save_interval: 500,
                 max_checkpoints: 10,      // Keep last 10 checkpoints
@@ -1157,139 +1182,10 @@ pub fn compute_file_hash(path: &str) -> anyhow::Result<String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-/// Blazr-compatible inference configuration
-///
-/// This struct matches the config.json format expected by the blazr inference server.
-/// It's generated once at training start and saved to the checkpoint directory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlazrConfig {
-    pub hidden_size: usize,
-    pub num_layers: usize,
-    pub vocab_size: usize,
-    /// Whether `lm_head` shares the embedding matrix. Must be recorded here:
-    /// a tied checkpoint has no `lm_head.weight`, so an inference server that
-    /// assumed untied would look for a tensor the file does not contain.
-    #[serde(default)]
-    pub tie_word_embeddings: bool,
-    /// Tokenizer vocabulary name (cl100k_base, o200k_base, llama3, deepseek_v3)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tokenizer_vocab: Option<String>,
-
-    // Mamba2 parameters
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mamba2_num_heads: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mamba2_head_dim: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mamba2_state_size: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mamba2_chunk_size: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mamba2_expand: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mamba2_conv_kernel: Option<usize>,
-
-    // Mamba3 parameters
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mamba3_enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mamba3_complex_rope: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mamba3_mimo_rank: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mamba3_use_conv: Option<bool>,
-
-    // MLA (Multi-Head Latent Attention) parameters
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub num_attention_heads: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kv_latent_dim: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub q_latent_dim: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub d_rope: Option<usize>,
-
-    // MoE (Mixture of Experts) parameters
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub num_experts: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub experts_per_tok: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shared_expert_enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub intermediate_size: Option<usize>,
-
-    // Layer configuration
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub mamba_layers: Vec<usize>,
-
-    // RMSNorm
-    pub rms_norm_eps: f64,
-
-    // Inference settings
-    pub max_seq_len: usize,
-}
-
-impl BlazrConfig {
-    /// Create a BlazrConfig from an OxidizrModelConfig
-    pub fn from_model_config(cfg: &OxidizrModelConfig) -> Self {
-        Self {
-            hidden_size: cfg.hidden_size,
-            num_layers: cfg.num_layers,
-            vocab_size: cfg.vocab_size,
-            tie_word_embeddings: cfg.tie_word_embeddings,
-            tokenizer_vocab: Some(cfg.tokenizer_vocab.clone()),
-
-            // Mamba2 parameters
-            mamba2_num_heads: cfg.mamba2_num_heads,
-            mamba2_head_dim: cfg.mamba2_head_dim,
-            mamba2_state_size: cfg.mamba2_state_size,
-            mamba2_chunk_size: cfg.mamba2_chunk_size,
-            mamba2_expand: cfg.mamba2_expand,
-            mamba2_conv_kernel: cfg.mamba2_conv_kernel,
-
-            // Mamba3 parameters
-            mamba3_enabled: cfg.mamba3_enabled,
-            mamba3_complex_rope: cfg.mamba3_complex_rope,
-            mamba3_mimo_rank: cfg.mamba3_mimo_rank,
-            mamba3_use_conv: cfg.mamba3_use_conv,
-
-            // MLA parameters
-            num_attention_heads: Some(cfg.num_heads),
-            kv_latent_dim: cfg.kv_latent_dim,
-            q_latent_dim: cfg.q_latent_dim,
-            d_rope: cfg.d_rope,
-
-            // MoE parameters
-            num_experts: cfg.num_experts,
-            experts_per_tok: cfg.experts_per_tok,
-            shared_expert_enabled: cfg.shared_expert_enabled,
-            intermediate_size: cfg.intermediate_size,
-
-            // Layer configuration
-            mamba_layers: cfg.mamba_layers.clone().unwrap_or_default(),
-
-            // RMSNorm (hardcoded default, same as blazr)
-            rms_norm_eps: 1e-5,
-
-            // Inference settings
-            max_seq_len: cfg.max_seq_len,
-        }
-    }
-
-    /// Save config to checkpoint directory as config.json
-    pub fn save(&self, checkpoint_dir: &str) -> anyhow::Result<()> {
-        let config_path = format!("{}/config.json", checkpoint_dir);
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(&config_path, json)?;
-        Ok(())
-    }
-
-    /// Check if config.json already exists in checkpoint directory
-    pub fn exists(checkpoint_dir: &str) -> bool {
-        Path::new(&format!("{}/config.json", checkpoint_dir)).exists()
-    }
-}
+// The checkpoint-directory `config.json` blazr reads is written by
+// `crate::checkpoint_config::write_checkpoint_config`, as boostr's own
+// `UniversalConfig` derived through `OxidizrModelConfig::to_boostr`. See that
+// module for the schema and rationale.
 
 /// Find the latest checkpoint in a directory
 /// Format: {name}_{seq}_{params}_{dtype}_step_{N}.safetensors
@@ -1961,6 +1857,61 @@ mod tests {
         assert!(err.to_string().contains("OXIDIZR_TEST_FROM_YAML_MISSING"));
 
         fs::remove_file(&dir).ok();
+    }
+
+    /// `trainer.checkpoint_sidecars` entries expand `${VAR}` the same way
+    /// `checkpoint_dir` does, and must point at a file that exists.
+    #[test]
+    fn from_yaml_expands_and_validates_checkpoint_sidecars() {
+        let scratch =
+            std::env::temp_dir().join(format!("oxidizr-sidecar-test-{}", std::process::id()));
+        fs::create_dir_all(&scratch).expect("create scratch dir");
+        let vocab_path = scratch.join("vocab.json");
+        fs::write(&vocab_path, "{}").expect("write vocab.json");
+
+        unsafe { std::env::set_var("OXIDIZR_TEST_SIDECAR_DIR", scratch.to_str().unwrap()) };
+
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.trainer.checkpoint_sidecars =
+            vec!["${OXIDIZR_TEST_SIDECAR_DIR}/vocab.json".to_string()];
+        let yaml = serde_yaml::to_string(&cfg).expect("serialize");
+
+        let config_path = scratch.join("config.yaml");
+        fs::write(&config_path, yaml).expect("write temp config");
+
+        let loaded = LitConfig::from_yaml(&config_path).expect("sidecar file exists");
+        assert_eq!(
+            loaded.trainer.checkpoint_sidecars,
+            vec![vocab_path.to_str().unwrap().to_string()]
+        );
+
+        fs::remove_dir_all(&scratch).ok();
+        unsafe { std::env::remove_var("OXIDIZR_TEST_SIDECAR_DIR") };
+    }
+
+    /// A `checkpoint_sidecars` entry naming a file that does not exist fails
+    /// at load time, naming the missing path, rather than surfacing only when
+    /// the checkpoint is later found to be missing it.
+    #[test]
+    fn from_yaml_fails_when_a_checkpoint_sidecar_is_missing() {
+        let scratch = std::env::temp_dir().join(format!(
+            "oxidizr-sidecar-missing-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&scratch).expect("create scratch dir");
+        let missing_path = scratch.join("does-not-exist.json");
+
+        let mut cfg = LitConfig::nano_baseline();
+        cfg.trainer.checkpoint_sidecars = vec![missing_path.to_str().unwrap().to_string()];
+        let yaml = serde_yaml::to_string(&cfg).expect("serialize");
+
+        let config_path = scratch.join("config.yaml");
+        fs::write(&config_path, yaml).expect("write temp config");
+
+        let err = LitConfig::from_yaml(&config_path).expect_err("sidecar file is missing");
+        assert!(err.to_string().contains(missing_path.to_str().unwrap()));
+
+        fs::remove_dir_all(&scratch).ok();
     }
 
     /// `train_modules` matches one WHOLE dot-separated segment, never a

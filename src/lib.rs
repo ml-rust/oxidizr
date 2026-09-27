@@ -6,6 +6,8 @@
 //! `VarBuilder`/`LitGPT::new` wiring `commands::train` uses — through the
 //! public API instead of re-implementing it.
 
+pub mod checkpoint_config;
+pub mod checkpoint_sidecars;
 pub mod commands;
 pub mod config;
 pub mod config_convert;

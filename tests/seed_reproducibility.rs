@@ -62,6 +62,7 @@ fn trainer_config(seed: Option<u64>) -> TrainerConfig {
         num_epochs: 1,
         gradient_accumulation: 1,
         checkpoint_dir: "./checkpoints".to_string(),
+        checkpoint_sidecars: Vec::new(),
         log_interval: 10,
         save_interval: 500,
         max_checkpoints: 10,

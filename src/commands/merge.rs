@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::{BlazrConfig, LitConfig, LoraConfig};
+use crate::checkpoint_config::write_checkpoint_config;
+use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
+use crate::config::{LitConfig, LoraConfig};
 use crate::model::{load_checkpoint_into_model, save_checkpoint_from_params, LitGPT};
 use crate::prelude::{DType, Tensor, VarBuilder, VarMap};
 use boostr::runtime::{Runtime, RuntimeClient};
@@ -140,9 +142,9 @@ where
     println!("  Writing merged checkpoint...");
     save_checkpoint_from_params(&args.output, &model, &params)?;
 
-    // The blazr sidecar carries no `lora` key in any case — `BlazrConfig` has
-    // no such field — but the config it is derived from is stripped too, so
-    // what is written describes the merged model exactly.
+    // The blazr sidecar carries no `lora` key in any case — a merged model has
+    // no adapter left to describe — but the config it is derived from is
+    // stripped too, so what is written describes the merged model exactly.
     let mut merged_config = config.model.clone();
     merged_config.lora = None;
     let sidecar_dir = output
@@ -151,9 +153,16 @@ where
         .unwrap_or_else(|| Path::new("."));
     let sidecar_dir = sidecar_dir.to_string_lossy().into_owned();
     println!("  Writing config.json for blazr inference compatibility...");
-    BlazrConfig::from_model_config(&merged_config)
-        .save(&sidecar_dir)
+    write_checkpoint_config(&merged_config, &sidecar_dir)
         .with_context(|| format!("Failed to write config.json in '{}'", sidecar_dir))?;
+    copy_checkpoint_sidecars(&config.trainer.checkpoint_sidecars, &sidecar_dir).with_context(
+        || {
+            format!(
+                "Failed to copy checkpoint sidecar files into '{}'",
+                sidecar_dir
+            )
+        },
+    )?;
 
     println!("\n✅ Merge complete!");
     println!("\nOutput files:");

@@ -1,4 +1,6 @@
-use crate::config::{BlazrConfig, CheckpointMeta, OxidizrModelConfig, TrainerConfig};
+use crate::checkpoint_config::{checkpoint_config_exists, write_checkpoint_config};
+use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
+use crate::config::{CheckpointMeta, OxidizrModelConfig, TrainerConfig};
 use crate::data::DataLoader;
 use crate::distributed::{
     create_synchronizer, AdamWConfig as DistAdamWConfig, DistributedAdamW, GradientSynchronizer,
@@ -776,14 +778,26 @@ where
         }
 
         // Only save if config.json doesn't already exist
-        if !BlazrConfig::exists(&self.config.checkpoint_dir) {
-            let blazr_config = BlazrConfig::from_model_config(&self.model_config);
-            if let Err(e) = blazr_config.save(&self.config.checkpoint_dir) {
-                if !self.headless {
-                    eprintln!("Warning: Failed to save blazr config.json: {}", e);
+        if !checkpoint_config_exists(&self.config.checkpoint_dir) {
+            match write_checkpoint_config(&self.model_config, &self.config.checkpoint_dir) {
+                Ok(()) => {
+                    if !self.headless {
+                        println!("📝 Saved config.json for blazr inference compatibility");
+                    }
                 }
-            } else if !self.headless {
-                println!("📝 Saved config.json for blazr inference compatibility");
+                Err(e) => {
+                    if !self.headless {
+                        eprintln!("Warning: Failed to save blazr config.json: {}", e);
+                    }
+                }
+            }
+            if let Err(e) = copy_checkpoint_sidecars(
+                &self.config.checkpoint_sidecars,
+                &self.config.checkpoint_dir,
+            ) {
+                if !self.headless {
+                    eprintln!("Warning: Failed to copy checkpoint sidecar files: {}", e);
+                }
             }
         }
     }

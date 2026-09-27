@@ -43,6 +43,9 @@ trainer:
 
   checkpoint_dir: "${BOOSTR_MODELS_DIR}/g2p_lm/checkpoints/g2p-char"
 
+  checkpoint_sidecars:
+    - "${BOOSTR_MODELS_DIR}/g2p_lm/data/vocab.json"
+
   log_interval: 20
   save_interval: 491
   max_checkpoints: 10

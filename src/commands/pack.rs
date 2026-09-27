@@ -8,7 +8,7 @@ use dialoguer::{theme::ColorfulTheme, Select};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::BlazrConfig;
+use boostr::model::UniversalConfig;
 
 /// Pack command arguments
 #[derive(Args, Debug)]
@@ -245,11 +245,37 @@ struct TrainingStats {
     learning_rate: Option<f64>,
 }
 
+/// Mamba (SSM) layer count: every layer under a pure-SSM config, the
+/// `hybrid_layers.ssm_layers` count under a hybrid one, 0 for dense attention.
+fn mamba_layer_count(config: &UniversalConfig) -> usize {
+    if let Some(hybrid) = &config.hybrid_layers {
+        hybrid.ssm_layers.len()
+    } else if config.ssm.is_some() {
+        config.num_layers
+    } else {
+        0
+    }
+}
+
+/// True when the SSM config's variant is Mamba3, not Mamba2/Mamba1.
+fn is_mamba3(config: &UniversalConfig) -> bool {
+    config.ssm.as_ref().is_some_and(|s| s.variant == "mamba3")
+}
+
+/// True for MLA (Multi-Head Latent Attention): the attention block compresses
+/// its KV cache into `kv_latent_dim`.
+fn is_mla(config: &UniversalConfig) -> bool {
+    config
+        .attention
+        .as_ref()
+        .is_some_and(|a| a.kv_latent_dim.is_some())
+}
+
 /// Generate model card README.md
 fn generate_model_card(
     model_name: &str,
     username: &str,
-    config: &BlazrConfig,
+    config: &UniversalConfig,
     _checkpoint: &CheckpointInfo,
     stats: Option<&TrainingStats>,
 ) -> String {
@@ -259,13 +285,13 @@ fn generate_model_card(
 
     // Build tags
     let mut tags = vec!["oxidizr", "llm"];
-    if config.mamba2_num_heads.is_some() {
+    if config.ssm.is_some() {
         tags.push("mamba");
     }
-    if config.kv_latent_dim.is_some() {
+    if is_mla(config) {
         tags.push("mla");
     }
-    if config.num_experts.is_some() {
+    if config.moe.is_some() {
         tags.push("moe");
     }
     let tags_str = tags
@@ -425,10 +451,10 @@ Standard inference tools (llama.cpp, vLLM, Transformers, etc.) do not support th
 }
 
 /// Generate detailed architecture description for README
-fn describe_architecture_details(config: &BlazrConfig) -> String {
+fn describe_architecture_details(config: &UniversalConfig) -> String {
     let mut lines = Vec::new();
 
-    let mamba_count = config.mamba_layers.len();
+    let mamba_count = mamba_layer_count(config);
     let attn_count = config.num_layers.saturating_sub(mamba_count);
 
     // Determine if hybrid or pure architecture
@@ -441,8 +467,8 @@ fn describe_architecture_details(config: &BlazrConfig) -> String {
     }
 
     // Mamba layers
-    if mamba_count > 0 && config.mamba2_num_heads.is_some() {
-        let mamba_type = if config.mamba3_enabled.unwrap_or(false) {
+    if mamba_count > 0 {
+        let mamba_type = if is_mamba3(config) {
             "Mamba3"
         } else {
             "Mamba2"
@@ -455,7 +481,7 @@ fn describe_architecture_details(config: &BlazrConfig) -> String {
 
     // Attention layers
     if attn_count > 0 {
-        if config.kv_latent_dim.is_some() {
+        if is_mla(config) {
             lines.push(format!(
                 "- **{} MLA (Multi-Head Latent Attention) layers** - Compressed KV cache attention",
                 attn_count
@@ -469,16 +495,15 @@ fn describe_architecture_details(config: &BlazrConfig) -> String {
     }
 
     // MoE
-    if let Some(num_experts) = config.num_experts {
-        let experts_per_tok = config.experts_per_tok.unwrap_or(2);
-        let shared = if config.shared_expert_enabled.unwrap_or(false) {
+    if let Some(moe) = &config.moe {
+        let shared = if moe.has_shared_expert() {
             " + shared expert"
         } else {
             ""
         };
         lines.push(format!(
             "- **MoE (Mixture of Experts)** - {} experts{}, top-{} routing",
-            num_experts, shared, experts_per_tok
+            moe.num_experts, shared, moe.experts_per_tok
         ));
     }
 
@@ -486,13 +511,13 @@ fn describe_architecture_details(config: &BlazrConfig) -> String {
 }
 
 /// Describe the model architecture
-fn describe_architecture(config: &BlazrConfig) -> String {
+fn describe_architecture(config: &UniversalConfig) -> String {
     let mut parts = Vec::new();
 
     // Mamba layers
-    let mamba_count = config.mamba_layers.len();
-    if mamba_count > 0 && config.mamba2_num_heads.is_some() {
-        if config.mamba3_enabled.unwrap_or(false) {
+    let mamba_count = mamba_layer_count(config);
+    if mamba_count > 0 {
+        if is_mamba3(config) {
             parts.push(format!("{} Mamba3", mamba_count));
         } else {
             parts.push(format!("{} Mamba2", mamba_count));
@@ -502,7 +527,7 @@ fn describe_architecture(config: &BlazrConfig) -> String {
     // Attention layers (saturating_sub prevents underflow)
     let attn_count = config.num_layers.saturating_sub(mamba_count);
     if attn_count > 0 {
-        if config.kv_latent_dim.is_some() {
+        if is_mla(config) {
             parts.push(format!("{} MLA", attn_count));
         } else {
             parts.push(format!("{} Attention", attn_count));
@@ -510,8 +535,9 @@ fn describe_architecture(config: &BlazrConfig) -> String {
     }
 
     // MoE
-    if let Some(num_experts) = config.num_experts {
-        let experts_per_tok = config.experts_per_tok.unwrap_or(2);
+    if let Some(moe) = &config.moe {
+        let num_experts = moe.num_experts;
+        let experts_per_tok = moe.experts_per_tok;
         parts.push(format!(
             "MoE ({} experts, top-{})",
             num_experts, experts_per_tok
@@ -525,8 +551,8 @@ fn describe_architecture(config: &BlazrConfig) -> String {
     }
 }
 
-/// Estimate parameters from BlazrConfig
-fn estimate_params_from_config(config: &BlazrConfig) -> String {
+/// Estimate parameters from UniversalConfig
+fn estimate_params_from_config(config: &UniversalConfig) -> String {
     // Rough estimation based on config
     let embed_params = config.vocab_size * config.hidden_size;
     let intermediate = config.intermediate_size.unwrap_or(config.hidden_size * 4);
@@ -594,7 +620,7 @@ pub fn run_pack(args: PackArgs) -> Result<()> {
     }
 
     let config_content = fs::read_to_string(&config_path)?;
-    let config: BlazrConfig =
+    let config: UniversalConfig =
         serde_json::from_str(&config_content).context("Failed to parse config.json")?;
 
     // Determine model name
