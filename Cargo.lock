@@ -189,20 +189,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boostr-audio"
-version = "0.1.0"
-dependencies = [
- "boostr",
- "numr",
- "serde",
- "serde_json",
- "splintr",
- "symphonia",
- "thiserror 2.0.17",
- "tracing",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1503,7 +1489,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "boostr",
- "boostr-audio",
  "chrono",
  "clap",
  "dialoguer",
@@ -1518,6 +1503,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "voxr",
 ]
 
 [[package]]
@@ -1841,8 +1827,6 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 [[package]]
 name = "regexr"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a10e63d4a65161fc4e8a0bf34c9b65aaee6a325fd6cf44a624204d18276c6551"
 dependencies = [
  "aho-corasick",
  "dynasm",
@@ -2860,6 +2844,20 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "voxr"
+version = "0.1.0"
+dependencies = [
+ "boostr",
+ "numr",
+ "serde",
+ "serde_json",
+ "splintr",
+ "symphonia",
+ "thiserror 2.0.17",
+ "tracing",
+]
 
 [[package]]
 name = "want"

@@ -42,8 +42,8 @@ use boostr::model::audio::SileroVad;
 use boostr::model::SpeechLayout;
 use boostr::runtime::Runtime;
 use boostr::{DType, MatmulOps, TypeConversionOps};
-use boostr_audio::enhance::EnhanceOptions;
-use boostr_audio::{
+use voxr::enhance::EnhanceOptions;
+use voxr::{
     check_max_speech_duration, decode_audio_file_mono_at, CorpusOptions, SpeechCorpusBuilder,
     TextTokenizer, Utterance, VadSegmentOptions, WhisperBundle, MAX_UTTERANCE_SECS,
     PRETRAINED_TOKENIZER_NAMES,

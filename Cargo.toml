@@ -39,7 +39,7 @@ nccl = ["cuda", "boostr/nccl"]
 huggingface = ["dep:hf-hub"]
 
 # Speech corpus preparation: the `prep-corpus` command, which needs
-# boostr-audio's corpus pipeline and the boostr models behind it (VAD,
+# voxr's corpus pipeline and the boostr models behind it (VAD,
 # Whisper, NeuCodec). Off by default — a text-only training build has no use
 # for four codec decoders and the audio pipelines. The boostr model gates are
 # listed too because the command imports those types from boostr directly.
@@ -48,8 +48,8 @@ huggingface = ["dep:hf-hub"]
 # has to read `foo.layout.json` to refuse a speech corpus packed under a
 # different layout, and that code is pure JSON with no audio dependency.
 audio = [
-  "dep:boostr-audio",
-  "boostr-audio/corpus",
+  "dep:voxr",
+  "voxr/corpus",
   "boostr/whisper",
   "boostr/silero-vad",
   "boostr/neucodec",
@@ -85,7 +85,7 @@ vocabs = ["boostr/vocabs"]
 # Also re-exports cubecl_cuda::CudaRuntime when cuda feature is enabled
 boostr = { path = "../boostr" }
 # Sample-level audio: decode, enhancement, and the speech-corpus builder.
-boostr-audio = { path = "../boostr/crates/boostr-audio", optional = true }
+voxr = { version = "0.1", optional = true }
 
 # Data & Config
 serde = { version = "1.0", features = ["derive"] }
