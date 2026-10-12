@@ -1,591 +1,305 @@
-# Oxidizr
+<div align="center">
 
-A Rust-based LLM training framework built on [Candle](https://github.com/huggingface/candle). Oxidizr is a flexible trainer - bring your own config and dataset, and start training.
+# oxidizr
 
-[Full Documentation](docs/README.md) | [Architecture Guide](docs/architecture/overview.md) | [CLI Reference](docs/cli.md)
+<h3>LLM training from a YAML config, in Rust.</h3>
+
+<p>
+Trains GPT-style language models from a YAML config and a tokenized dataset.
+Supports dense GQA transformers, Mamba1, Mamba2, Mamba3, MLA, and MoE layers
+on CPU or CUDA, built on <a href="https://github.com/ml-rust/boostr">boostr</a>.
+</p>
+
+<p>
+  <a href="https://docs.rs/oxidizr"><strong>Docs</strong></a>
+  ·
+  <a href="https://crates.io/crates/oxidizr"><strong>Crate</strong></a>
+  ·
+  <a href="#bring-your-own-config-and-data"><strong>Config</strong></a>
+  ·
+  <a href="#cli-reference"><strong>CLI</strong></a>
+  ·
+  <a href="#quick-start"><strong>Example</strong></a>
+  ·
+  <a href="CONTRIBUTING.md"><strong>Contributing</strong></a>
+</p>
+
+<p>
+  <a href="https://discord.gg/jBhFk9kHPg">
+    <img src="https://img.shields.io/discord/1453357769720594543?label=Discord&logo=discord&logoColor=white&color=5865F2" alt="Join the Discord">
+  </a>
+</p>
+
+<p>
+  <a href="https://crates.io/crates/oxidizr">
+    <img src="https://img.shields.io/crates/v/oxidizr" alt="crates.io">
+  </a>
+  <a href="https://docs.rs/oxidizr">
+    <img src="https://img.shields.io/docsrs/oxidizr" alt="docs.rs">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/crates/l/oxidizr" alt="License">
+  </a>
+  <a href="https://github.com/ml-rust/oxidizr/stargazers">
+    <img src="https://img.shields.io/github/stars/ml-rust/oxidizr?style=social" alt="GitHub stars">
+  </a>
+</p>
+
+</div>
+
+## What is oxidizr
+
+oxidizr trains a language model from two inputs:
+
+1. **A YAML config** that defines the architecture, optimizer, and training schedule.
+2. **A tokenized dataset** stored as a binary file of `u32` tokens.
+
+oxidizr runs the training loop, optimizer, checkpointing, and metrics. It writes
+checkpoints as `.safetensors` files and packages them for distribution.
+
+| Layer | Config keys | Notes |
+|-------|-------------|-------|
+| Dense GQA transformer | `kv_heads`, with `kv_latent_dim` unset | Grouped-query attention with RoPE and RMSNorm |
+| MLA (Multi-Head Latent Attention) | `kv_latent_dim`, `q_latent_dim`, `d_rope` | Compressed KV cache |
+| Mamba1 | `mamba_layers`, with `mamba2_num_heads` unset | Selective state-space layers |
+| Mamba2 | `mamba_layers`, `mamba2_*` | State Space Duality (SSD) |
+| Mamba3 | `mamba3_enabled: true`, `mamba2_*` | Trapezoidal discretization. Optional `mamba3_complex_rope`, `mamba3_mimo_rank` |
+| MoE (Mixture of Experts) | `num_experts`, `experts_per_tok`, `shared_expert_enabled` | Top-k routing with a load-balance loss |
+
+Layers mix within one model. `mamba_layers` lists the SSM layer indices, and every other layer uses attention.
+
+Mamba2 and Mamba3 require `hidden_size * mamba2_expand == mamba2_num_heads * mamba2_head_dim`. For example, `384 * 2 == 48 * 16`.
 
 ## Installation
 
-**Recommended: Install from Git** (supports CUDA 12.x and 13.x):
+oxidizr depends on `boostr` through the path `../boostr`. Clone both repositories into the same parent directory:
 
 ```bash
-# CPU-only
-cargo install --git https://github.com/ml-rust/oxidizr
-
-# With CUDA support
-cargo install --git https://github.com/ml-rust/oxidizr --features cuda
-
-# With CUDA + HuggingFace model publishing
-cargo install --git https://github.com/ml-rust/oxidizr --features cuda,huggingface
+git clone https://github.com/ml-rust/boostr
+git clone https://github.com/ml-rust/oxidizr
+cd oxidizr
+cargo build --release
 ```
 
-**From crates.io** (CUDA 12.x only):
-
-```bash
-cargo install oxidizr
-cargo install oxidizr --features cuda
-cargo install oxidizr --features cuda,huggingface
-```
-
-> **Note:** The crates.io version only supports CUDA 12.x. For CUDA 13.x support, install from Git.
+Add `--features cuda` to the build for GPU support. The CUDA build uses the toolkit installed on the system.
 
 ## Quick Start
 
+Build the project, download the educational dataset, and start training:
+
 ```bash
-# Clone and build
+git clone https://github.com/ml-rust/boostr
 git clone https://github.com/ml-rust/oxidizr
 cd oxidizr
 cargo build --release
 
-# Download nano-start dataset
 pip install huggingface_hub
 hf download fs90/nano-start-data-bin --local-dir data/nano-start/tokenized --repo-type dataset
 
-# Train!
-cargo run --release -- train -f models/nano-start.yaml -d data/nano-start/tokenized/combined.bin
+cargo run --release -- train -f models/nano-start/nano-start.yaml -d data/nano-start/tokenized/combined.bin
 ```
 
-That's it! Training works on CPU out of the box - no GPU required.
+The default build trains on CPU. Checkpoints for this config go to `./checkpoints/nano-start`.
 
-**For faster training with GPU:**
+To train on a GPU, build and run with `--features cuda`:
 
 ```bash
-cargo build --release --features cuda
-cargo run --release --features cuda -- train -f models/nano-start.yaml -d data/nano-start/tokenized/combined.bin
+cargo run --release --features cuda -- train -f models/nano-start/nano-start.yaml -d data/nano-start/tokenized/combined.bin
 ```
 
-GPU training is significantly faster but completely optional. CPU training is fully functional, just slower.
-
-**After training, package and share your model:**
-
-```bash
-# Package the trained model
-cargo run --release -- pack
-
-# Push to HuggingFace (requires --features huggingface)
-cargo run --release --features huggingface -- push
-```
-
-## What is Oxidizr?
-
-Oxidizr is a **production-grade LLM trainer** written in Rust. You provide:
-
-1. **A config file** - Model architecture, hyperparameters, training settings
-2. **A dataset** - Tokenized data (binary format or in-memory)
-
-Oxidizr handles the training loop, optimization, checkpointing, and logging.
-
-### Why Oxidizr?
-
-- **Production-grade** - Train real models, not just toys. Modern architectures (Mamba, MLA, MoE) ready to use.
-- **No GPU required** - Full training support on CPU. Great for learning, prototyping, or when GPU isn't available.
-- **Researchers & Students** - Transparent codebase, easy to understand and modify. Perfect for experiments.
-- **Fast iteration** - Rust performance without Python overhead. Quick feedback loops.
-- **Portable** - Single binary, no complex dependencies. Works anywhere Rust compiles.
-
-### Sample Configs Included
-
-We include several example configs in `models/` to help you get started:
-
-- `nano-start.yaml` - Educational config for beginners (cl100k_base vocab)
-- `nano.yaml` - Hybrid Mamba2 + MLA + MoE (~60M params)
-- `nano_mamba3.yaml` - Pure Mamba3 architecture
-- `nano_mamba3_hybrid.yaml` - Hybrid Mamba3 + MLA + MoE
-
-These are **educational examples** showing you how to configure oxidizr. Feel free to create your own configs for your specific use case.
+After training, package the model. See [Model Distribution](#model-distribution).
 
 ## Bring Your Own Config and Data
 
-### Creating Your Config
+### Write a Config
 
-Create a YAML file with your model architecture and training settings:
+A config has two top-level keys: `model` and `trainer`. This dense GQA example is a complete starting point:
 
 ```yaml
-# my_model.yaml
+# my-model.yaml
 model:
+  name: my-model
   hidden_size: 512
   num_layers: 8
   num_heads: 8
-  kv_heads: 4
-  vocab_size: 128354 # Llama 3 + splintr agent tokens
+  kv_heads: 4              # Fewer KV heads than query heads (GQA)
+  intermediate_size: 2048
+  vocab_size: 100315
+  tokenizer_vocab: cl100k_base   # Must match the tokenizer that produced the data
   max_seq_len: 512
   rope_theta: 10000.0
-  intermediate_size: 2048
 
 trainer:
+  target_device: gpu
   learning_rate: 0.0003
   batch_size: 2
+  gradient_accumulation: 1
   max_steps: 5000
   num_epochs: 2
-  gradient_accumulation: 1
-  checkpoint_dir: "./checkpoints"
+  checkpoint_dir: "./checkpoints/my-model"
   log_interval: 10
   save_interval: 500
+  max_checkpoints: 3
+  load_balance_alpha: 0.0  # MoE auxiliary loss weight. Required. 0.0 disables it.
 ```
 
 Run it:
 
 ```bash
-cargo run --release --features cuda -- train -f my_model.yaml
+cargo run --release -- train -f my-model.yaml -d data/my-dataset.bin
 ```
 
-### Preparing Your Data
+`tokenizer_vocab` is required. Set it to `cl100k_base`, `o200k_base`, `llama3`, `deepseek_v3`, or `custom`.
 
-Oxidizr accepts tokenized data in binary format (u32 tokens):
+Key `trainer` fields:
 
-**Option 1: Use the educational dataset**
+| Field | Purpose |
+|-------|---------|
+| `learning_rate`, `batch_size`, `gradient_accumulation` | Optimizer step size and batch shape |
+| `max_steps`, `num_epochs` | Training length |
+| `checkpoint_dir`, `save_interval`, `max_checkpoints` | Checkpoint location, frequency, and retention (`0` keeps all) |
+| `log_interval` | Steps between metric updates |
+| `target_device` | `gpu` or `cpu`. The CLI `--target-device` overrides it |
+| `load_balance_alpha` | MoE load-balance loss weight |
 
-The `data/nano-start/` directory contains a curated educational dataset designed to help you understand LLM training fundamentals. See the `data/` directory for details.
+The full key reference is in [docs/configuration.md](docs/configuration.md).
 
-**Option 2: Bring your own tokenized data**
+### Sample Configs
 
-Create a binary file containing raw u32 tokens:
+Start from a file in `models/`. [models/README.md](models/README.md) describes each one. `models/nano-start/nano-start.yaml` is the educational hybrid model (Mamba2 + MLA + MoE).
+
+### Prepare the Data
+
+oxidizr memory-maps a binary file of native-endian `u32` tokens. The tokenizer must match `model.tokenizer_vocab`.
+
+This Python snippet uses [splintr](https://github.com/ml-rust/splintr) to write a token file:
 
 ```python
-# Using splintr tokenizer (recommended)
 from splintr import Tokenizer
+import numpy as np
 
 tokenizer = Tokenizer("llama3")
 tokens = tokenizer.encode("Your training text here...")
-
-# Save as binary u32 array
-import numpy as np
-np.array(tokens, dtype=np.uint32).tofile("data/my_dataset.bin")
+np.array(tokens, dtype=np.uint32).tofile("data/my-dataset.bin")
 ```
 
-Then point your config to the data file, or load it programmatically in your training script.
+Pass the file with `-d`. Without `-d`, `train` generates 1,000,000 random tokens for a smoke test.
 
-**Option 3: Generate dummy data for testing**
-
-For quick testing, oxidizr can generate random tokens:
-
-```rust
-use oxidizr::data::{LitDataLoader, create_dummy_data};
-
-let tokens = create_dummy_data(128354, 100_000);  // vocab_size, num_tokens
-let data_loader = LitDataLoader::new(tokens, batch_size, seq_len, device);
-```
-
-## Supported Architectures
-
-Oxidizr supports multiple architectures:
-
-### Base Architectures
-
-- **GPT/Llama-style Transformer** - RoPE, RMSNorm, Grouped Query Attention (GQA), SwiGLU
-- **Mamba1** - State Space Model with selective mechanism for efficient long-range context
-- **Mamba2** - State Space Duality (SSD) algorithm, faster than Mamba1
-- **Mamba3** - Latest Mamba with trapezoidal discretization, complex-valued RoPE, and MIMO
-
-### Advanced Components
-
-- **MLA (Multi-Head Latent Attention)** - Compressed KV cache for memory efficiency
-- **MoE (Mixture of Experts)** - Fine-grained expert routing with load balancing
-
-### Hybrid Architectures
-
-You can mix and match components. For example, the `nano_mamba2.yaml` config uses:
-
-- 6 Mamba2 layers for efficient sequential processing
-- 2 MLA + MoE layers for cross-sequence attention
-
-Configure hybrid models by specifying which layers use which architecture in your YAML.
+The `oxidizr::data::create_dummy_data(vocab_size, total_tokens)` function returns the same random tokens as a `Vec<u32>`.
 
 ## CLI Reference
-
-Oxidizr uses a subcommand-based CLI:
 
 ```bash
 oxidizr <SUBCOMMAND> [OPTIONS]
 ```
 
-### Subcommands
+| Subcommand | Purpose | Feature |
+|------------|---------|---------|
+| `train` | Train a model. `oxidizr -f <config>` runs `train` without the subcommand | none |
+| `import` | Convert a HuggingFace checkpoint to an oxidizr checkpoint (`-f`, `-m`, `-d`, `-o`) | none |
+| `merge` | Fold LoRA adapters into base weights (`-f`, `-c`, `-o`) | none |
+| `pack` | Package a checkpoint for distribution | none |
+| `push` | Upload a packaged model to the HuggingFace Hub | `huggingface` |
+| `prep-corpus` | Build a packed speech-LM corpus from audio recordings | `audio` |
 
-- `train` - Train a model (default if -f flag is used)
-- `pack` - Package a trained model for distribution
-- `push` - Push a packaged model to HuggingFace Hub (requires `--features huggingface`)
+Common `train` flags:
 
-### Training
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `-f, --config <FILE>` | `models/nano.yaml` | YAML config |
+| `-d, --data <FILE>` | 1,000,000 random tokens | Memory-mapped `u32` token file |
+| `--target-device <gpu\|cpu>` | Config `trainer.target_device` | Device. A build without `cuda` runs on CPU |
+| `--batch-size`, `--seq-len`, `--grad-accum`, `--max-steps` | Config | Override the config value |
+| `--resume <PATH\|auto>` | None | Resume from a `.safetensors` checkpoint, or the latest one |
+| `--gpus <IDS>` | None | Comma-separated GPU IDs, for example `0,1,2,3` |
+| `--sync-backend <single\|cpu\|nccl>` | `single` | Gradient sync for multi-GPU runs |
+| `--prefetch <N>` | `0` | Batches to prefetch on a background thread |
+| `--max-checkpoints <N>` | `10` | Checkpoints to keep. `0` keeps all |
+| `--dtype <f32\|f16\|bf16>` | Config `model.dtype` (`f32`) | Model precision |
+| `--checkpoint-dir <DIR>` | Config `trainer.checkpoint_dir` | Checkpoint directory |
+| `--headless` | Off | Print JSON metrics only. Use in CI, pipes, and non-interactive shells |
 
-```bash
-oxidizr train -f <config.yaml> [OPTIONS]
-
-# Or use the legacy shortcut (backwards compatible):
-oxidizr -f <config.yaml> [OPTIONS]
-
-Options:
-  -f, --config <FILE>           Path to YAML configuration file (required)
-  -d, --data <FILE>             Path to tokenized data file (.bin)
-  --target-device <gpu|cpu>     Override target device (default: gpu if available)
-  --seq-len <N>                 Override sequence length from config
-  --batch-size <N>              Override batch size from config
-  --grad-accum <N>              Override gradient accumulation from config
-  --max-steps <N>               Override max training steps from config
-  --gpus <IDS>                  Comma-separated GPU IDs for multi-GPU (e.g., 0,1,2,3)
-  --sync-backend <cpu|nccl>     Gradient sync backend for multi-GPU (default: cpu)
-  --prefetch <N>                Prefetch N batches in background (default: 0)
-  --resume <PATH|auto>          Resume from checkpoint (.safetensors) or "auto" for latest
-  --headless                    Output JSON metrics only (for non-interactive terminals)
-  --dtype <f32|f16|bf16>        Model precision (default: f32)
-  --max-checkpoints <N>         Maximum checkpoints to keep (default: 10)
-  -h, --help                    Print help information
-```
-
-### Examples
-
-```bash
-# Basic training with default settings
-cargo run --release --features cuda -- train -f models/nano.yaml
-
-# Legacy syntax (backwards compatible)
-cargo run --release --features cuda -- -f models/nano.yaml
-
-# Force CPU execution
-cargo run --release -- train -f models/nano.yaml --target-device cpu
-
-# Override batch size and sequence length
-cargo run --release --features cuda -- train -f models/nano.yaml --batch-size 4 --seq-len 256
-
-# Multi-GPU training (2 GPUs)
-cargo run --release --features cuda -- train -f models/nano.yaml --gpus 0,1 --sync-backend cpu
-
-# Custom config file
-cargo run --release --features cuda -- train -f experiments/my_config.yaml
-```
-
-### Output Modes
-
-**Interactive mode (default):**
-
-- Shows a TUI progress bar with live loss, speed, and ETA
-- Best for interactive terminal sessions
-
-**Headless mode (`--headless`):**
-
-- Outputs JSON metrics to stdout
-- Use when: TUI doesn't render (CI/CD, piped output, non-interactive shells)
-- Use when: You want to parse training metrics programmatically
-
-```bash
-# If progress bar doesn't appear, use headless mode
-cargo run --release -- train -f models/nano.yaml --headless
-```
-
-### CPU vs GPU Training
-
-```bash
-# CPU training (no CUDA required)
-cargo build --release
-cargo run --release -- train -f models/nano.yaml --target-device cpu
-
-# GPU training (faster, requires CUDA)
-cargo build --release --features cuda
-cargo run --release --features cuda -- train -f models/nano.yaml --target-device gpu
-```
-
-CPU training is fully functional - just slower. Great for:
-
-- Learning and experimentation
-- Systems without GPU
-- Debugging and development
+Without `--headless`, `train` shows a progress bar. Run `oxidizr <SUBCOMMAND> --help` for every flag. [docs/cli.md](docs/cli.md) documents each subcommand.
 
 ## Model Distribution
 
-After training, you can package and share your models:
-
-### Packaging Models
+Package a checkpoint, then upload it:
 
 ```bash
-# Interactive mode - select checkpoint from TUI
-oxidizr pack
-
-# Non-interactive - specify checkpoint
-oxidizr pack --checkpoint latest
-oxidizr pack --checkpoint final
-oxidizr pack --checkpoint 10000  # specific step
-
-# Custom options
-oxidizr pack \
-  --checkpoint-dir ./checkpoints \
-  --checkpoint final \
-  --name my-model \
-  --username my-hf-username
-```
-
-This creates a packaged model in `hf/<username>/<model>/` with:
-
-- `model.safetensors` - Model weights
-- `config.json` - Inference configuration
-- `README.md` - Auto-generated model card
-
-### Publishing to HuggingFace
-
-Requires the `huggingface` feature flag and `huggingface-cli`:
-
-```bash
-# Build with HuggingFace support
+oxidizr pack --checkpoint latest      # Or: final, or a step number. Omit to pick interactively
 cargo build --release --features huggingface
-
-# Install HuggingFace CLI
 pip install huggingface_hub
-
-# Interactive mode - select model from list
-oxidizr push
-
-# Non-interactive - specify model
-oxidizr push --model hf/username/model-name
-
-# Create private repository
-oxidizr push --model hf/username/model-name --private
+oxidizr push --model hf/<username>/<model-name>
 ```
 
-**Configuration**: Create a `.env` file (see `.env.example`):
+`pack` writes `model.safetensors`, `config.json`, and a generated `README.md` to `hf/<username>/<model>/`. It also copies `training_config.json` when the checkpoint has a `run.json`.
+
+`push` runs the `hf` CLI, so `hf` must be on `PATH`. It accepts `--private`, `-t, --token`, and `-y, --yes`.
+
+Put these values in a `.env` file, copied from `.env.example`:
 
 ```env
 HF_USERNAME=your-username
 HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-Get your token from [HuggingFace settings](https://huggingface.co/settings/tokens).
-
-See [hf/README.md](hf/README.md) for detailed documentation.
+Get a token from the [HuggingFace token page](https://huggingface.co/settings/tokens). See [hf/README.md](hf/README.md) and [docs/cli.md](docs/cli.md) for the full flag list.
 
 ## Multi-GPU Training
 
-Oxidizr supports data-parallel training across multiple GPUs:
+Build with `cuda` and pass the GPU IDs:
 
 ```bash
-# Train on GPUs 0, 1, 2, 3 with CPU backend
+# Four GPUs, CPU-staged gradient sync
 cargo run --release --features cuda -- train -f models/nano.yaml --gpus 0,1,2,3 --sync-backend cpu
 
-# Train with NCCL backend (faster for 4+ GPUs, requires nccl feature)
+# Two GPUs, NCCL sync
 cargo run --release --features cuda,nccl -- train -f models/nano.yaml --gpus 0,1 --sync-backend nccl
 ```
 
-**How it works:**
+Each GPU runs forward and backward on its own data shard. oxidizr synchronizes the gradients before the optimizer step.
 
-1. Dataset is sharded across GPUs
-2. Each GPU runs forward/backward pass on its shard
-3. Gradients are synchronized (all-reduced) across all GPUs
-4. Averaged gradients are applied by the optimizer
+The `nccl` feature requires the NCCL library installed on the system.
 
-**Effective batch size** = `batch_size × gradient_accumulation × num_gpus`
+## Features
 
-## Configuration Guide
+| Feature | Default | Enables |
+|---------|---------|---------|
+| `f16` | On | F16 and BF16 dtypes |
+| `cuda` | Off | CUDA backend (boostr CubeCL) |
+| `nccl` | Off | NCCL sync backend. Implies `cuda` |
+| `huggingface` | Off | `push` command |
+| `audio` | Off | `prep-corpus` command, with the voxr corpus pipeline and the Whisper, NeuCodec, and Silero VAD models |
+| `vocab-<name>` | Off | Bundled tokenizer vocabulary for `prep-corpus --tokenizer <name>` |
+| `vocabs` | Off | Every bundled vocabulary |
 
-### Basic Config Structure
+Bundled vocabulary names: `cl100k`, `o200k`, `gpt-oss`, `phi4`, `olmo2`, `llama3`, `llama2`, `deepseek`, `qwen`, `glm`, `gemma2`, `gemma3`, `gemma4`, `kimi`, `mistral`, `modernbert`.
 
-```yaml
-model:
-  # Architecture parameters
-  hidden_size: 512
-  num_layers: 8
-  num_heads: 8
-  kv_heads: 4 # For GQA (fewer KV heads than Q heads)
-  vocab_size: 128354 # Llama 3 + splintr agent tokens
-  max_seq_len: 512
-  rope_theta: 10000.0
-  intermediate_size: 2048
-
-trainer:
-  # Training hyperparameters
-  learning_rate: 0.0003
-  batch_size: 2
-  max_steps: 5000
-  num_epochs: 2
-  gradient_accumulation: 1
-  checkpoint_dir: "./checkpoints"
-  log_interval: 10
-  save_interval: 500
-  load_balance_alpha: 0.0 # MoE load balancing (0.0 = disabled)
-```
-
-### Enabling Mamba2
-
-Add these fields to use Mamba2 instead of standard attention:
-
-```yaml
-model:
-  # ... other fields ...
-
-  mamba2_num_heads: 48
-  mamba2_head_dim: 16
-  mamba2_state_size: 64
-  mamba2_chunk_size: 64
-  mamba2_n_groups: 1
-  mamba2_conv_kernel: 4
-  mamba2_expand: 2
-
-  # CONSTRAINT: hidden_size * mamba2_expand == mamba2_num_heads * mamba2_head_dim
-  # Example: 384 * 2 = 768 == 48 * 16 ✓
-```
-
-### Enabling Mamba3
-
-Mamba3 extends Mamba2 with three innovations:
-
-```yaml
-model:
-  # ... Mamba2 base params (same as above) ...
-
-  # Mamba3 features
-  mamba3_enabled: true
-  mamba3_complex_rope: true # Complex-valued RoPE for state tracking
-  mamba3_mimo_rank: 0 # 0 = SISO, 4 = MIMO mode
-  mamba3_use_conv: false # false = trapezoidal discretization
-```
-
-### Enabling MLA (Multi-Head Latent Attention)
-
-For compressed KV cache and memory efficiency:
-
-```yaml
-model:
-  # ... other fields ...
-
-  kv_latent_dim: 192 # Compressed KV dimension (instead of hidden_size)
-  q_latent_dim: 192 # Compressed query dimension
-  d_rope: 16 # RoPE dimension
-```
-
-### Enabling MoE (Mixture of Experts)
-
-```yaml
-model:
-  # ... other fields ...
-
-  num_experts: 4 # Total number of experts
-  experts_per_tok: 2 # Top-K routing (use 2 to prevent expert collapse)
-  shared_expert_enabled: true
-  intermediate_size: 1536
-
-trainer:
-  load_balance_alpha: 0.01 # MoE load balancing loss weight (required > 0 for MoE)
-```
-
-### Hybrid Architectures
-
-Specify which layers use Mamba vs Attention:
-
-```yaml
-model:
-  # ... other fields ...
-
-  mamba_layers: [0, 1, 2, 4, 5, 6] # These layers use Mamba
-  # Other layers use MLA + MoE
-```
-
-## Project Structure
-
-```
-oxidizr/
-├── src/
-│   ├── main.rs          # CLI entry point
-│   ├── config.rs        # Configuration loading
-│   ├── model.rs         # Transformer model
-│   ├── mamba.rs         # Mamba1 implementation
-│   ├── mamba2.rs        # Mamba2 with SSD
-│   ├── mamba3.rs        # Mamba3 with trapezoidal/RoPE/MIMO
-│   ├── data.rs          # Data loader
-│   └── trainer.rs       # Training loop
-├── models/
-│   ├── nano-start.yaml  # Educational config
-│   ├── nano.yaml        # Hybrid Mamba2 + MLA + MoE
-│   ├── nano_mamba3.yaml # Pure Mamba3
-│   └── ...              # More examples
-├── data/
-│   └── nano-start/      # Educational dataset for learning
-└── Cargo.toml
-```
-
-## System Requirements
-
-### Hardware
-
-- **CPU**: Full training support on CPU - no GPU required. Training will be slower but works completely.
-- **GPU**: Recommended for faster training. CUDA 12.x supported (requires `--features cuda`)
-- **Memory**: Depends on your model size and batch size
-
-### Software
-
-- Rust 1.70+ ([install via rustup](https://rustup.rs/))
-- CUDA Toolkit 12.x (optional, for GPU acceleration)
-
-## Nano Educational Project
-
-The included `nano` configs are part of an educational initiative to help users learn LLM training fundamentals. The philosophy:
-
-- **Zero magic** - Full visibility into the training process
-- **Clear examples** - Well-documented configs showing best practices
-- **Starting point** - Use as a template for your own experiments
-
-The `data/nano-start/` directory contains a curated dataset designed for learning. It's small enough to train quickly while demonstrating key concepts.
-
-**This is guidance, not a requirement.** Oxidizr is a general-purpose trainer. The nano examples exist to help you get started - you're free to create any architecture and use any dataset you want.
-
-## Tips and Best Practices
-
-### Memory Management
-
-- Start with small batch size and sequence length, then scale up
-- Use gradient accumulation to simulate larger batches without OOM
-- Monitor VRAM usage (oxidizr estimates memory requirements before training)
-
-### Effective Batch Size
-
-```
-effective_batch = batch_size × gradient_accumulation × num_gpus
-```
-
-Example: `batch_size=2`, `gradient_accumulation=4`, `num_gpus=2` → effective batch of 16
-
-### Data Prefetching
-
-Enable async data loading to overlap CPU I/O with GPU compute:
-
-```bash
-cargo run --release --features cuda -- train -f models/nano.yaml --prefetch 2
-```
+Example: `cargo build --release --features cuda,huggingface`.
 
 ## Development
 
-```bash
-# Run tests
-cargo test
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, and lint commands, and the project layout.
 
-# Build documentation
-cargo doc --open
-
-# Lint
-cargo clippy
-
-# Format
-cargo fmt
-```
-
-## License
-
-MIT License - See LICENSE file for details
-
-## Acknowledgments
-
-- Built on [Candle](https://github.com/huggingface/candle) by HuggingFace
-- Architecture inspired by Llama 2/3, Mamba, and DeepSeek
-- Designed for transparency and ease of use
-
----
-
-**Status**: Beta | **Version**: 0.1.0 | **Last Updated**: 2025-12-05
+Documentation: [docs/README.md](docs/README.md) indexes the guides. [docs/configuration.md](docs/configuration.md) is the config reference. [docs/cli.md](docs/cli.md) is the CLI reference. [docs/architecture/overview.md](docs/architecture/overview.md) describes the design.
 
 ## Citation
 
-If you use Splintr in your research, please cite:
-
 ```bibtex
-@software{splintr,
+@software{oxidizr,
   author = {Farhan Syah},
-  title = {Oxidzr: A Rust-based LLM training framework},
+  title = {oxidizr: A Rust-based LLM training framework},
   year = {2025},
   url = {https://github.com/ml-rust/oxidizr}
 }
 ```
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and checks.
+
+Questions and design discussion happen on [Discord](https://discord.gg/jBhFk9kHPg).
+
+## License
+
+Licensed under Apache-2.0. See [LICENSE](LICENSE).
