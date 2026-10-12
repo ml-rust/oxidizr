@@ -386,6 +386,7 @@ fn to_moe(cfg: &OxidizrModelConfig) -> Result<Option<MoeConfig>> {
         // copied as literals so they cannot drift from boostr either.
         load_balance_alpha: default_load_balance_alpha(),
         z_loss_alpha: default_z_loss_alpha(),
+        norm_topk_prob: None,
     }))
 }
 
@@ -449,6 +450,7 @@ impl OxidizrModelConfig {
             gdn: None,
             qwen35_attention: None,
             hadamard: None,
+            block: Default::default(),
             quant_formats: Vec::new(),
         };
 

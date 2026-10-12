@@ -964,6 +964,8 @@ where
             // trait, not a trainer one.
             skip_rope: false,
             sliding_window: self.sliding_window,
+            softcap: None,
+            alibi_scale: 1.0,
             // Ignored by `attention_core_flash`; stated for honesty.
             kernel: boostr::model::AttentionKernel::Flash,
         };
@@ -5317,6 +5319,7 @@ mod attention_extras_reach_dense_attention_tests {
             gdn: None,
             qwen35_attention: None,
             hadamard: None,
+            block: Default::default(),
             quant_formats: Vec::new(),
         }
     }
@@ -5558,6 +5561,7 @@ mod head_dim_tests {
             gdn: None,
             qwen35_attention: None,
             hadamard: None,
+            block: Default::default(),
             quant_formats: Vec::new(),
         }
     }
