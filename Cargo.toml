@@ -83,9 +83,9 @@ vocabs = ["boostr/vocabs"]
 # boostr: Complete ML framework replacing Candle
 # Provides: Tensor, Device, DType, Linear, Embedding, VarBuilder, etc.
 # Also re-exports cubecl_cuda::CudaRuntime when cuda feature is enabled
-boostr = { path = "../boostr" }
+boostr = { path = "../boostr", version = "0.9" }
 # Sample-level audio: decode, enhancement, and the speech-corpus builder.
-voxr = { version = "0.1", optional = true }
+voxr = { version = "0.7", optional = true }
 
 # Data & Config
 serde = { version = "1.0", features = ["derive"] }
