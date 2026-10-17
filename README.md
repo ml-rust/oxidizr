@@ -210,7 +210,7 @@ Common `train` flags:
 | `-d, --data <FILE>` | 1,000,000 random tokens | Memory-mapped `u32` token file |
 | `--target-device <gpu\|cpu>` | Config `trainer.target_device` | Device. A build without `cuda` runs on CPU |
 | `--batch-size`, `--seq-len`, `--grad-accum`, `--max-steps` | Config | Override the config value |
-| `--resume <PATH\|auto>` | None | Resume from a `.safetensors` checkpoint, or the latest one |
+| `--resume <PATH\|auto>` | None | Resume from a `.safetensors` checkpoint, or the latest one. Restores weights, optimizer state and data position |
 | `--gpus <IDS>` | None | Comma-separated GPU IDs, for example `0,1,2,3` |
 | `--sync-backend <single\|cpu\|nccl>` | `single` | Gradient sync for multi-GPU runs |
 | `--prefetch <N>` | `0` | Batches to prefetch on a background thread |

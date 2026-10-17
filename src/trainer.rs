@@ -1,10 +1,12 @@
 use crate::checkpoint_config::{checkpoint_config_exists, write_checkpoint_config};
-use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
-use crate::config::{CheckpointMeta, OxidizrModelConfig, TrainerConfig};
-use crate::data::{DataLoader, DataPosition, RowLayout};
-use crate::distributed::{
-    create_synchronizer, AdamWConfig as DistAdamWConfig, DistributedAdamW, GradientSynchronizer,
+use crate::checkpoint_set::{
+    apply_optimizer_resume, remove_old_checkpoints, write_checkpoint_set, CheckpointLabel,
+    CheckpointSave, NameMaps, OptimizerResume,
 };
+use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
+use crate::config::{OxidizrModelConfig, TrainerConfig};
+use crate::data::{DataLoader, DataPosition, RowLayout};
+use crate::distributed::{create_synchronizer, GradientSynchronizer};
 use crate::prelude::{
     cross_entropy, cross_entropy_masked, DType, Error, FusedAdamW, Result, Tensor,
 };
@@ -47,9 +49,11 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     params: &'a mut HashMap<TensorId, Tensor<R>>,
     parameter_ids: Vec<TensorId>,
     parameter_names: Vec<(String, TensorId)>,
+    /// Checkpoint names of the trainable parameters, for optimizer state files.
+    name_maps: NameMaps,
     optimizer: FusedAdamW<R>,
     client: R::Client,
-    #[allow(dead_code)] // Kept for potential future use (e.g., device-specific optimizations)
+    /// Training device. Loaded optimizer state goes here.
     device: R::Device,
     global_step: usize,
     // Training metrics
@@ -71,7 +75,6 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     data_file_path: Option<String>,
     // Distributed training support
     synchronizer: Option<Box<dyn GradientSynchronizer<R>>>,
-    distributed_optimizer: Option<DistributedAdamW<R>>,
     // Learning rate warmup (critical for Mamba SSM parameter alignment)
     warmup_steps: usize,     // Effective warmup steps (0 = disabled)
     base_learning_rate: f64, // Base LR to warmup towards
@@ -137,15 +140,14 @@ where
         // Whole batches of `num_epochs` epochs, `gradient_accumulation` per step.
         let total_steps = row_layout.total_steps(config.gradient_accumulation, config.num_epochs);
 
-        // Initialize distributed training components if enabled
-        let (synchronizer, distributed_optimizer) = if config.distributed.enabled {
-            let sync = create_synchronizer(&config.distributed)?;
-            let dist_opt =
-                DistributedAdamW::new(params, DistAdamWConfig::with_lr(config.learning_rate))?;
-            (Some(sync), Some(dist_opt))
+        // A distributed run adds a gradient synchronizer. It steps the same
+        // optimizer as a single-device run.
+        let synchronizer = if config.distributed.enabled {
+            Some(create_synchronizer(&config.distributed)?)
         } else {
-            (None, None)
+            None
         };
+        let name_maps = NameMaps::new(&parameter_names, &parameter_ids)?;
 
         // Calculate effective warmup steps (explicit steps OR ratio * total_steps)
         // Priority: warmup_steps > warmup_ratio > disabled (0)
@@ -175,6 +177,7 @@ where
             params,
             parameter_ids,
             parameter_names,
+            name_maps,
             optimizer,
             client,
             device,
@@ -190,7 +193,6 @@ where
             model_config,
             data_file_path,
             synchronizer,
-            distributed_optimizer,
             warmup_steps,
             base_learning_rate,
             effective_total_steps,
@@ -624,97 +626,83 @@ where
             }
         }
 
-        // Apply gradients - either single-GPU or distributed path
-        if let (Some(ref sync), Some(ref mut dist_opt)) =
-            (&self.synchronizer, &mut self.distributed_optimizer)
-        {
-            // DISTRIBUTED PATH: Synchronize gradients across GPUs.
-            // The distributed module migration must keep gradients keyed by the same TensorIds.
-            let mut synced_grads = sync.synchronize_gradients(&grads, self.params)?;
+        // A distributed run averages gradients across ranks first. Both paths then
+        // clip, skip a non-finite step, and step the one optimizer, so the LR
+        // schedule and the saved optimizer state are the same in both.
+        let mut grads = match &self.synchronizer {
+            Some(sync) => sync.synchronize_gradients(&grads, self.params)?,
+            None => grads,
+        };
 
-            let grad_norm = crate::prelude::compute_grad_norm(
-                &self.client,
-                &mut synced_grads,
-                &self.parameter_ids,
-                self.config.max_grad_norm,
-            )?;
+        // 1. Clip by global norm using boostr AdamW's gradient utility.
+        // The function returns the original norm as its value.
+        let grad_norm_start = if profile { Some(Instant::now()) } else { None };
+        let max_grad_norm = self.config.max_grad_norm;
+        let grad_norm = crate::prelude::compute_grad_norm(
+            &self.client,
+            &mut grads,
+            &self.parameter_ids,
+            max_grad_norm,
+        )?;
+        if let Some(start) = grad_norm_start {
+            eprintln!(
+                "[PROFILE] grad_norm_compute: {:.3}ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+
+        // DEBUG: Print raw gradient norm BEFORE any clipping
+        if std::env::var("DEBUG_RAW_GRAD").is_ok() {
+            eprintln!(
+                "[RAW GRAD NORM] step={} raw_grad_norm={:.6}",
+                self.global_step + 1,
+                grad_norm
+            );
+        }
+
+        // DEBUG: Print top gradient contributors when DEBUG_MLA_MOE or DEBUG_GRAD is set
+        if std::env::var("DEBUG_MLA_MOE").is_ok() || std::env::var("DEBUG_GRAD").is_ok() {
+            self.print_gradient_breakdown(&grads);
+        }
+
+        // 2. Skip step if gradient norm is invalid (inf/NaN)
+        if grad_norm.is_infinite() || grad_norm.is_nan() {
+            eprintln!(
+                "[GradClip] Skipping step {} - gradient norm: {}",
+                self.global_step + 1,
+                grad_norm
+            );
+            self.diagnose_bad_gradients(&grads);
             last_grad_norm = grad_norm;
-
-            dist_opt.step(&self.client, self.params, &synced_grads)?;
         } else {
-            // SINGLE-GPU PATH
-            let mut grads = grads;
+            // 3. Optional tighter target norm clipping delegates to the same boostr utility.
+            let effective_after_max = grad_norm.min(max_grad_norm);
+            if let Some(target) = self.config.target_grad_norm {
+                if effective_after_max > target && effective_after_max > 1e-8 {
+                    crate::prelude::compute_grad_norm(
+                        &self.client,
+                        &mut grads,
+                        &self.parameter_ids,
+                        target,
+                    )?;
+                }
+            }
 
-            // 1. Clip by global norm using boostr AdamW's gradient utility.
-            // The function returns the original norm as its value.
-            let grad_norm_start = if profile { Some(Instant::now()) } else { None };
-            let max_grad_norm = self.config.max_grad_norm;
-            let grad_norm = crate::prelude::compute_grad_norm(
-                &self.client,
-                &mut grads,
-                &self.parameter_ids,
-                max_grad_norm,
-            )?;
-            if let Some(start) = grad_norm_start {
+            // 4. Apply gradients via optimizer (LR already set at start of step)
+            let opt_start = if profile { Some(Instant::now()) } else { None };
+            self.optimizer.step(&self.client, self.params, &grads)?;
+            if let Some(start) = opt_start {
                 eprintln!(
-                    "[PROFILE] grad_norm_compute: {:.3}ms",
+                    "[PROFILE] optimizer.step: {:.3}ms",
                     start.elapsed().as_secs_f64() * 1000.0
                 );
             }
 
-            // DEBUG: Print raw gradient norm BEFORE any clipping
-            if std::env::var("DEBUG_RAW_GRAD").is_ok() {
-                eprintln!(
-                    "[RAW GRAD NORM] step={} raw_grad_norm={:.6}",
-                    self.global_step + 1,
-                    grad_norm
-                );
-            }
-
-            // DEBUG: Print top gradient contributors when DEBUG_MLA_MOE or DEBUG_GRAD is set
-            if std::env::var("DEBUG_MLA_MOE").is_ok() || std::env::var("DEBUG_GRAD").is_ok() {
-                self.print_gradient_breakdown(&grads);
-            }
-
-            // 2. Skip step if gradient norm is invalid (inf/NaN)
-            if grad_norm.is_infinite() || grad_norm.is_nan() {
-                eprintln!(
-                    "[GradClip] Skipping step {} - gradient norm: {}",
-                    self.global_step + 1,
-                    grad_norm
-                );
-                self.diagnose_bad_gradients(&grads);
-                last_grad_norm = grad_norm;
+            last_grad_norm = if let Some(target) = self.config.target_grad_norm {
+                grad_norm.min(target).min(max_grad_norm)
             } else {
-                // 3. Optional tighter target norm clipping delegates to the same boostr utility.
-                let effective_after_max = grad_norm.min(max_grad_norm);
-                if let Some(target) = self.config.target_grad_norm {
-                    if effective_after_max > target && effective_after_max > 1e-8 {
-                        crate::prelude::compute_grad_norm(
-                            &self.client,
-                            &mut grads,
-                            &self.parameter_ids,
-                            target,
-                        )?;
-                    }
-                }
-
-                // 4. Apply gradients via optimizer (LR already set at start of step)
-                let opt_start = if profile { Some(Instant::now()) } else { None };
-                self.optimizer.step(&self.client, self.params, &grads)?;
-                if let Some(start) = opt_start {
-                    eprintln!(
-                        "[PROFILE] optimizer.step: {:.3}ms",
-                        start.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
-
-                last_grad_norm = if let Some(target) = self.config.target_grad_norm {
-                    grad_norm.min(target).min(max_grad_norm)
-                } else {
-                    grad_norm.min(max_grad_norm)
-                };
-            }
+                grad_norm.min(max_grad_norm)
+            };
         }
 
         // Store gradient norm for monitoring/logging (no longer used for pre-scaling)
@@ -880,7 +868,7 @@ where
             "Saving final checkpoint to {}/{}_final.safetensors",
             self.config.checkpoint_dir, prefix
         );
-        self.save_checkpoint_named(model, "final")?;
+        self.save_final_checkpoint(model)?;
 
         println!("{{\"status\": \"complete\"}}");
 
@@ -1047,7 +1035,7 @@ where
             self.config.checkpoint_dir, prefix
         ))
         .ok();
-        self.save_checkpoint_named(model, "final")?;
+        self.save_final_checkpoint(model)?;
 
         mp.println(format!(
             "✅ Training complete | final loss: {:.4} | grad: {:.4}",
@@ -1153,112 +1141,58 @@ where
         self.config.save_interval > 0 && completed.is_multiple_of(self.config.save_interval)
     }
 
-    /// Saves weights labelled with `step`, the count of completed optimizer
-    /// steps, so a resume from `step_N` starts at step index `N` and its
-    /// loader at the position recorded beside it.
+    /// Saves the checkpoint set labelled with `step`, the count of completed
+    /// optimizer steps. A resume from `step_N` starts at step index `N`.
+    /// Its loader starts at the position in the meta.
     ///
-    /// Frozen parameters are absent from `self.params`, so the model is passed
-    /// through to `save_checkpoint_from_params` as their source. Without it a
-    /// LoRA run would write an adapter-only checkpoint.
-    fn save_checkpoint(&self, model: &crate::model::LitGPT<R>, step: usize) -> Result<()> {
-        let prefix = self.model_config.checkpoint_prefix();
-        let checkpoint_path = format!(
-            "{}/{}_step_{}.safetensors",
-            self.config.checkpoint_dir, prefix, step
-        );
-        if !Path::new(&self.config.checkpoint_dir).exists() {
-            std::fs::create_dir_all(&self.config.checkpoint_dir)?;
-        }
-
-        crate::model::save_checkpoint_from_params(&checkpoint_path, model, self.params)?;
-
-        // Save metadata for auto-resume validation
-        if let Some(ref data_path) = self.data_file_path {
-            let position = Some(self.data_position_after(step));
-            let saved = CheckpointMeta::new(
-                step,
-                &self.model_config,
-                data_path,
-                &checkpoint_path,
-                position,
-            )
-            .and_then(|meta| meta.save(&self.config.checkpoint_dir));
-            if let Err(e) = saved {
-                eprintln!(
-                    "Warning: failed to write checkpoint_step_{step}.meta.json in {}: {e}. \
-                     `--resume auto` cannot select this checkpoint; pass its path to \
-                     `--resume` instead.",
-                    self.config.checkpoint_dir
-                );
-            }
-        }
-
-        // Clean up old checkpoints if limit is set
+    /// Frozen parameters are absent from `self.params`, so the model is their
+    /// source. Without it a LoRA run writes an adapter-only checkpoint.
+    pub fn save_checkpoint(&self, model: &crate::model::LitGPT<R>, step: usize) -> Result<()> {
+        self.write_set(model, CheckpointLabel::Step(step), step)?;
         if self.config.max_checkpoints > 0 {
-            self.cleanup_old_checkpoints()?;
-        }
-
-        Ok(())
-    }
-
-    /// Remove old checkpoints to keep only max_checkpoints most recent
-    fn cleanup_old_checkpoints(&self) -> Result<()> {
-        let dir = Path::new(&self.config.checkpoint_dir);
-        if !dir.exists() {
-            return Ok(());
-        }
-
-        // Collect all step checkpoints with their step numbers
-        // Format: {name}_{seq}_{params}_{dtype}_step_{N}.safetensors
-        let mut checkpoints: Vec<(usize, std::path::PathBuf)> = Vec::new();
-
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    if filename.contains("_step_") && filename.ends_with(".safetensors") {
-                        if let Some(step_part) = filename.split("_step_").last() {
-                            if let Some(step_str) = step_part.strip_suffix(".safetensors") {
-                                if let Ok(step) = step_str.parse::<usize>() {
-                                    checkpoints.push((step, path));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        checkpoints.sort_by_key(|(step, _)| *step);
-
-        let to_remove = checkpoints
-            .len()
-            .saturating_sub(self.config.max_checkpoints);
-        for (step, path) in checkpoints.into_iter().take(to_remove) {
-            if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!("Warning: Failed to remove old checkpoint {:?}: {}", path, e);
-            }
-            let meta_path = format!(
-                "{}/checkpoint_step_{}.meta.json",
-                self.config.checkpoint_dir, step
+            remove_old_checkpoints(
+                Path::new(&self.config.checkpoint_dir),
+                self.config.max_checkpoints,
             );
-            let _ = std::fs::remove_file(&meta_path);
         }
-
         Ok(())
     }
 
-    fn save_checkpoint_named(&self, model: &crate::model::LitGPT<R>, name: &str) -> Result<()> {
-        let prefix = self.model_config.checkpoint_prefix();
-        let path = format!(
-            "{}/{}_{}.safetensors",
-            self.config.checkpoint_dir, prefix, name
-        );
-        if !Path::new(&self.config.checkpoint_dir).exists() {
-            std::fs::create_dir_all(&self.config.checkpoint_dir)?;
-        }
-        crate::model::save_checkpoint_from_params(&path, model, self.params)?;
-        Ok(())
+    /// Saves the `_final` checkpoint set at the current step.
+    pub fn save_final_checkpoint(&self, model: &crate::model::LitGPT<R>) -> Result<()> {
+        self.write_set(model, CheckpointLabel::Final, self.global_step)
+    }
+
+    /// Writes optimizer state, weights, then the meta that marks the set complete.
+    fn write_set(
+        &self,
+        model: &crate::model::LitGPT<R>,
+        label: CheckpointLabel,
+        step: usize,
+    ) -> Result<()> {
+        write_checkpoint_set(CheckpointSave {
+            dir: Path::new(&self.config.checkpoint_dir),
+            prefix: &self.model_config.checkpoint_prefix(),
+            label,
+            step,
+            position: self.data_position_after(step),
+            model_config: &self.model_config,
+            data_file_path: self.data_file_path.as_deref(),
+            model,
+            params: self.params,
+            optimizer: &self.optimizer,
+            name_maps: &self.name_maps,
+        })
+    }
+
+    /// Applies the optimizer part of a resume plan to this trainer's optimizer.
+    pub fn apply_optimizer_resume(&mut self, plan: &OptimizerResume) -> Result<()> {
+        apply_optimizer_resume(&mut self.optimizer, &self.name_maps, &self.device, plan)
+    }
+
+    /// The optimizer's step count. A step skipped for a non-finite norm does not count.
+    pub fn optimizer_timestep(&self) -> u64 {
+        self.optimizer.timestep()
     }
 
     fn clone_grad_store(&self, grads: &GradStore<R>) -> GradStore<R> {

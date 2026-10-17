@@ -11,6 +11,7 @@ use boostr::tensor::TensorId;
 use clap::Args;
 use std::collections::HashMap;
 
+use crate::checkpoint_set::{manual_resume_target, plan_optimizer_resume};
 use crate::commands::overrides::{
     resolve_checkpoint_dir, resolve_dtype, resolve_sync_backend, Source,
 };
@@ -120,8 +121,10 @@ fn prompt_confirmation(message: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-/// Clear all checkpoint files from a directory
-/// Removes .safetensors, .meta.json, and config.json files
+/// Clear all checkpoint files from a directory.
+///
+/// Removes weights and optimizer state (`.safetensors`), metas (`.meta.json`),
+/// `config.json`, and temp files that an interrupted atomic write left behind.
 fn clear_checkpoint_directory(checkpoint_dir: &str) -> Result<usize> {
     use std::path::Path;
 
@@ -137,10 +140,13 @@ fn clear_checkpoint_directory(checkpoint_dir: &str) -> Result<usize> {
         let path = entry.path();
 
         if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-            // Remove checkpoint files (.safetensors), metadata (.meta.json), and config.json
+            // `.safetensors` also matches `.optimizer.safetensors`. A temp file is
+            // `.<file_name>.tmp-<pid>-<n>`.
+            let is_temp = filename.starts_with('.') && filename.contains(".tmp-");
             if filename.ends_with(".safetensors")
                 || filename.ends_with(".meta.json")
                 || filename == "config.json"
+                || is_temp
             {
                 if let Err(e) = std::fs::remove_file(&path) {
                     eprintln!("Warning: Failed to remove {}: {}", path.display(), e);
@@ -152,14 +158,6 @@ fn clear_checkpoint_directory(checkpoint_dir: &str) -> Result<usize> {
     }
 
     Ok(removed_count)
-}
-
-/// `checkpoint_step_{step}.meta.json` beside an explicitly named checkpoint,
-/// if that file exists.
-fn sibling_meta_path(checkpoint: &str, step: usize) -> Option<String> {
-    let dir = std::path::Path::new(checkpoint).parent()?;
-    let meta = dir.join(format!("checkpoint_step_{step}.meta.json"));
-    meta.exists().then(|| meta.to_string_lossy().into_owned())
 }
 
 /// Loader position for a run that resumes at `start_step`.
@@ -538,8 +536,8 @@ where
     let mut model = LitGPT::<R>::new_seeded(&config, &mut varmap, &device, &client)?;
 
     // Load checkpoint if resuming. The metadata path, when there is one,
-    // carries the loader position to resume the data stream at.
-    let (start_step, resume_meta_path) = if let Some(ref resume_arg) = args.resume {
+    // carries the loader position and names the optimizer state file.
+    let (start_step, resume_meta_path, resume_weights) = if let Some(ref resume_arg) = args.resume {
         if resume_arg == "auto" {
             // Auto-resume: find latest checkpoint and validate
             if !headless {
@@ -614,7 +612,7 @@ where
                                         ));
                                     }
                                 }
-                                (0, None) // Start from step 0
+                                (0, None, None) // Start from step 0
                             } else {
                                 println!("Aborted. Please resolve the configuration mismatch or use a different checkpoint directory.");
                                 return Err(anyhow::anyhow!("Training aborted by user"));
@@ -637,7 +635,7 @@ where
                             if !headless {
                                 println!("Resuming from step {}", step);
                             }
-                            (step, Some(meta_path))
+                            (step, Some(meta_path), Some(checkpoint_path))
                         }
                     } else {
                         if !headless {
@@ -647,7 +645,7 @@ where
                         if !headless {
                             println!("Resuming from step {}", step);
                         }
-                        (step, Some(meta_path))
+                        (step, Some(meta_path), Some(checkpoint_path))
                     }
                 }
                 None => {
@@ -665,7 +663,7 @@ where
                          `checkpoint_step_N.meta.json` beside it.",
                         config.trainer.checkpoint_dir
                     );
-                    (0, None)
+                    (0, None, None)
                 }
             }
         } else {
@@ -677,29 +675,22 @@ where
             if !headless {
                 println!("Checkpoint loaded successfully!");
             }
-            // Try to parse step number from checkpoint filename
-            // Format: {name}_{seq}_{params}_{dtype}_step_{N} (e.g., nano_512_117m_bf16_step_100)
-            let step = std::path::Path::new(resume_arg)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| {
-                    if s.contains("_step_") {
-                        s.split("_step_")
-                            .last()
-                            .and_then(|n| n.parse::<usize>().ok())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0);
+            // `*_step_N` resumes at step N, `*_final` at the step its meta records.
+            let (step, meta_path) = manual_resume_target(resume_arg)?;
             if !headless && step > 0 {
                 println!("Resuming from step {}", step);
             }
-            (step, sibling_meta_path(resume_arg, step))
+            (step, meta_path, Some(resume_arg.clone()))
         }
     } else {
-        (0, None)
+        (0, None, None)
     };
+    // Plan the optimizer restore before the long setup, so a missing file fails early.
+    let optimizer_resume = plan_optimizer_resume(
+        resume_weights.as_deref(),
+        resume_meta_path.as_deref(),
+        start_step,
+    )?;
 
     if !headless {
         println!("Model initialized successfully");
@@ -844,6 +835,7 @@ where
             data_file_path: args.data_file.clone(),
         },
     )?;
+    trainer.apply_optimizer_resume(&optimizer_resume)?;
 
     if !headless {
         println!("Trainer initialized with AdamW optimizer\n");

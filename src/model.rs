@@ -5120,7 +5120,7 @@ where
 /// to F32 here instead would write 4 bytes per parameter for a bf16 model — a
 /// 2x larger file that also forces the full F32 copy onto the device at load
 /// time before it is cast back down.
-fn stage_tensor_for_safetensors<R>(
+pub(crate) fn stage_tensor_for_safetensors<R>(
     tensor: &Tensor<R>,
     cpu_device: &boostr::CpuDevice,
 ) -> Result<Tensor<boostr::CpuRuntime>>

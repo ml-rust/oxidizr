@@ -27,6 +27,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::checkpoint_names::from_checkpoint_name;
+use crate::checkpoint_set::CheckpointLabel;
 use crate::config::{CheckpointMeta, LitConfig};
 use crate::model::{load_tensors_initializing_lora, save_checkpoint_from_params, LitGPT};
 use crate::prelude::{DType, Tensor, VarBuilder, VarMap};
@@ -251,11 +252,9 @@ where
 
     let output = match args.output {
         Some(path) => PathBuf::from(path),
-        None => PathBuf::from(&config.trainer.checkpoint_dir).join(format!(
-            "{}_step_{}.safetensors",
-            config.model.checkpoint_prefix(),
-            IMPORT_STEP
-        )),
+        None => PathBuf::from(&config.trainer.checkpoint_dir).join(
+            CheckpointLabel::Step(IMPORT_STEP).weights_file_name(&config.model.checkpoint_prefix()),
+        ),
     };
 
     println!("Config:     {}", args.config_file);
@@ -365,7 +364,7 @@ where
     let meta = CheckpointMeta::new(
         IMPORT_STEP,
         &config.model,
-        &args.data_file,
+        Some(args.data_file.as_str()),
         &output_path,
         Some(crate::data::DataPosition::default()),
     )?;
@@ -383,9 +382,10 @@ where
     println!("\nOutput files:");
     println!("  - {}", output_path);
     println!(
-        "  - {}/checkpoint_step_{}.meta.json",
-        meta_dir.display(),
-        IMPORT_STEP
+        "  - {}",
+        meta_dir
+            .join(CheckpointLabel::Step(IMPORT_STEP).meta_file_name())
+            .display()
     );
     println!("\nNext steps:");
     println!(

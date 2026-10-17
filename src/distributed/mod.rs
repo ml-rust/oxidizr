@@ -23,7 +23,6 @@
 //! ```
 
 pub mod cpu_staging;
-pub mod optimizer;
 pub mod sync;
 
 #[cfg(feature = "nccl")]
@@ -31,7 +30,6 @@ pub mod nccl;
 
 // Re-exports for convenience
 pub use cpu_staging::{CpuStagingSynchronizer, RuntimeDeviceFromOrdinal};
-pub use optimizer::{AdamWConfig, DistributedAdamW};
 pub use sync::{DistributedConfig, GradientSynchronizer, SyncBackend};
 
 #[cfg(feature = "nccl")]

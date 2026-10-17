@@ -184,9 +184,10 @@ cargo run --release -- -f config.yaml --resume auto
 ### Resume produces different results
 
 **Causes:**
+- The checkpoint has no `.optimizer.safetensors` file. The resume prints a
+  warning and restarts the Adam moments.
 - Different config file
 - Different data
-- Non-deterministic operations
 
 **Solution:**
 Use exact same config and data as original run.

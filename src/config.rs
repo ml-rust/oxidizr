@@ -1,3 +1,4 @@
+use crate::checkpoint_set::{optimizer_path_for, weights_step, CheckpointLabel};
 use crate::data::DataPosition;
 use crate::schedule::LrSchedule;
 use boostr::model::{SpeechLayout, SpeechVocab};
@@ -5,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 // Default value functions for serde
@@ -1055,6 +1056,11 @@ pub struct CheckpointMeta {
     /// before row loading; resume then derives it from `step`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_position: Option<DataPosition>,
+    /// File name of the optimizer state, in the meta's directory. Absent in
+    /// metadata written before optimizer state was saved. A resume from such
+    /// a checkpoint restarts the Adam moments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer_file: Option<String>,
 }
 
 fn default_dtype_string() -> String {
@@ -1062,17 +1068,25 @@ fn default_dtype_string() -> String {
 }
 
 impl CheckpointMeta {
-    /// Create new checkpoint metadata
+    /// Create new checkpoint metadata.
+    ///
+    /// A run on generated data has no `data_file_path`. Its meta then holds
+    /// an empty data path and hash, so a resume with a data file reports a
+    /// data mismatch.
     pub fn new(
         step: usize,
         model_config: &OxidizrModelConfig,
-        data_file_path: &str,
+        data_file_path: Option<&str>,
         checkpoint_file: &str,
         data_position: Option<DataPosition>,
     ) -> anyhow::Result<Self> {
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let model_config_hash = compute_model_config_hash(model_config);
-        let data_file_hash = compute_file_hash(data_file_path)?;
+        let data_file_hash = data_file_path
+            .map(compute_file_hash)
+            .transpose()?
+            .unwrap_or_default();
+        let data_file_path = data_file_path.unwrap_or_default();
 
         Ok(Self {
             step,
@@ -1083,15 +1097,25 @@ impl CheckpointMeta {
             checkpoint_file: checkpoint_file.to_string(),
             dtype: model_config.dtype.to_string(),
             data_position,
+            optimizer_file: None,
         })
     }
 
-    /// Save metadata to JSON file alongside checkpoint
+    /// Save metadata as `checkpoint_step_{step}.meta.json` in `checkpoint_dir`.
     pub fn save(&self, checkpoint_dir: &str) -> anyhow::Result<()> {
         let meta_path = format!("{}/checkpoint_step_{}.meta.json", checkpoint_dir, self.step);
+        self.save_to(Path::new(&meta_path))
+    }
+
+    /// Save metadata to `path` atomically. An error leaves an existing file unchanged.
+    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&meta_path, json)?;
-        Ok(())
+        boostr::format::write_atomic(path, |w| w.write_all(json.as_bytes())).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to write checkpoint meta '{}': {e}. Check that the directory is writable.",
+                path.display()
+            )
+        })
     }
 
     /// Load metadata from JSON file
@@ -1213,6 +1237,9 @@ pub fn compute_file_hash(path: &str) -> anyhow::Result<String> {
 
 /// Find the latest checkpoint in a directory
 /// Format: {name}_{seq}_{params}_{dtype}_step_{N}.safetensors
+///
+/// The meta is the commit marker of a checkpoint set. Weights with optimizer
+/// state and no meta are an interrupted save, and the scan skips them.
 pub fn find_latest_checkpoint(
     checkpoint_dir: &str,
 ) -> anyhow::Result<Option<(String, String, usize)>> {
@@ -1238,35 +1265,38 @@ pub fn find_latest_checkpoint(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if let Some(filename) = path.file_name().and_then(|s| s.to_str()) {
-            // Look for *_step_N.safetensors (e.g., nano_512_117m_bf16_step_100.safetensors)
-            if filename.contains("_step_") && filename.ends_with(".safetensors") {
-                // Extract step number after "_step_"
-                if let Some(step_part) = filename.split("_step_").last() {
-                    if let Some(step_str) = step_part.strip_suffix(".safetensors") {
-                        if let Ok(step) = step_str.parse::<usize>() {
-                            if newest_weights
-                                .as_ref()
-                                .is_none_or(|(newest, _)| step > *newest)
-                            {
-                                newest_weights = Some((step, path.to_string_lossy().to_string()));
-                            }
-                            if latest_step.is_none_or(|latest| step > latest) {
-                                // Check if corresponding meta file exists
-                                let meta_path = format!(
-                                    "{}/checkpoint_step_{}.meta.json",
-                                    checkpoint_dir, step
-                                );
-                                if Path::new(&meta_path).exists() {
-                                    latest_step = Some(step);
-                                    latest_checkpoint = Some(path.to_string_lossy().to_string());
-                                    latest_meta = Some(meta_path);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // `*_step_N.safetensors` only. An `.optimizer.safetensors` file never parses as weights.
+        let Some(step) = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(weights_step)
+        else {
+            continue;
+        };
+        let meta_path = format!(
+            "{checkpoint_dir}/{}",
+            CheckpointLabel::Step(step).meta_file_name()
+        );
+        let has_meta = Path::new(&meta_path).exists();
+        if !has_meta && optimizer_path_for(&path).is_some_and(|p| p.exists()) {
+            // A trainer save writes optimizer state, weights, then the meta.
+            // Weights with optimizer state and no meta are an interrupted save.
+            eprintln!(
+                "Skipping `{}`: its save stopped before the meta `{meta_path}` was written.",
+                path.display()
+            );
+            continue;
+        }
+        if newest_weights
+            .as_ref()
+            .is_none_or(|(newest, _)| step > *newest)
+        {
+            newest_weights = Some((step, path.to_string_lossy().to_string()));
+        }
+        if has_meta && latest_step.is_none_or(|latest| step > latest) {
+            latest_step = Some(step);
+            latest_checkpoint = Some(path.to_string_lossy().to_string());
+            latest_meta = Some(meta_path);
         }
     }
 
