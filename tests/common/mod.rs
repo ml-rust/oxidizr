@@ -1,5 +1,8 @@
 //! Shared helpers for the integration tests: a tiny CPU model, its trainer, and scratch dirs.
 
+// Each test binary compiles this module and uses a subset of it.
+#![allow(dead_code)]
+
 use boostr::tensor::TensorId;
 use boostr::{CpuClient, CpuDevice, CpuRuntime, Tensor, VarMap};
 use oxidizr::config::{
@@ -88,8 +91,6 @@ pub fn tiny_config(checkpoint_dir: &Path, max_steps: usize) -> LitConfig {
             seed: Some(42),
             target_mask: None,
             shuffle_rows: true,
-            group_size: 4,
-            beta_kl: 0.04,
         },
     }
 }
@@ -101,6 +102,24 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     dir
+}
+
+/// The deterministic token stream of [`data_loader`], `count` tokens long.
+pub fn tokens(cfg: &LitConfig, count: u32) -> Vec<u32> {
+    let vocab = cfg.model.vocab_size as u32;
+    (0..count).map(|i| (i * 7 + i / 5) % vocab).collect()
+}
+
+/// Writes `tokens` as a raw little-endian `u32` data file at `path`.
+pub fn write_token_file(path: &Path, tokens: &[u32]) {
+    let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+    std::fs::write(path, bytes).expect("write token file");
+}
+
+/// Writes `cfg` as a YAML config file at `path`, as `oxidizr train -f` reads it.
+pub fn write_config_yaml(path: &Path, cfg: &LitConfig) {
+    let yaml = serde_yaml::to_string(cfg).expect("serialize config");
+    std::fs::write(path, yaml).expect("write config yaml");
 }
 
 /// Build the model as `commands::train` does: a fresh `VarMap` and `LitGPT::new_seeded`.
@@ -136,10 +155,8 @@ pub fn train_parts(model: &LitGPT<CpuRuntime>) -> TrainParts {
 
 /// A deterministic token stream, read in a seeded shuffled row order.
 pub fn data_loader(cfg: &LitConfig) -> LitDataLoader<CpuRuntime> {
-    let vocab = cfg.model.vocab_size as u32;
-    let tokens: Vec<u32> = (0..4000u32).map(|i| (i * 7 + i / 5) % vocab).collect();
     LitDataLoader::<CpuRuntime>::new(
-        tokens,
+        tokens(cfg, 4000),
         cfg.trainer.batch_size,
         cfg.model.max_seq_len,
         CpuDevice::new(),

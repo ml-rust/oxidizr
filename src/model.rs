@@ -632,11 +632,12 @@ struct QkNormsWithIds<R: boostr::Runtime> {
     k_norm: WeightWithId<R>,
 }
 
-/// One MoE FFN's routed experts, its shared expert, and its router gate, for
-/// the `*_with_ids` rebuild path.
+/// One MoE FFN's routed experts, its shared expert (absent when
+/// `shared_expert_enabled` is false), and its router gate, for the
+/// `*_with_ids` rebuild path.
 type MoeWeightsWithIds<R> = (
     Vec<MlpWeightsWithIds<R>>,
-    MlpWeightsWithIds<R>,
+    Option<MlpWeightsWithIds<R>>,
     WeightWithId<R>,
 );
 
@@ -1715,15 +1716,24 @@ where
             experts.push(expert.into_inner());
         }
 
-        let shared_expert = Expert::new(
-            cfg.hidden_size,
-            intermediate,
-            vb.pp("shared_expert"),
-            client,
-            dtype,
-            lora,
-        )?
-        .into_inner();
+        // `moe.shared_expert` decides whether the layer holds a shared expert.
+        // The exported `config.json` carries the same flag, so the saved
+        // weights and the config always agree.
+        let shared_expert = if Self::has_shared_expert(cfg)? {
+            Some(
+                Expert::new(
+                    cfg.hidden_size,
+                    intermediate,
+                    vb.pp("shared_expert"),
+                    client,
+                    dtype,
+                    lora,
+                )?
+                .into_inner(),
+            )
+        } else {
+            None
+        };
         let router = Router::new(
             cfg.hidden_size,
             Self::router_config(num_experts, experts_per_tok),
@@ -1733,7 +1743,7 @@ where
         )?
         .into_inner();
 
-        let moe = boostr::nn::moe::layer::MoeLayer::new(router, experts, Some(shared_expert))
+        let moe = boostr::nn::moe::layer::MoeLayer::new(router, experts, shared_expert)
             .with_shared_expert_scale(Self::shared_expert_scale(experts_per_tok))?;
 
         Ok(Self { moe })
@@ -1743,7 +1753,7 @@ where
     fn with_ids(
         cfg: &ModelConfig,
         experts: Vec<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
-        shared_expert: (AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>),
+        shared_expert: Option<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
         router_gate: (Tensor<R>, boostr::autograd::TensorId),
         frozen: &FrozenParams,
     ) -> Result<Self> {
@@ -1770,15 +1780,28 @@ where
             boostr_experts.push(expert.into_inner());
         }
 
-        let shared_expert = Expert::with_ids(
-            cfg.hidden_size,
-            intermediate,
-            shared_expert.0,
-            shared_expert.1,
-            shared_expert.2,
-            frozen,
-        )?
-        .into_inner();
+        if shared_expert.is_some() != Self::has_shared_expert(cfg)? {
+            return Err(boostr::error::Error::ModelError {
+                reason: format!(
+                    "MoE rebuild got {} shared expert, but cfg.moe.shared_expert is {:?}",
+                    if shared_expert.is_some() { "a" } else { "no" },
+                    cfg.moe.as_ref().and_then(|moe| moe.shared_expert)
+                ),
+            });
+        }
+        let shared_expert = shared_expert
+            .map(|(gate_proj, up_proj, down_proj)| {
+                Expert::with_ids(
+                    cfg.hidden_size,
+                    intermediate,
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                    frozen,
+                )
+                .map(Expert::into_inner)
+            })
+            .transpose()?;
         let router = Router::with_ids(
             cfg.hidden_size,
             Self::router_config(num_experts, experts_per_tok),
@@ -1787,9 +1810,8 @@ where
         )?
         .into_inner();
 
-        let moe =
-            boostr::nn::moe::layer::MoeLayer::new(router, boostr_experts, Some(shared_expert))
-                .with_shared_expert_scale(Self::shared_expert_scale(experts_per_tok))?;
+        let moe = boostr::nn::moe::layer::MoeLayer::new(router, boostr_experts, shared_expert)
+            .with_shared_expert_scale(Self::shared_expert_scale(experts_per_tok))?;
 
         Ok(Self { moe })
     }
@@ -1931,6 +1953,18 @@ where
         }
     }
 
+    /// Whether `cfg.moe` asks for a shared expert. `to_boostr` always writes
+    /// an explicit flag, so `None` here means a config that bypassed it.
+    fn has_shared_expert(cfg: &ModelConfig) -> Result<bool> {
+        let moe = cfg
+            .moe
+            .as_ref()
+            .ok_or_else(|| boostr::error::Error::ModelError {
+                reason: "moe config missing while building an MoE FfnLayer".into(),
+            })?;
+        Ok(moe.has_shared_expert())
+    }
+
     fn shared_expert_scale(experts_per_tok: usize) -> f32 {
         1.0 / (experts_per_tok as f32 + 1.0)
     }
@@ -2018,7 +2052,7 @@ where
         mlp: Option<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
         moe: Option<(
             Vec<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
-            (AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>),
+            Option<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
             (Tensor<R>, boostr::autograd::TensorId),
         )>,
         frozen: &FrozenParams,
@@ -2370,11 +2404,7 @@ where
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
             Option<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
-            Option<(
-                Vec<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
-                (AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>),
-                (Tensor<R>, boostr::autograd::TensorId),
-            )>,
+            Option<MoeWeightsWithIds<R>>,
             (Tensor<R>, boostr::autograd::TensorId),
             (Tensor<R>, boostr::autograd::TensorId),
         )>,
@@ -4174,7 +4204,7 @@ where
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
     ) -> Result<(
         Vec<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
-        (AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>),
+        Option<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
         (Tensor<R>, boostr::autograd::TensorId),
     )> {
         let mut experts = Vec::new();
@@ -4186,14 +4216,11 @@ where
                 params,
             )?);
         }
-        let shared_expert =
-            moe.moe
-                .shared_expert()
-                .ok_or_else(|| boostr::error::Error::ModelError {
-                    reason: "MoE layer is missing the shared expert required by oxidizr".into(),
-                })?;
-        let shared_expert =
-            Self::expert_weights_with_ids(cfg, "moe.shared_expert", shared_expert, params)?;
+        let shared_expert = moe
+            .moe
+            .shared_expert()
+            .map(|shared| Self::expert_weights_with_ids(cfg, "moe.shared_expert", shared, params))
+            .transpose()?;
         let router_gate = Self::tensor_with_stable_id(moe.moe.router().gate().weight(), params)?;
         Ok((experts, shared_expert, router_gate))
     }

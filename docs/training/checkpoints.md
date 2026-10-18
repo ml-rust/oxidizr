@@ -82,7 +82,7 @@ Each checkpoint is a set of three files in `checkpoint_dir`:
 |------|---------|
 | `<prefix>_step_N.safetensors` | Model weights after N completed optimizer steps |
 | `<prefix>_step_N.optimizer.safetensors` | AdamW state: `exp_avg`, `exp_avg_sq`, `master` per trainable tensor, and `__step` |
-| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes, dtype, `data_position`, and `optimizer_file` |
+| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, and `optimizer_file` |
 
 The end of a run writes the same set as `<prefix>_final.safetensors`,
 `<prefix>_final.optimizer.safetensors` and `checkpoint_final.meta.json`.
@@ -121,6 +121,17 @@ at step 0, such as from `oxidizr import`, needs no optimizer state.
 A meta that names an optimizer file that does not exist stops the run.
 Restore the file, or remove `optimizer_file` from the meta to resume with
 fresh Adam moments.
+
+`--resume auto` with `--data` compares the model config hash and the
+data-file hash. The data-file hash covers the first 1 MiB of the file and
+its size. Both hashes use 64-bit FNV-1a (`hash_algo: fnv1a64`), so a Rust
+upgrade cannot change them.
+
+Metadata without `hash_algo` holds `legacy` hashes from Rust's
+`DefaultHasher`. The resume recomputes them the legacy way. A legacy
+data-file hash that differs prints a warning, and the resume continues
+without a data check. A legacy model hash that differs reports a mismatch,
+as before.
 
 Metadata written before `data_position` existed has none. The loader
 position then derives from N and the current `batch_size` and

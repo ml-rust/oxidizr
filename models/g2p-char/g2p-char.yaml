@@ -95,7 +95,3 @@ trainer:
     kind: prefix_lm
     target_base: 61
     always_score: [3]
-
-  # Unused; required by the config parser.
-  group_size: 4
-  beta_kl: 0.04

@@ -620,8 +620,9 @@ pub fn run_pack(args: PackArgs) -> Result<()> {
     }
 
     let config_content = fs::read_to_string(&config_path)?;
-    let config: UniversalConfig =
+    let mut config: UniversalConfig =
         serde_json::from_str(&config_content).context("Failed to parse config.json")?;
+    let repaired = crate::checkpoint_config::repair_legacy_shared_expert(&mut config);
 
     // Determine model name
     let model_name = args.name.unwrap_or_else(|| {
@@ -655,8 +656,16 @@ pub fn run_pack(args: PackArgs) -> Result<()> {
 
     // Copy config.json
     let config_dest = output_dir.join("config.json");
-    println!("  Copying config.json...");
-    fs::copy(&config_path, &config_dest)?;
+    if repaired {
+        println!("  Writing config.json with moe.shared_expert: true (older files hold null)...");
+        let json =
+            serde_json::to_string_pretty(&config).context("Failed to serialize config.json")?;
+        fs::write(&config_dest, json)
+            .with_context(|| format!("Failed to write {}", config_dest.display()))?;
+    } else {
+        println!("  Copying config.json...");
+        fs::copy(&config_path, &config_dest)?;
+    }
 
     // Try to find and copy training config.yaml
     // Look for run.json or the original config

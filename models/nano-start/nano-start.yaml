@@ -293,12 +293,3 @@ trainer:
   #   - Data order and dropout are unaffected - this only seeds init
 
   seed: 42
-
-  # ---------------------------------------------------------------------------
-  # GRPO CONFIG (Advanced - Phase 2)
-  # ---------------------------------------------------------------------------
-  # Group Relative Policy Optimization for RLHF
-  # Not used in basic training, but required by config parser
-
-  group_size: 4
-  beta_kl: 0.04

@@ -3,13 +3,15 @@
 //! This module contains the training logic, extracted from the original main.rs.
 
 use crate::prelude::{DType, Tensor, VarMap};
-use anyhow::Result;
+use crate::run_record::{RunProgress, RunRecord, STEPS_FILE};
+use anyhow::{Context, Result};
 use boostr::autograd::Var;
 use boostr::ops::{FusedOptimizerOps, TensorOps};
 use boostr::runtime::{Runtime, RuntimeClient};
 use boostr::tensor::TensorId;
 use clap::Args;
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::checkpoint_set::{manual_resume_target, plan_optimizer_resume};
 use crate::commands::overrides::{
@@ -92,6 +94,11 @@ pub struct TrainArgs {
     /// the config value applies otherwise.
     #[arg(long = "checkpoint-dir")]
     pub checkpoint_dir: Option<String>,
+
+    /// Run directory for run.json and steps.json. Default: $OXIDIZED_RUN_DIR,
+    /// else ./runs/<timestamp>. The directory is created when absent.
+    #[arg(long = "run-dir")]
+    pub run_dir: Option<String>,
 }
 
 /// Parse GPU IDs from comma-separated string (e.g., "0,1,2,3")
@@ -111,7 +118,8 @@ fn prompt_confirmation(message: &str) -> bool {
     use std::io::{self, Write};
 
     print!("{} [y/N]: ", message);
-    io::stdout().flush().unwrap();
+    // A flush error leaves the prompt unshown. The answer is still read, so it is ignored.
+    let _ = io::stdout().flush();
 
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_err() {
@@ -318,7 +326,23 @@ pub fn run_train(args: TrainArgs) -> Result<()> {
     run_train_with_runtime::<boostr::CpuRuntime>(args, config)
 }
 
-fn run_train_with_runtime<R>(args: TrainArgs, mut config: LitConfig) -> Result<()>
+/// The run directory: `--run-dir`, else `$OXIDIZED_RUN_DIR`, else `./runs/<timestamp>`.
+fn resolve_run_dir(args: &TrainArgs) -> Result<String> {
+    let dir = match (&args.run_dir, std::env::var("OXIDIZED_RUN_DIR")) {
+        (Some(dir), _) => dir.clone(),
+        (None, Ok(dir)) => dir,
+        (None, Err(_)) => format!("./runs/{}", chrono::Local::now().format("%Y%m%d_%H%M%S")),
+    };
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create run directory '{dir}'"))?;
+    Ok(dir)
+}
+
+/// Runs one training run and writes its `run.json`, whatever the outcome.
+///
+/// The record goes to the run directory before the result returns, so `main`
+/// exits only after it is on disk.
+fn run_train_with_runtime<R>(args: TrainArgs, config: LitConfig) -> Result<()>
 where
     R: Runtime<DType = DType> + crate::distributed::RuntimeDeviceFromOrdinal,
     R::Client: RuntimeClient<R>
@@ -337,21 +361,46 @@ where
         + boostr::TypeConversionOps<R>
         + boostr::DequantOps<R>,
 {
-    // Use run directory from env var (set by wrapper script) or create new one
-    let run_dir = match std::env::var("OXIDIZED_RUN_DIR") {
-        Ok(dir) => {
-            // Wrapper script already created the directory
-            dir
-        }
-        Err(_) => {
-            // No wrapper - create our own timestamped directory
-            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-            let dir = format!("./runs/{}", timestamp);
-            std::fs::create_dir_all(&dir)?;
-            dir
-        }
-    };
+    let run_dir = resolve_run_dir(&args)?;
+    let headless = args.headless;
+    let mut progress = RunProgress::start(&run_dir, R::name());
+    let result = train_in_run_dir::<R>(args, config, &run_dir, &mut progress);
+    match progress.finish(&result).write(Path::new(&run_dir)) {
+        Ok(()) if !headless => println!(
+            "Run metadata saved to: {}",
+            RunRecord::path_in(Path::new(&run_dir)).display()
+        ),
+        Ok(()) => {}
+        // The training result outranks its record: warn, and keep the result.
+        Err(e) => eprintln!("Warning: {e:#}"),
+    }
+    result
+}
 
+fn train_in_run_dir<R>(
+    args: TrainArgs,
+    mut config: LitConfig,
+    run_dir: &str,
+    progress: &mut RunProgress,
+) -> Result<()>
+where
+    R: Runtime<DType = DType> + crate::distributed::RuntimeDeviceFromOrdinal,
+    R::Client: RuntimeClient<R>
+        + TensorOps<R>
+        + FusedOptimizerOps<R>
+        + boostr::RandomOps<R>
+        + boostr::ScalarOps<R>
+        + boostr::BinaryOps<R>
+        + boostr::CompareOps<R>
+        + boostr::ConvOps<R>
+        + boostr::FlashAttentionOps<R>
+        + boostr::IndexingOps<R>
+        + boostr::NormalizationOps<R>
+        + boostr::QuantMatmulOps<R>
+        + boostr::RoPEOps<R>
+        + boostr::TypeConversionOps<R>
+        + boostr::DequantOps<R>,
+{
     // Apply headless mode flag
     let headless = args.headless;
 
@@ -619,7 +668,11 @@ where
                             }
                         } else {
                             // Validation passed - load checkpoint and resume
-                            if !headless {
+                            if let Some(warning) = validation.data_check_warning() {
+                                // stderr in both modes: an unchecked data file is
+                                // worth a line even in headless output.
+                                eprintln!("{warning}");
+                            } else if !headless {
                                 println!("✅ Checkpoint validated: model and data match");
                             }
 
@@ -685,6 +738,7 @@ where
     } else {
         (0, None, None)
     };
+    progress.final_step = start_step;
     // Plan the optimizer restore before the long setup, so a missing file fails early.
     let optimizer_resume = plan_optimizer_resume(
         resume_weights.as_deref(),
@@ -755,6 +809,7 @@ where
 
     // Get dataset size before potentially wrapping in prefetch
     let dataset_size = base_loader.dataset_size();
+    progress.dataset_size = Some(dataset_size);
     let row_layout = base_loader.row_layout()?;
     let start_position = resume_data_position(
         resume_meta_path.as_deref(),
@@ -798,6 +853,30 @@ where
     // Effective batch size is the number of samples per optimizer step
     let effective_batch_size = batch_size * config_trainer.gradient_accumulation;
 
+    progress.config = Some(serde_json::json!({
+        "model": {
+            "name": config.model.name,
+            "hidden_size": config.model.hidden_size,
+            "num_layers": config.model.num_layers,
+            "num_heads": config.model.num_heads,
+            "num_experts": config.model.num_experts,
+            "experts_per_tok": config.model.experts_per_tok,
+            "vocab_size": config.model.vocab_size,
+            "max_seq_len": config.model.max_seq_len,
+            "dtype": config.model.dtype.to_string(),
+        },
+        "trainer": {
+            "learning_rate": config.trainer.learning_rate,
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "gradient_accumulation": config_trainer.gradient_accumulation,
+            "max_steps": config.trainer.max_steps,
+            "num_epochs": config.trainer.num_epochs,
+            "effective_batch_size": effective_batch_size,
+            "total_steps": total_steps,
+        }
+    }));
+
     // Stable TensorId parameter registration.
     // There is no global tape: the optimizer owns a HashMap keyed by the model's
     // logical TensorIds, and every step rebuilds Vars with those same IDs.
@@ -816,7 +895,10 @@ where
         .sum::<usize>();
     let total_params = trainable_params;
 
-    let steps_json_path = format!("{}/steps.json", run_dir);
+    let steps_json_path = Path::new(run_dir)
+        .join(STEPS_FILE)
+        .to_string_lossy()
+        .into_owned();
     let mut trainer = LitTrainer::<R>::new(
         config_trainer.clone(),
         &mut params,
@@ -934,47 +1016,8 @@ where
         let mut data_loader = base_loader;
         trainer.fit(&model, &mut data_loader)
     };
-
-    // Write run.json with metadata
-    let run_json = serde_json::json!({
-        "run_dir": run_dir,
-        "config": {
-            "model": {
-                "name": config.model.name,
-                "hidden_size": config.model.hidden_size,
-                "num_layers": config.model.num_layers,
-                "num_heads": config.model.num_heads,
-                "num_experts": config.model.num_experts,
-                "experts_per_tok": config.model.experts_per_tok,
-                "vocab_size": config.model.vocab_size,
-                "max_seq_len": config.model.max_seq_len,
-                "dtype": config.model.dtype.to_string(),
-            },
-            "trainer": {
-                "learning_rate": config.trainer.learning_rate,
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "gradient_accumulation": config_trainer.gradient_accumulation,
-                "max_steps": config.trainer.max_steps,
-                "num_epochs": config.trainer.num_epochs,
-                "effective_batch_size": effective_batch_size,
-                "total_steps": total_steps,
-            }
-        },
-        "dataset_size": dataset_size,
-        "device": R::name(),
-        "status": if training_result.is_ok() { "completed" } else { "failed" },
-        "error": if let Err(ref e) = training_result {
-            Some(format!("{:?}", e))
-        } else {
-            None
-        },
-    });
-
-    let run_json_path = format!("{}/run.json", run_dir);
-    if let Ok(run_json_str) = serde_json::to_string_pretty(&run_json) {
-        let _ = std::fs::write(&run_json_path, run_json_str);
-    }
+    progress.final_step = trainer.global_step();
+    progress.last_loss = trainer.last_loss();
 
     match training_result {
         Ok(_) => {
@@ -983,7 +1026,6 @@ where
                     "\nTraining complete! Checkpoints saved to: {}",
                     config.trainer.checkpoint_dir
                 );
-                println!("Run metadata saved to: {}/run.json", run_dir);
             }
             Ok(())
         }
@@ -1013,7 +1055,8 @@ where
                     println!("  4. Use --dtype bf16 or --dtype f16 for lower memory usage");
                     println!();
                 }
-                Err(anyhow::anyhow!("CUDA out of memory"))
+                // Keep the device error under the summary, so run.json records both.
+                Err(anyhow::Error::from(e).context("CUDA out of memory"))
             } else {
                 Err(e.into())
             }

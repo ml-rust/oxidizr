@@ -125,6 +125,7 @@ cargo run --release -- train -f models/nano.yaml --resume auto
 | Argument                   | Description                                                      |
 | -------------------------- | ---------------------------------------------------------------- |
 | `--headless`               | Output JSON metrics only. No TUI progress bar.                   |
+| `--run-dir <DIR>`          | Directory for `run.json` and `steps.json`. Default: `$OXIDIZED_RUN_DIR`, else `./runs/<timestamp>`. |
 | `--dtype <f32\|f16\|bf16>` | Model precision. Default: f32. BF16 recommended for modern GPUs. |
 
 #### Interactive Mode (Default)

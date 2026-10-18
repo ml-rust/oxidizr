@@ -376,7 +376,9 @@ fn to_moe(cfg: &OxidizrModelConfig) -> Result<Option<MoeConfig>> {
     Ok(Some(MoeConfig {
         num_experts,
         experts_per_tok,
-        shared_expert: cfg.shared_expert_enabled,
+        // Always explicit: boostr reads an absent flag as `false`, while
+        // oxidizr builds a shared expert unless the config says `false`.
+        shared_expert: Some(cfg.shared_expert_enabled.unwrap_or(true)),
         intermediate_size: cfg.intermediate_size,
         // Deliberately boostr's own defaults, NOT read from oxidizr: the real
         // load-balance/z-loss coefficients live on `TrainerConfig` and drive

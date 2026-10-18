@@ -185,7 +185,8 @@ Check the `models/` directory for working examples:
 |--------|--------------|-------------|
 | `nano.yaml` | Llama Transformer | Standard GPT-style |
 | `nano_mamba2.yaml` | Mamba2 + MLA | Hybrid architecture |
-| `nano_mamba2_pure.yaml` | Pure Mamba2 | No attention layers |
+| `nano_mamba3.yaml` | Mamba3 | Trapezoidal discretization |
+| `nano_mamba3_hybrid.yaml` | Mamba3 + MLA + MoE | Hybrid architecture |
 
 ## Implementation Details
 
@@ -193,10 +194,9 @@ Check the `models/` directory for working examples:
 
 | File | Component |
 |------|-----------|
-| `src/model.rs` | Transformer, attention, FFN |
-| `src/mamba.rs` | Mamba1 SSM |
-| `src/mamba2.rs` | Mamba2 SSD |
-| `src/config.rs` | Configuration parsing |
+| `src/model.rs` | Transformer, attention, FFN, MoE, and the Mamba1/2/3 blocks over boostr's `Mamba1`/`Mamba2`/`Mamba3` |
+| `src/config.rs` | Config parsing |
+| `src/config_convert.rs` | Conversion to boostr's model config |
 
 ### Constraints
 

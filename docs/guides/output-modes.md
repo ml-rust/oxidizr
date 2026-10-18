@@ -43,9 +43,8 @@ cargo run --release -- -f models/nano.yaml --headless
 Output:
 
 ```json
-{"step": 1, "loss": 11.5161, "grad_norm": 0.2542, "learning_rate": 2.000000e-3, "epoch": 0.01, "it/s": 3.24}
-{"step": 21, "loss": 11.4948, "grad_norm": 0.1980, "learning_rate": 2.000000e-3, "epoch": 0.21, "it/s": 3.09}
-{"step": 41, "loss": 11.3234, "grad_norm": 0.1823, "learning_rate": 2.000000e-3, "epoch": 0.41, "it/s": 3.12}
+{"step": 1, "loss": 11.5161, "grad_norm": 0.2542, "learning_rate": 2.000000e-3, "epoch": 0.01, "samples/s": 3.24, "vram": "0"}
+{"step": 21, "loss": 11.4948, "grad_norm": 0.1980, "learning_rate": 2.000000e-3, "epoch": 0.21, "samples/s": 3.09, "vram": "0"}
 ```
 
 ### When to Use Headless Mode
@@ -65,7 +64,19 @@ Output:
 | `grad_norm`     | Gradient norm               |
 | `learning_rate` | Current learning rate       |
 | `epoch`         | Epoch progress (fractional) |
-| `it/s`          | Iterations per second       |
+| `samples/s`     | Samples per second          |
+| `vram`          | Device memory in use (MiB), `"0"` when unknown |
+
+## Run Directory Files
+
+Both modes write the same two files to the run directory. Set it with `--run-dir`. The default is `$OXIDIZED_RUN_DIR`, else `./runs/<timestamp>`.
+
+| File         | Content                                                                                       |
+| ------------ | --------------------------------------------------------------------------------------------- |
+| `steps.json` | One JSON line per log interval: `step`, `loss`, `grad_norm`, `learning_rate`, `epoch`         |
+| `run.json`   | Written when the run ends: `status`, `error`, `final_step`, `last_loss`, `started_at`, `finished_at`, `device`, `dataset_size`, `config` |
+
+`status` is `completed` or `failed`. A failed run, setup errors included, records the error text in `error`. The process then exits with code 1.
 
 ## Choosing the Right Mode
 

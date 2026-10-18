@@ -48,8 +48,12 @@ How many experts process each token (top-K routing).
 
 Whether to include a shared expert that processes all tokens:
 
-- `true` - Shared expert provides baseline capacity
-- `false` - Only routed experts
+- `true` (default when absent or `null`) - Shared expert provides baseline capacity
+- `false` - Only routed experts. The checkpoint holds no `moe.shared_expert.*` tensors.
+
+The exported `config.json` always carries the flag explicitly, so it matches the saved weights.
+A `config.json` from an older oxidizr holds `null`, while its weights hold a shared expert.
+`train` rewrites `config.json` at start, and `pack` writes `true` for such a file.
 
 ### load_balance_alpha
 

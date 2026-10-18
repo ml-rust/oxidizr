@@ -38,6 +38,22 @@ pub fn write_checkpoint_config(
     Ok(())
 }
 
+/// Sets an absent `moe.shared_expert` to `true` in a `config.json` from an
+/// older oxidizr. Returns whether it changed `config`.
+///
+/// Older oxidizr wrote the flag as `null` and always trained a shared expert.
+/// boostr reads `null` as no shared expert, so the weights and the config
+/// disagreed. Current writes always carry the flag.
+pub fn repair_legacy_shared_expert(config: &mut boostr::model::UniversalConfig) -> bool {
+    match config.moe.as_mut() {
+        Some(moe) if moe.shared_expert.is_none() => {
+            moe.shared_expert = Some(true);
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +181,26 @@ mod tests {
         assert!(checkpoint_config_exists(dir.to_str().unwrap()));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An MoE config written by an older oxidizr carries `shared_expert: null`.
+    #[test]
+    fn a_null_shared_expert_flag_is_repaired_to_true_and_an_explicit_one_is_kept() {
+        let mut model_config = load_model_config("models/nano.yaml");
+        let mut legacy = model_config.to_boostr().expect("nano converts");
+        legacy.moe.as_mut().expect("nano is MoE").shared_expert = None;
+        assert!(repair_legacy_shared_expert(&mut legacy));
+        assert_eq!(
+            legacy.moe.as_ref().and_then(|m| m.shared_expert),
+            Some(true)
+        );
+
+        model_config.shared_expert_enabled = Some(false);
+        let mut explicit = model_config.to_boostr().expect("nano converts");
+        assert!(!repair_legacy_shared_expert(&mut explicit));
+        assert_eq!(
+            explicit.moe.as_ref().and_then(|m| m.shared_expert),
+            Some(false)
+        );
     }
 }

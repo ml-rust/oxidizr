@@ -19,7 +19,6 @@ use boostr::tensor::TensorId;
 use boostr::{ReduceOps, TypeConversionOps};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
@@ -58,7 +57,6 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     global_step: usize,
     // Training metrics
     row_layout: RowLayout,
-    total_steps: usize,
     batch_size: usize,
     // JSON logging
     steps_json_path: String,
@@ -85,6 +83,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     /// Guard against a silently all-ones or nearly-all-zeros loss mask: the
     /// masked-in fraction is reported once per run, not once per step.
     mask_stats_logged: bool,
+    /// Loss of the last completed step, for the run record.
+    last_loss: Option<f64>,
 }
 
 impl<'a, R> LitTrainer<'a, R>
@@ -164,8 +164,7 @@ where
 
         // The step the post-warmup decay schedule decays across: an explicit
         // `max_steps` caps it, otherwise the epoch-derived `total_steps`
-        // applies — the same two ways `fit_headless`/`fit_normal` compute
-        // `effective_steps`.
+        // applies — the step count `fit_headless`/`fit_normal` run to.
         let effective_total_steps = if config.max_steps == 0 {
             total_steps
         } else {
@@ -183,7 +182,6 @@ where
             device,
             global_step: start_step,
             row_layout,
-            total_steps,
             batch_size,
             steps_json_path,
             headless,
@@ -197,6 +195,7 @@ where
             base_learning_rate,
             effective_total_steps,
             mask_stats_logged: false,
+            last_loss: None,
         })
     }
 
@@ -204,14 +203,14 @@ where
     /// Returns (loss, grad_norm)
     ///
     /// # Gradient Clipping Strategy
-    /// Gradients are clipped in place by `boostr::optimizer::clip_grad_norm`, first
-    /// to `config.max_grad_norm` and then, optionally, to the tighter
-    /// `config.target_grad_norm`. Steps whose gradient norm is inf/NaN are skipped
-    /// entirely rather than clipped. The earlier loss-pre-scaling heuristic (a
-    /// workaround for Candle's lack of in-place gradient modification) is gone.
+    /// Gradients are clipped in place. `crate::grad_clip::clip_gradients` first
+    /// clamps each element to `config.max_grad_value` when that is set. It then
+    /// clips to `config.max_grad_norm`. The step then clips, optionally, to the
+    /// tighter `config.target_grad_norm`. A step whose gradient norm is inf/NaN
+    /// is skipped, not clipped.
     ///
-    /// Both clips norm over `self.parameter_ids` — the tensors the optimizer
-    /// actually steps, and now also the only keys the merged grad store holds.
+    /// The clips measure the norm over `self.parameter_ids`: the tensors the
+    /// optimizer steps, and the only keys the merged grad store holds.
     /// `backward_wrt` still retains the loss node's `dL/dL = 1` seed and every
     /// activation on a path to a trainable parameter, but that per-micro-batch
     /// store is filtered to `parameter_ids` on the way into the merged store
@@ -269,10 +268,6 @@ where
         // Profiling support - set PROFILE_TRAIN=1 to enable detailed timing
         let profile = std::env::var("PROFILE_TRAIN").is_ok();
         let step_start = if profile { Some(Instant::now()) } else { None };
-
-        // Note: max_grad_value (per-element clipping) is handled by FusedAdamW's built-in clamping (±1e4)
-        // Global gradient clipping and normalization are applied below before optimizer.step()
-        let _max_grad_value = self.config.max_grad_value;
 
         // Accumulated scaled-loss scalar across micro-batches, held as a plain
         // `Tensor` and never as a `Var`. A `Var` carries its `grad_fn`, and a
@@ -634,14 +629,15 @@ where
             None => grads,
         };
 
-        // 1. Clip by global norm using boostr AdamW's gradient utility.
-        // The function returns the original norm as its value.
+        // 1. Clip each element to `max_grad_value` (when set), then by global norm.
+        // The returned norm is the one the norm clip measured.
         let grad_norm_start = if profile { Some(Instant::now()) } else { None };
         let max_grad_norm = self.config.max_grad_norm;
-        let grad_norm = crate::prelude::compute_grad_norm(
+        let grad_norm = crate::grad_clip::clip_gradients(
             &self.client,
             &mut grads,
             &self.parameter_ids,
+            self.config.max_grad_value,
             max_grad_norm,
         )?;
         if let Some(start) = grad_norm_start {
@@ -716,7 +712,19 @@ where
         }
 
         self.global_step += 1;
-        Ok((total_loss_for_logging / accum_steps as f64, last_grad_norm))
+        let loss = total_loss_for_logging / accum_steps as f64;
+        self.last_loss = Some(loss);
+        Ok((loss, last_grad_norm))
+    }
+
+    /// The count of completed optimizer steps, resumed steps included.
+    pub fn global_step(&self) -> usize {
+        self.global_step
+    }
+
+    /// The loss of the last completed step. `None` before the first step.
+    pub fn last_loss(&self) -> Option<f64> {
+        self.last_loss
     }
 
     /// Get the current effective learning rate (accounting for warmup)
@@ -743,8 +751,7 @@ where
         model: &crate::model::LitGPT<R>,
         data_loader: &mut D,
     ) -> Result<()> {
-        // Save blazr-compatible config.json if it doesn't exist
-        // This enables the checkpoint to be used directly with blazr inference server
+        // Write the blazr-compatible config.json, so blazr can serve the checkpoint directly.
         self.save_blazr_config_if_needed();
 
         if self.headless {
@@ -754,7 +761,7 @@ where
         }
     }
 
-    /// Save blazr-compatible config.json to checkpoint directory (once only)
+    /// Write the blazr-compatible config.json to the checkpoint directory.
     fn save_blazr_config_if_needed(&self) {
         // Create checkpoint directory if it doesn't exist
         if !Path::new(&self.config.checkpoint_dir).exists() {
@@ -766,20 +773,23 @@ where
             }
         }
 
-        // Only save if config.json doesn't already exist
-        if !checkpoint_config_exists(&self.config.checkpoint_dir) {
-            match write_checkpoint_config(&self.model_config, &self.config.checkpoint_dir) {
-                Ok(()) => {
-                    if !self.headless {
-                        println!("📝 Saved config.json for blazr inference compatibility");
-                    }
-                }
-                Err(e) => {
-                    if !self.headless {
-                        eprintln!("Warning: Failed to save blazr config.json: {}", e);
-                    }
+        // config.json is rewritten at every start. It derives from the model
+        // config that this run's weights follow, so a stale file from an older
+        // oxidizr cannot disagree with the weights. Sidecars copy once.
+        let first_write = !checkpoint_config_exists(&self.config.checkpoint_dir);
+        match write_checkpoint_config(&self.model_config, &self.config.checkpoint_dir) {
+            Ok(()) => {
+                if !self.headless && first_write {
+                    println!("📝 Saved config.json for blazr inference compatibility");
                 }
             }
+            Err(e) => {
+                if !self.headless {
+                    eprintln!("Warning: Failed to save blazr config.json: {}", e);
+                }
+            }
+        }
+        if first_write {
             if let Err(e) = copy_checkpoint_sidecars(
                 &self.config.checkpoint_sidecars,
                 &self.config.checkpoint_dir,
@@ -799,11 +809,7 @@ where
         let training_start = Instant::now();
 
         // max_steps=0 means unlimited (train for full epochs)
-        let effective_steps = if self.config.max_steps == 0 {
-            self.total_steps
-        } else {
-            self.config.max_steps.min(self.total_steps)
-        };
+        let effective_steps = self.effective_total_steps;
 
         // Log warmup info if enabled
         if self.warmup_steps > 0 {
@@ -819,13 +825,12 @@ where
             let (loss, grad_norm) = match step_result {
                 Ok(result) => result,
                 Err(e) => {
-                    let err_msg = format!("{}", e);
-                    eprintln!(
-                        "{{\"error\": \"Training error at step {}\", \"message\": \"{}\"}}",
-                        step + 1,
-                        err_msg.replace('"', "'")
-                    );
-                    std::process::exit(1);
+                    let line = serde_json::json!({
+                        "error": format!("Training error at step {}", step + 1),
+                        "message": e.to_string(),
+                    });
+                    eprintln!("{line}");
+                    return Err(e);
                 }
             };
             let current_epoch = self.epoch_progress(step + 1);
@@ -853,6 +858,7 @@ where
 
                 println!("{{\"step\": {}, \"loss\": {:.4}, \"grad_norm\": {:.4}, \"learning_rate\": {:.6e}, \"epoch\": {:.2}, \"samples/s\": {:.2}, \"vram\": \"{}\"}}",
                     step + 1, loss, grad_norm, self.current_learning_rate(), current_epoch, samples_s, vram);
+                self.record_step(step + 1, loss, grad_norm, current_epoch);
             }
 
             let completed = step + 1;
@@ -871,9 +877,23 @@ where
         self.save_final_checkpoint(model)?;
 
         println!("{{\"status\": \"complete\"}}");
+        Ok(())
+    }
 
-        // Force exit to avoid CUDA cleanup hang (boostr/CubeCL resources)
-        std::process::exit(0);
+    /// Appends one step line to `steps.json`. Both output modes call this.
+    ///
+    /// A write error prints a warning and never stops the run.
+    fn record_step(&self, step: usize, loss: f64, grad_norm: f64, epoch: f64) {
+        let record = crate::run_record::StepRecord {
+            step,
+            loss,
+            grad_norm,
+            learning_rate: self.current_learning_rate(),
+            epoch,
+        };
+        if let Err(e) = record.append_to(Path::new(&self.steps_json_path)) {
+            eprintln!("Warning: {e}");
+        }
     }
 
     fn fit_normal<D: DataLoader<R>>(
@@ -882,19 +902,17 @@ where
         data_loader: &mut D,
     ) -> Result<()> {
         // Respect max_steps limit (0 = unlimited, train for full epochs)
-        let effective_steps = if self.config.max_steps == 0 {
-            self.total_steps
-        } else {
-            self.config.max_steps.min(self.total_steps)
-        };
+        let effective_steps = self.effective_total_steps;
 
         // MultiProgress: scrollable logs above, sticky progress bar below
         let mp = MultiProgress::new();
 
-        // Progress bar style - ETA calculated manually using rolling average
+        // Progress bar style - ETA calculated manually using rolling average.
+        // The template is a constant. On a template error the default bar
+        // still shows progress, so the run continues.
         let sty =
             ProgressStyle::with_template("{bar:40.cyan/dim} {pos:>7}/{len:7} [{elapsed}<{msg}")
-                .unwrap()
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
                 .progress_chars("━━─");
 
         let pb = mp.add(ProgressBar::new(effective_steps as u64));
@@ -956,9 +974,8 @@ where
                         mp.println(format!("   🔥 Error: {}", err_msg)).ok();
                     }
 
-                    // Force exit - CUDA cleanup can hang
                     mp.println("").ok();
-                    std::process::exit(1);
+                    return Err(e);
                 }
             };
             last_loss = loss;
@@ -986,20 +1003,7 @@ where
 
             // Silent log to file at intervals (no terminal output for steps)
             if step % self.config.log_interval == 0 || step == 0 {
-                let step_json = serde_json::json!({
-                    "step": step + 1,
-                    "loss": loss,
-                    "grad_norm": grad_norm,
-                    "learning_rate": self.current_learning_rate(),
-                    "epoch": current_epoch,
-                });
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.steps_json_path)
-                {
-                    let _ = writeln!(file, "{}", step_json);
-                }
+                self.record_step(step + 1, loss, grad_norm, current_epoch);
             }
 
             // Calculate ETA based on rolling average

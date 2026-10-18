@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::Write;
 
 #[cfg(feature = "audio")]
 use oxidizr::commands::PrepCorpusArgs;
@@ -102,7 +103,7 @@ enum Commands {
     Push(PushArgs),
 }
 
-fn main() -> Result<()> {
+fn main() {
     // Initialize logging
     env_logger::init();
 
@@ -127,8 +128,20 @@ fn main() -> Result<()> {
         default_hook(panic_info);
     }));
 
-    let cli = Cli::parse();
+    let result = run(Cli::parse());
+    if let Err(e) = &result {
+        eprintln!("Error: {e:?}");
+    }
+    // Commands write their records before they return, so exiting here loses
+    // nothing. `exit` skips destructors: GPU runtime teardown can block after
+    // training. Flush errors are ignored: the process ends next, with nothing
+    // left to report them to.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(oxidizr::run_record::exit_code(&result));
+}
 
+fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Commands::Train(args)) => commands::run_train(args),
         Some(Commands::Import(args)) => commands::run_import(args),
@@ -159,6 +172,7 @@ fn main() -> Result<()> {
                     max_checkpoints: cli.max_checkpoints,
                     dtype: cli.dtype,
                     checkpoint_dir: cli.checkpoint_dir,
+                    run_dir: None,
                 };
                 commands::run_train(args)
             } else {

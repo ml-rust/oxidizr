@@ -1,12 +1,11 @@
 use crate::checkpoint_set::{optimizer_path_for, weights_step, CheckpointLabel};
 use crate::data::DataPosition;
+use crate::data_hash::{hash_json, legacy_file_hash, legacy_hash_str, HashAlgo};
 use crate::schedule::LrSchedule;
 use boostr::model::{SpeechLayout, SpeechVocab};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 // Default value functions for serde
@@ -104,7 +103,9 @@ pub struct OxidizrModelConfig {
     // MoE (Mixture of Experts) config
     pub num_experts: Option<usize>,
     pub experts_per_tok: Option<usize>,
-    #[allow(dead_code)] // Phase 2: Implement sparse MoE with shared expert routing
+    /// Whether each MoE layer holds a shared expert that every token passes
+    /// through. `None` means `true`. With `false` the model has no
+    /// `moe.shared_expert.*` tensors, and the exported `config.json` says so.
     pub shared_expert_enabled: Option<bool>,
     pub intermediate_size: Option<usize>,
 
@@ -604,10 +605,14 @@ pub struct TrainerConfig {
     pub target_grad_norm: Option<f64>, // Target gradient normalization (None = disabled)
     // If set, normalize gradients to this target norm
     // Good values: 1.0 - 5.0
+    /// Per-element gradient clip. `None` (the default) disables it.
+    ///
+    /// Each gradient element is clamped to `[-max, +max]` first. The global
+    /// norm clip to `max_grad_norm` then runs on the clamped gradients. This is
+    /// PyTorch's `clip_grad_value_` followed by `clip_grad_norm_`. A set value
+    /// must be finite and positive. Typical values: 1.0 to 10.0.
     #[serde(default = "default_max_grad_value")]
-    pub max_grad_value: Option<f64>, // Per-element gradient clipping (None = disabled)
-    // Clips individual gradient values to [-max, +max]
-    // Good values: 1.0 - 10.0
+    pub max_grad_value: Option<f64>,
 
     // -------------------------------------------------------------------------
     // AdamW Optimizer Hyperparameters (from optimization.md "Golden Recipe")
@@ -708,12 +713,8 @@ pub struct TrainerConfig {
     /// epoch. See [`crate::data::RowOrder`].
     #[serde(default = "default_shuffle_rows")]
     pub shuffle_rows: bool,
-
-    // GRPO (Group Relative Policy Optimization) config - Phase 2
-    #[allow(dead_code)] // Phase 2: GRPO implementation
-    pub group_size: usize, // Number of rollouts per prompt (e.g., 4 or 8)
-    #[allow(dead_code)] // Phase 2: GRPO implementation
-    pub beta_kl: f64, // KL penalty coefficient (e.g., 0.04)
+    // Unknown keys are ignored, as serde does for every config struct here.
+    // Older configs carry `group_size` and `beta_kl`, which no trainer reads.
 }
 
 impl LitConfig {
@@ -765,6 +766,7 @@ impl LitConfig {
         crate::checkpoint_sidecars::validate_checkpoint_sidecars(
             &self.trainer.checkpoint_sidecars,
         )?;
+        crate::grad_clip::check_max_grad_value(self.trainer.max_grad_value)?;
 
         // Mamba2 constraint: hidden_size * expand == num_heads * head_dim
         if let (Some(num_heads), Some(head_dim), Some(expand)) = (
@@ -939,8 +941,6 @@ impl LitConfig {
                 seed: None,
                 target_mask: None,
                 shuffle_rows: true,
-                group_size: 4, // GRPO: 4 rollouts per prompt
-                beta_kl: 0.04, // GRPO: KL penalty coefficient
             },
         }
     }
@@ -1032,8 +1032,6 @@ impl LitConfig {
                 seed: None,
                 target_mask: None,
                 shuffle_rows: true,
-                group_size: 4, // GRPO: 4 rollouts per prompt
-                beta_kl: 0.04, // GRPO: KL penalty coefficient
             },
         }
     }
@@ -1061,6 +1059,11 @@ pub struct CheckpointMeta {
     /// a checkpoint restarts the Adam moments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optimizer_file: Option<String>,
+    /// Algorithm of `model_config_hash` and `data_file_hash`. A meta without
+    /// this key is `legacy`: its data hash cannot be checked, and a resume
+    /// from it warns instead.
+    #[serde(default = "HashAlgo::legacy")]
+    pub hash_algo: HashAlgo,
 }
 
 fn default_dtype_string() -> String {
@@ -1098,6 +1101,7 @@ impl CheckpointMeta {
             dtype: model_config.dtype.to_string(),
             data_position,
             optimizer_file: None,
+            hash_algo: HashAlgo::Fnv1a64,
         })
     }
 
@@ -1131,17 +1135,36 @@ impl CheckpointMeta {
         model_config: &OxidizrModelConfig,
         data_file_path: &str,
     ) -> anyhow::Result<CheckpointValidation> {
-        let current_model_hash = compute_model_config_hash(model_config);
-        let current_data_hash = compute_file_hash(data_file_path)?;
+        // A legacy model hash is recomputed the legacy way, so an old meta
+        // still matches under the toolchain that wrote it.
+        let current_model_hash = match self.hash_algo {
+            HashAlgo::Fnv1a64 => compute_model_config_hash(model_config),
+            HashAlgo::Legacy => legacy_model_config_hash(model_config),
+        };
         let current_dtype = model_config.dtype.to_string();
-
         let model_matches = self.model_config_hash == current_model_hash;
-        let data_matches = self.data_file_hash == current_data_hash;
+
+        // A legacy data hash that differs can mean another file or another
+        // Rust release. The two cannot be told apart, so the resume goes ahead
+        // unchecked, and `data_check_warning` says so.
+        let (current_data_hash, data_checked, data_matches) = match self.hash_algo {
+            HashAlgo::Fnv1a64 => {
+                let hash = compute_file_hash(data_file_path)?;
+                let matches = self.data_file_hash == hash;
+                (hash, true, matches)
+            }
+            HashAlgo::Legacy => {
+                let hash = legacy_file_hash(data_file_path)?;
+                let checked = self.data_file_hash == hash;
+                (hash, checked, true)
+            }
+        };
         let dtype_matches = self.dtype == current_dtype;
 
         Ok(CheckpointValidation {
             model_matches,
             data_matches,
+            data_checked,
             dtype_matches,
             checkpoint_model_hash: self.model_config_hash.clone(),
             current_model_hash,
@@ -1158,6 +1181,8 @@ impl CheckpointMeta {
 pub struct CheckpointValidation {
     pub model_matches: bool,
     pub data_matches: bool,
+    /// False when a legacy meta's data hash differs: `data_matches` is then true unchecked.
+    pub data_checked: bool,
     pub dtype_matches: bool,
     pub checkpoint_model_hash: String,
     pub current_model_hash: String,
@@ -1172,6 +1197,16 @@ impl CheckpointValidation {
     /// dtype mismatch is allowed (weights will be converted)
     pub fn is_valid(&self) -> bool {
         self.model_matches && self.data_matches
+    }
+
+    /// The warning for a resume whose data file was not checked, if any.
+    pub fn data_check_warning(&self) -> Option<String> {
+        (!self.data_checked).then(|| {
+            "⚠️  Checkpoint metadata predates stable data hashes, and its data hash differs: \
+             the data file is unchecked. Resuming anyway. Pass the data file the \
+             checkpoint trained on."
+                .to_string()
+        })
     }
 }
 
@@ -1193,42 +1228,33 @@ impl CheckpointValidation {
 /// here. A new field that reaches the hash changes it for every existing
 /// checkpoint, so resume validation reports a model mismatch on weights that
 /// are in fact compatible.
+///
+/// The hash is FNV-1a over canonical JSON (see [`crate::data_hash`]), stable
+/// across Rust releases.
 pub fn compute_model_config_hash(config: &OxidizrModelConfig) -> String {
-    // Create a JSON Value and remove non-architecture fields before hashing
+    hash_json(&architecture_json(config))
+}
+
+/// The model config hash as metas without `hash_algo` stored it.
+///
+/// It hashes the plain JSON text with `DefaultHasher`. A Rust release can
+/// change that output, so only the resume check of an old meta calls this.
+pub fn legacy_model_config_hash(config: &OxidizrModelConfig) -> String {
+    legacy_hash_str(&serde_json::to_string(&architecture_json(config)).unwrap_or_default())
+}
+
+/// `config` as JSON without the fields that do not describe the architecture.
+fn architecture_json(config: &OxidizrModelConfig) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(ref mut map) = value {
         map.remove("name");
         map.remove("tokenizer_vocab");
         map.remove("grow_vocab");
     }
-    let json = serde_json::to_string(&value).unwrap_or_default();
-    let mut hasher = DefaultHasher::new();
-    json.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    value
 }
 
-/// Compute hash of a file (first 1MB + file size for speed)
-pub fn compute_file_hash(path: &str) -> anyhow::Result<String> {
-    let mut file = fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    let file_size = metadata.len();
-
-    // Read up to the first 1 MB for hashing (fast for large files).
-    //
-    // The parenthesis matters: `.min()` binds tighter than `*`, so
-    // `1024 * 1024.min(file_size)` is `1024 * (1024.min(file_size))`, which for
-    // any file at least 1024 bytes long asks for a full 1 MB regardless of the
-    // file's real size — and `read_exact` then fails with "failed to fill whole
-    // buffer" on every dataset smaller than 1 MB.
-    let mut buffer = vec![0u8; (1024 * 1024).min(file_size as usize)];
-    file.read_exact(&mut buffer)?;
-
-    let mut hasher = DefaultHasher::new();
-    buffer.hash(&mut hasher);
-    file_size.hash(&mut hasher);
-
-    Ok(format!("{:016x}", hasher.finish()))
-}
+pub use crate::data_hash::compute_file_hash;
 
 // The checkpoint-directory `config.json` blazr reads is written by
 // `crate::checkpoint_config::write_checkpoint_config`, as boostr's own

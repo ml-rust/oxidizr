@@ -101,6 +101,8 @@ Enable Mixture of Experts:
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `load_balance_alpha` | MoE load balancing weight | 0.0 |
+| `max_grad_norm` | Global gradient norm clip | 1.0 |
+| `max_grad_value` | Per-element gradient clamp, applied before the norm clip. Must be finite and positive. Omit to disable. | none |
 
 ## Complete Example
 

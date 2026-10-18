@@ -56,10 +56,6 @@ trainer:
   save_interval: 100
   load_balance_alpha: 0.01 # For MoE load balancing
 
-  # GRPO (Group Relative Policy Optimization) config - Phase 2
-  group_size: 4 # Number of rollouts per prompt
-  beta_kl: 0.04 # KL penalty coefficient
-
   max_grad_norm: 10.0 # Stable with warmup
   target_grad_norm: null # Disabled - use standard max_grad_norm clipping only
   max_grad_value: null # Per-element clipping disabled

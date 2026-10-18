@@ -61,6 +61,3 @@ trainer:
   log_interval: 10
   save_interval: 500
   load_balance_alpha: 0.0
-
-  group_size: 4
-  beta_kl: 0.04

@@ -126,6 +126,3 @@ trainer:
   warmup_ratio: null
 
   seed: 42
-
-  group_size: 4
-  beta_kl: 0.04

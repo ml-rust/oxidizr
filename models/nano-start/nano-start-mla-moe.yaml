@@ -69,5 +69,3 @@ trainer:
 
   warmup_steps: null
   warmup_ratio: null
-  group_size: 4
-  beta_kl: 0.04
