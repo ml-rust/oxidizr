@@ -1,9 +1,11 @@
 use crate::checkpoint_set::{optimizer_path_for, weights_step, CheckpointLabel};
 use crate::data::DataPosition;
 use crate::data_hash::{hash_json, legacy_file_hash, legacy_hash_str, HashAlgo};
+use crate::loss_scale::{resolve_loss_scale, LossScaleConfig};
 use crate::schedule::{LrDecayShape, LrSchedule};
 use crate::weight_decay::WeightDecayRule;
 use boostr::model::{SpeechLayout, SpeechVocab};
+use boostr::optimizer::GradScalerState;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -746,6 +748,14 @@ pub struct TrainerConfig {
     /// epoch. See [`crate::data::RowOrder`].
     #[serde(default = "default_shuffle_rows")]
     pub shuffle_rows: bool,
+
+    /// Dynamic loss scaling. f16 only: under bf16 or f32 the key is an error.
+    ///
+    /// An f16 run without the key scales with the defaults of
+    /// [`LossScaleConfig`]. `skip_serializing_if` keeps the key out of
+    /// serialized configs while unset, so existing configs serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_scale: Option<LossScaleConfig>,
     // Unknown keys are ignored, as serde does for every config struct here.
     // Older configs carry `group_size` and `beta_kl`, which no trainer reads.
 }
@@ -800,6 +810,8 @@ impl LitConfig {
             &self.trainer.checkpoint_sidecars,
         )?;
         crate::grad_clip::check_max_grad_value(self.trainer.max_grad_value)?;
+        // `--dtype` can change the precision later. The trainer checks the final one again.
+        resolve_loss_scale(self.trainer.loss_scale.as_ref(), self.model.dtype)?;
         // A fresh run's rule. A resume checks its inherited rule again in train.
         crate::weight_decay::resolve_weight_decay(&self.trainer, None, true)?;
 
@@ -961,6 +973,7 @@ impl LitConfig {
                 seed: None,
                 target_mask: None,
                 shuffle_rows: true,
+                loss_scale: None,
             },
         }
     }
@@ -1057,6 +1070,7 @@ impl LitConfig {
                 seed: None,
                 target_mask: None,
                 shuffle_rows: true,
+                loss_scale: None,
             },
         }
     }
@@ -1098,6 +1112,11 @@ pub struct CheckpointMeta {
     /// `trainer.no_decay_patterns` of that run. Empty when it set none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub no_decay_patterns: Vec<String>,
+    /// Loss scale and clean-step count of an f16 run after `step` steps. A
+    /// resume continues from it. Absent for bf16 and f32 runs, and in metadata
+    /// written before loss scaling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_scale: Option<GradScalerState>,
 }
 
 fn default_dtype_string() -> String {
@@ -1138,6 +1157,7 @@ impl CheckpointMeta {
             hash_algo: HashAlgo::Fnv1a64,
             weight_decay_rule: None,
             no_decay_patterns: Vec::new(),
+            loss_scale: None,
         })
     }
 

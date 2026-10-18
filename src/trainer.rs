@@ -6,13 +6,14 @@ use crate::checkpoint_set::{
 use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
 use crate::config::{OxidizrModelConfig, TrainerConfig};
 use crate::data::{DataLoader, DataPosition, RowLayout};
+use crate::loss_scale::{resolve_loss_scale, restore_loss_scale, weighted_loss, LossScaler};
 use crate::prelude::{DType, Error, FusedAdamW, Result, Tensor};
 use crate::schedule::LrPlan;
 use crate::step_loss::StepWeighting;
 use crate::weight_decay::{DecayPlan, WeightDecaySpec};
 use boostr::autograd::{backward_wrt, var_add, var_mul_scalar, var_reshape, GradStore, Var};
 use boostr::ops::{FusedOptimizerOps, TensorOps};
-use boostr::optimizer::AdamWConfig;
+use boostr::optimizer::{AdamWConfig, GradScalerState};
 use boostr::readback::scalar_f32;
 use boostr::runtime::{Runtime, RuntimeClient};
 use boostr::tensor::TensorId;
@@ -82,6 +83,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     mask_stats_logged: bool,
     /// Loss of the last completed step, for the run record.
     last_loss: Option<f64>,
+    /// Dynamic loss scaling. `Some` exactly when the model trains in f16.
+    loss_scaler: Option<LossScaler>,
 }
 
 impl<'a, R> LitTrainer<'a, R>
@@ -145,6 +148,10 @@ where
         let total_steps = row_layout.total_steps(config.gradient_accumulation, config.num_epochs);
 
         let lr_plan = LrPlan::new(&config, total_steps)?;
+        // The final dtype, after any `--dtype` override.
+        let loss_scaler = resolve_loss_scale(config.loss_scale.as_ref(), model_config.dtype)?
+            .map(LossScaler::new)
+            .transpose()?;
 
         Ok(Self {
             config,
@@ -169,6 +176,7 @@ where
             lr_plan,
             mask_stats_logged: false,
             last_loss: None,
+            loss_scaler,
         })
     }
 
@@ -210,6 +218,13 @@ where
     /// weights every scored token of the step by `1 / total`. An unmasked step
     /// keeps the per-micro-batch mean. Either way the cross-entropy part of
     /// the reported loss is the per-token mean over the step.
+    ///
+    /// # Loss Scaling
+    /// An f16 run multiplies each backward loss by the loss scale on top of
+    /// that weighting. After accumulation, every gradient is widened to f32
+    /// and divided by the scale, before any clip. A non-finite norm skips the
+    /// optimizer step, so its timestep stays put, and the scale backs off.
+    /// The step still draws its batches. The reported loss and norm are unscaled.
     pub fn training_step<D: DataLoader<R>>(
         &mut self,
         model: &crate::model::LitGPT<R>,
@@ -442,14 +457,16 @@ where
                 }
             }
 
-            // Scale loss for gradient accumulation
-            let scaled_loss = var_mul_scalar(&loss, 1.0 / accum_steps as f64, &self.client)?;
+            // Scale loss for gradient accumulation. Under f16 the backward
+            // loss also carries the loss scale. The logged loss never does.
+            let (logged_loss, scaled_loss) =
+                weighted_loss(&loss, accum_steps, self.loss_scaler.as_ref(), &self.client)?;
 
             // Only the scalar tensor is kept, never the `Var`, so nothing here
             // pins this micro-batch's graph.
             accumulated_loss = Some(accumulate_loss_scalar(
                 accumulated_loss,
-                scaled_loss.tensor(),
+                &logged_loss,
                 &self.client,
             )?);
 
@@ -601,6 +618,12 @@ where
             }
         }
 
+        // 0. Undo the loss scale before any clip, so every clip and the
+        // reported norm see true gradients.
+        if let Some(scaler) = &self.loss_scaler {
+            scaler.unscale(&self.client, &mut grads, &self.parameter_ids)?;
+        }
+
         // 1. Clip each element to `max_grad_value` (when set), then by global norm.
         // The returned norm is the one the norm clip measured.
         let grad_norm_start = if profile { Some(Instant::now()) } else { None };
@@ -633,14 +656,18 @@ where
             self.print_gradient_breakdown(&grads);
         }
 
-        // 2. Skip step if gradient norm is invalid (inf/NaN)
-        if grad_norm.is_infinite() || grad_norm.is_nan() {
-            eprintln!(
-                "[GradClip] Skipping step {} - gradient norm: {}",
-                self.global_step + 1,
-                grad_norm
-            );
-            self.diagnose_bad_gradients(&grads);
+        // 2. Skip step if gradient norm is invalid (inf/NaN). Under loss
+        // scaling this is the overflow signal: the scale backs off below.
+        let overflow = !grad_norm.is_finite();
+        if overflow {
+            if self.loss_scaler.is_none() {
+                eprintln!(
+                    "[GradClip] Skipping step {} - gradient norm: {}",
+                    self.global_step + 1,
+                    grad_norm
+                );
+                self.diagnose_bad_gradients(&grads);
+            }
             last_grad_norm = grad_norm;
         } else {
             // 3. Optional tighter target norm clipping delegates to the same boostr utility.
@@ -671,6 +698,19 @@ where
             } else {
                 grad_norm.min(max_grad_norm)
             };
+        }
+
+        if let Some(scaler) = self.loss_scaler.as_mut() {
+            let scale = scaler.scale();
+            scaler.record_step(overflow);
+            if overflow {
+                eprintln!(
+                    "[LossScale] Skipping step {}: gradient norm {grad_norm} at loss scale \
+                     {scale}. The scale backs off to {}.",
+                    self.global_step + 1,
+                    scaler.scale()
+                );
+            }
         }
 
         // Store gradient norm for monitoring/logging (no longer used for pre-scaling)
@@ -1152,6 +1192,7 @@ where
             optimizer: &self.optimizer,
             name_maps: &self.name_maps,
             weight_decay: self.decay_plan.spec(),
+            loss_scale: self.loss_scale_state(),
         })
     }
 
@@ -1160,12 +1201,25 @@ where
         apply_optimizer_resume(&mut self.optimizer, &self.name_maps, &self.device, plan)
     }
 
+    /// Continues the loss scale from a resumed checkpoint's `saved` state.
+    ///
+    /// See [`restore_loss_scale`] for the cases without a scaler or a state.
+    pub fn restore_loss_scale(&mut self, saved: Option<GradScalerState>) -> Result<()> {
+        restore_loss_scale(self.loss_scaler.as_mut(), saved, self.start_step)
+    }
+
+    /// Loss scale and clean-step count. `None` when the run does not scale.
+    pub fn loss_scale_state(&self) -> Option<GradScalerState> {
+        self.loss_scaler.as_ref().map(LossScaler::state)
+    }
+
     /// The weight decay rule and the no-decay set of this run.
     pub fn decay_plan(&self) -> &DecayPlan {
         &self.decay_plan
     }
 
-    /// The optimizer's step count. A step skipped for a non-finite norm does not count.
+    /// The optimizer's step count. A step skipped for a non-finite norm,
+    /// a loss scale overflow included, does not count.
     pub fn optimizer_timestep(&self) -> u64 {
         self.optimizer.timestep()
     }

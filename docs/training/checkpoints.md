@@ -82,7 +82,7 @@ Each checkpoint is a set of three files in `checkpoint_dir`:
 |------|---------|
 | `<prefix>_step_N.safetensors` | Model weights after N completed optimizer steps |
 | `<prefix>_step_N.optimizer.safetensors` | AdamW state: `exp_avg`, `exp_avg_sq`, `master` per trainable tensor, and `__step` |
-| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, and `no_decay_patterns` when set |
+| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, `no_decay_patterns` when set, and `loss_scale` for an f16 run |
 
 The end of a run writes the same set as `<prefix>_final.safetensors`,
 `<prefix>_final.optimizer.safetensors` and `checkpoint_final.meta.json`.
@@ -108,6 +108,8 @@ When resuming:
    same rows, in the same shuffled order, as an uninterrupted run.
 5. The weight decay rule comes from the meta's `weight_decay_rule` and
    `no_decay_patterns`, unless the config sets them.
+6. An f16 run continues the loss scale from the meta's `loss_scale`: the
+   `scale` and the `consecutive_ok` clean-step count.
 
 With all three files, the resumed run matches an uninterrupted run exactly.
 The training step uses no random state, so no RNG state is saved.
@@ -119,6 +121,14 @@ as `decay_all`. A config key that differs from the meta prints a warning, and
 the resume is not exact. Under `--headless` the mismatch stops the run. A
 resume without a meta uses `decay_all`. A resume at step 0 uses the config
 rule, `skip_1d` by default. See [Weight Decay](../configuration.md#weight-decay).
+
+The loss scale is run state outside the optimizer file. The meta records it
+for f16 runs only, so bf16 and f32 metas are unchanged. The scaler's growth
+and backoff rules come from the current config. A meta without `loss_scale`
+under an f16 run restarts the scale at `loss_scale.initial` with a warning.
+That resume is not exact. A meta with `loss_scale` under a bf16 or f32 run
+drops the state with a warning. See
+[Loss Scaling](../configuration.md#loss-scaling-f16).
 
 `--resume <dir>/<prefix>_final.safetensors` resumes at the step that
 `checkpoint_final.meta.json` records.

@@ -120,6 +120,37 @@ The unmasked path keeps the old mean form on purpose. The sum form gives the sam
 | `max_grad_norm` | Global gradient norm clip | 1.0 |
 | `max_grad_value` | Per-element gradient clamp, applied before the norm clip. Must be finite and positive. Omit to disable. | none |
 
+### Loss Scaling (f16)
+
+f16 has a 5-bit exponent, so gradients below about `6e-8` flush to zero. An f16 run scales its loss to keep them. bf16 and f32 share f32's exponent range and need no scaling.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `loss_scale.initial` | Starting scale. Finite and positive | 65536 |
+| `loss_scale.growth_factor` | Scale multiplier after `growth_interval` clean steps. Finite and above 1 | 2 |
+| `loss_scale.backoff_factor` | Scale multiplier on an overflow step. Above 0 and below 1 | 0.5 |
+| `loss_scale.growth_interval` | Clean steps in a row before the scale grows. At least 1 | 2000 |
+
+Rules:
+
+- `model.dtype: f16` always scales. Without the `trainer.loss_scale` key, the run uses the defaults above. A partial block fills the other keys with their defaults.
+- `trainer.loss_scale` under `bf16` or `f32` is an error that names the key and the dtype. The check uses the final dtype, after `--dtype`.
+- The trainer multiplies each backward loss by the scale, on top of the `1 / gradient_accumulation` or `1 / total` weighting.
+- After accumulation, every gradient widens to f32 and is divided by the scale. `max_grad_value`, `max_grad_norm` and `target_grad_norm` then apply to the unscaled gradients.
+- A non-finite gradient norm is an overflow. The step skips the optimizer, so the parameters and the AdamW step count stay unchanged. The scale backs off, and a stderr line reports it. The step still draws its batches, so the data position stays valid.
+- The loss and `grad_norm` in logs and `steps.json` are unscaled. An overflow step reports a non-finite `grad_norm`.
+
+```yaml
+model:
+  dtype: f16
+trainer:
+  loss_scale:
+    initial: 65536
+    growth_interval: 1000   # other keys keep their defaults
+```
+
+The checkpoint meta records the scale, so a resume continues it exactly. See [Resume Behavior](training/checkpoints.md#resume-behavior).
+
 ### Learning Rate Schedule
 
 Warmup runs first. Step `s` of `W` warmup steps applies `learning_rate * (s + 1) / W`, at least `1e-7`. The schedule covers every later step up to the run's last step `T`. `T` is `max_steps`, capped by the steps in `num_epochs` epochs.

@@ -18,6 +18,7 @@ pub mod data;
 pub mod data_hash;
 pub mod distributed;
 pub mod grad_clip;
+pub mod loss_scale;
 pub mod model;
 pub mod prelude;
 pub mod run_record;

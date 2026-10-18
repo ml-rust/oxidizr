@@ -89,6 +89,7 @@ fn trainer_config(seed: Option<u64>) -> TrainerConfig {
         seed,
         target_mask: None,
         shuffle_rows: true,
+        loss_scale: None,
     }
 }
 

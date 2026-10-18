@@ -23,6 +23,7 @@ use crate::config::{
 use crate::data::{
     create_dummy_data, DataPosition, LitDataLoader, PrefetchDataLoader, RowLayout, RowOrder,
 };
+use crate::loss_scale::{read_loss_scale_state, resolve_loss_scale};
 use crate::model::LitGPT;
 use crate::trainer::{LitTrainer, TrainerRunConfig};
 use crate::weight_decay::{inherited_weight_decay, resolve_weight_decay};
@@ -533,6 +534,16 @@ where
             config.model.dtype
         );
     }
+    // The dtype is final here, so a block under bf16 or f32 fails before the model builds.
+    let loss_scale = resolve_loss_scale(config.trainer.loss_scale.as_ref(), config.model.dtype)?;
+    if let Some(scale) = loss_scale {
+        if !headless {
+            println!(
+                "Loss scaling on: initial {}, growth {}x every {} clean steps, backoff {}x",
+                scale.initial, scale.growth_factor, scale.growth_interval, scale.backoff_factor
+            );
+        }
+    }
 
     if !headless {
         println!("Configuration loaded successfully!\n");
@@ -721,6 +732,7 @@ where
     )?;
     // The config's weight decay rule, or the rule of the checkpoint this run resumes.
     let inherited_decay = inherited_weight_decay(resume_meta_path.as_deref(), start_step)?;
+    let loss_scale_state = read_loss_scale_state(resume_meta_path.as_deref(), start_step)?;
     let weight_decay = resolve_weight_decay(&config.trainer, inherited_decay.as_ref(), headless)?;
 
     if !headless {
@@ -896,6 +908,7 @@ where
         },
     )?;
     trainer.apply_optimizer_resume(&optimizer_resume)?;
+    trainer.restore_loss_scale(loss_scale_state)?;
     // Headless stdout carries JSON metrics only.
     let decay_summary = trainer.decay_plan().summary(config_trainer.weight_decay);
     if headless {

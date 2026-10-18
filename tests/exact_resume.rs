@@ -6,6 +6,7 @@
 
 mod common;
 
+use boostr::optimizer::GradScalerState;
 use boostr::CpuRuntime;
 use common::{
     bits_by_name, build_model, data_loader, scratch_dir, tiny_config, tiny_model_config,
@@ -17,6 +18,7 @@ use oxidizr::checkpoint_set::{
 };
 use oxidizr::config::{find_latest_checkpoint, CheckpointMeta, LitConfig};
 use oxidizr::data::DataPosition;
+use oxidizr::loss_scale::read_loss_scale_state;
 use oxidizr::model::{load_checkpoint_into_model, LitGPT};
 use oxidizr::trainer::LitTrainer;
 use oxidizr::weight_decay::{
@@ -78,6 +80,11 @@ struct Resumed {
     timestep_after_load: u64,
     /// Tensors in the no-decay group of the resumed trainer.
     no_decay_tensors: usize,
+    /// Loss scaler state right after the resume, before any step.
+    loss_scale_after_load: Option<GradScalerState>,
+    /// Optimizer step count and loss scaler state after step `STEPS`.
+    timestep_after_run: u64,
+    loss_scale_after_run: Option<GradScalerState>,
 }
 
 /// Resume from `weights` as `commands::train` does, then train to `STEPS`.
@@ -97,20 +104,33 @@ fn resume(cfg: &LitConfig, weights: &str, meta: Option<&str>, start_step: usize)
     let mut loader = data_loader(cfg);
     let layout = loader.row_layout().expect("row layout");
     loader.seek(position).expect("seek");
-    let (timestep_after_load, no_decay_tensors) = {
+    // The loss scale comes from the meta, as `commands::train` restores it.
+    let saved_scale = read_loss_scale_state(meta, start_step).expect("loss scale state");
+    let (timestep_after_load, no_decay_tensors, loss_scale_after_load, after_run) = {
         let mut t = trainer_with_decay(cfg, &mut parts, layout, start_step, position, weight_decay);
         t.apply_optimizer_resume(&plan).expect("apply plan");
+        t.restore_loss_scale(saved_scale)
+            .expect("restore loss scale");
         let timestep = t.optimizer_timestep();
         let no_decay = t.decay_plan().no_decay_ids().len();
+        let scale = t.loss_scale_state();
         for _ in start_step..STEPS {
             t.training_step(&model, &mut loader).expect("training step");
         }
-        (timestep, no_decay)
+        (
+            timestep,
+            no_decay,
+            scale,
+            (t.optimizer_timestep(), t.loss_scale_state()),
+        )
     };
     Resumed {
         bits: bits_by_name(&parts),
         timestep_after_load,
         no_decay_tensors,
+        loss_scale_after_load,
+        timestep_after_run: after_run.0,
+        loss_scale_after_run: after_run.1,
     }
 }
 
@@ -324,5 +344,102 @@ fn tied_model_names_each_trainable_tensor_once() {
     );
     assert!(maps.ids().contains_key("model.embed_tokens.weight"));
     assert!(!maps.ids().contains_key("lm_head.weight"));
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The f16 loss scale of [`f16_run`]. Three clean steps at a small scale,
+/// then a growth to `2^18`. Step 4 scales its backward loss by `2^17`, past
+/// f16's maximum, so it must overflow, skip and back off.
+#[cfg(feature = "f16")]
+fn f16_loss_scale() -> oxidizr::loss_scale::LossScaleConfig {
+    oxidizr::loss_scale::LossScaleConfig {
+        initial: 16.0,
+        growth_factor: 16384.0,
+        backoff_factor: 0.5,
+        growth_interval: 3,
+    }
+}
+
+#[cfg(feature = "f16")]
+fn f16_run(cfg: &mut LitConfig) {
+    cfg.model.dtype = oxidizr::config::DTypePrecision::F16;
+    cfg.trainer.loss_scale = Some(f16_loss_scale());
+}
+
+#[cfg(feature = "f16")]
+#[test]
+fn an_f16_run_resumes_bit_identical_with_its_loss_scale() {
+    let (cfg, reference, dir) = reference_and_stopped_run_with("resume-f16", f16_run);
+    let mut reference_end = (0, None);
+    let again = train_fresh(&cfg, STEPS, |t, _| {
+        reference_end = (t.optimizer_timestep(), t.loss_scale_state());
+    });
+    assert_eq!(reference, again, "two uninterrupted f16 runs differ");
+    assert!(
+        reference_end.0 < STEPS as u64,
+        "step 4 must overflow and skip: timestep {}",
+        reference_end.0
+    );
+
+    let meta = dir
+        .join(CheckpointLabel::Step(HALF).meta_file_name())
+        .to_string_lossy()
+        .into_owned();
+    let saved = CheckpointMeta::load(&meta).expect("meta").loss_scale;
+    let grown = GradScalerState {
+        scale: 16.0 * 16384.0,
+        consecutive_ok: 0,
+    };
+    assert_eq!(
+        saved,
+        Some(grown),
+        "three clean steps must grow the scale once"
+    );
+
+    let weights = weights_path(&cfg, &dir, CheckpointLabel::Step(HALF));
+    let resumed = resume(&cfg, &weights, Some(&meta), HALF);
+    assert_eq!(resumed.loss_scale_after_load, Some(grown));
+    assert_eq!(resumed.timestep_after_load, HALF as u64);
+    assert_eq!(resumed.timestep_after_run, reference_end.0);
+    assert_eq!(resumed.loss_scale_after_run, reference_end.1);
+    assert_identical(&reference, &resumed.bits);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Without the saved state the scale restarts small, step 4 does not
+/// overflow, and the run differs: the restore is what makes the resume exact.
+#[cfg(feature = "f16")]
+#[test]
+fn an_f16_meta_without_loss_scale_state_resumes_inexact() {
+    let (cfg, reference, dir) = reference_and_stopped_run_with("resume-f16-old", f16_run);
+    let meta_path = dir.join(CheckpointLabel::Step(HALF).meta_file_name());
+    let mut meta = CheckpointMeta::load(&meta_path.to_string_lossy()).expect("meta");
+    meta.loss_scale = None;
+    meta.save_to(&meta_path).expect("rewrite meta");
+    let text = fs::read_to_string(&meta_path).expect("read meta");
+    assert!(!text.contains("loss_scale"), "{text}");
+
+    let weights = weights_path(&cfg, &dir, CheckpointLabel::Step(HALF));
+    let meta = meta_path.to_string_lossy().into_owned();
+    let resumed = resume(&cfg, &weights, Some(&meta), HALF);
+    assert_eq!(
+        resumed.loss_scale_after_load,
+        Some(GradScalerState {
+            scale: 16.0,
+            consecutive_ok: 0
+        })
+    );
+    assert!(reference
+        .iter()
+        .any(|(n, b)| resumed.bits.get(n) != Some(b)));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_f32_meta_records_no_loss_scale() {
+    let (_, _, dir) = reference_and_stopped_run("resume-f32-no-scale");
+    let meta_path = dir.join(CheckpointLabel::Step(HALF).meta_file_name());
+    let text = fs::read_to_string(&meta_path).expect("read meta");
+    assert!(!text.contains("loss_scale"), "{text}");
     let _ = fs::remove_dir_all(dir);
 }

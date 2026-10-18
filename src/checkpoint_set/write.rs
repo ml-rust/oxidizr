@@ -9,6 +9,7 @@ use crate::model::{save_checkpoint_from_params, LitGPT};
 use crate::prelude::{DType, FusedAdamW, Result, Tensor};
 use crate::weight_decay::WeightDecaySpec;
 use boostr::ops::TensorOps;
+use boostr::optimizer::GradScalerState;
 use boostr::runtime::{Runtime, RuntimeClient};
 use boostr::tensor::TensorId;
 use boostr::TypeConversionOps;
@@ -37,6 +38,8 @@ pub struct CheckpointSave<'a, R: Runtime<DType = DType>> {
     pub name_maps: &'a NameMaps,
     /// Weight decay rule of the run, recorded in the meta for a resume to inherit.
     pub weight_decay: &'a WeightDecaySpec,
+    /// Loss scaler state after `step` steps. `None` for a run without loss scaling.
+    pub loss_scale: Option<GradScalerState>,
 }
 
 /// Write the optimizer state, then the weights, then the meta.
@@ -76,6 +79,7 @@ where
         meta.optimizer_file = Some(optimizer_name);
         meta.weight_decay_rule = Some(save.weight_decay.rule);
         meta.no_decay_patterns = save.weight_decay.no_decay_patterns.clone();
+        meta.loss_scale = save.loss_scale;
         meta.save_to(&meta_path)
     });
     if let Err(e) = written {

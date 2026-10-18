@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use boostr::tensor::TensorId;
-use boostr::{CpuClient, CpuDevice, CpuRuntime, Tensor, VarMap};
+use boostr::{CpuClient, CpuDevice, CpuRuntime, DType, Tensor, TypeConversionOps, VarMap};
 use oxidizr::config::{
     DTypePrecision, DistributedConfig, LitConfig, OxidizrModelConfig, TargetDevice, TrainerConfig,
 };
@@ -97,6 +97,7 @@ pub fn tiny_config(checkpoint_dir: &Path, max_steps: usize) -> LitConfig {
             seed: Some(42),
             target_mask: None,
             shuffle_rows: true,
+            loss_scale: None,
         },
     }
 }
@@ -226,15 +227,22 @@ pub fn trainer_with_decay<'a>(
 }
 
 /// Bit patterns of every trainable tensor, keyed by parameter name.
+///
+/// A half-precision tensor is widened to f32 first. The cast is exact, so
+/// equal bits still mean equal tensors.
 pub fn bits_by_name(parts: &TrainParts) -> BTreeMap<String, Vec<u32>> {
+    let client = CpuClient::new(CpuDevice::new());
     parts
         .names
         .iter()
         .map(|(name, id)| {
-            let values = parts.params[id]
-                .contiguous()
-                .expect("contiguous")
-                .to_vec::<f32>();
+            let tensor = parts.params[id].contiguous().expect("contiguous");
+            let tensor = if tensor.dtype() == DType::F32 {
+                tensor
+            } else {
+                client.cast(&tensor, DType::F32).expect("widen to f32")
+            };
+            let values = tensor.to_vec::<f32>();
             (name.clone(), values.iter().map(|v| v.to_bits()).collect())
         })
         .collect()
