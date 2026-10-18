@@ -221,7 +221,7 @@ Common `train` flags:
 | `--headless` | Off | Print JSON metrics only. Use in CI, pipes, and non-interactive shells |
 | `--run-dir <DIR>` | `$OXIDIZED_RUN_DIR`, else `./runs/<timestamp>` | Directory for `run.json` and `steps.json` |
 
-Every run writes `run.json` to its run directory when it ends, in both output modes. It records `status` (`completed` or `failed`), the error text of a failed run, the final step, the last loss, and start and end times. `train` exits with code 1 when the run failed. `steps.json` holds one JSON line per log interval.
+Every run writes `run.json` to its run directory when it ends, in both output modes. It records `status` (`completed` or `failed`), the error text of a failed run, the final step, the last loss, and start and end times. `train` exits with code 1 when the run failed. `steps.json` holds one JSON line per log interval and one for the first step of each session.
 
 Without `--headless`, `train` shows a progress bar. Run `oxidizr <SUBCOMMAND> --help` for every flag. [docs/cli.md](docs/cli.md) documents each subcommand.
 

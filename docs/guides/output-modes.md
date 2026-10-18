@@ -73,7 +73,7 @@ Both modes write the same two files to the run directory. Set it with `--run-dir
 
 | File         | Content                                                                                       |
 | ------------ | --------------------------------------------------------------------------------------------- |
-| `steps.json` | One JSON line per log interval: `step`, `loss`, `grad_norm`, `learning_rate`, `epoch`         |
+| `steps.json` | One JSON line per log interval and for the first step of each session: `step`, `loss`, `grad_norm`, `learning_rate`, `epoch` |
 | `run.json`   | Written when the run ends: `status`, `error`, `final_step`, `last_loss`, `started_at`, `finished_at`, `device`, `dataset_size`, `config` |
 
 `status` is `completed` or `failed`. A failed run, setup errors included, records the error text in `error`. The process then exits with code 1.
@@ -157,3 +157,5 @@ trainer:
 ```
 
 Smaller = more output, larger = less output.
+
+Both modes also log the first step of each session, a resumed session included. `log_interval: 0` logs that first step only.

@@ -1,12 +1,11 @@
-use crate::checkpoint_config::{checkpoint_config_exists, write_checkpoint_config};
 use crate::checkpoint_set::{
     apply_optimizer_resume, remove_old_checkpoints, write_checkpoint_set, CheckpointLabel,
     CheckpointSave, NameMaps, OptimizerResume,
 };
-use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
 use crate::config::{OxidizrModelConfig, TrainerConfig};
 use crate::data::{DataLoader, DataPosition, RowLayout};
 use crate::loss_scale::{resolve_loss_scale, restore_loss_scale, weighted_loss, LossScaler};
+use crate::oom_guard::{oom_guard, Pass};
 use crate::prelude::{DType, Error, FusedAdamW, Result, Tensor};
 use crate::schedule::LrPlan;
 use crate::step_loss::StepWeighting;
@@ -18,8 +17,7 @@ use boostr::readback::scalar_f32;
 use boostr::runtime::{Runtime, RuntimeClient};
 use boostr::tensor::TensorId;
 use boostr::{ReduceOps, TypeConversionOps};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -47,7 +45,7 @@ pub struct TrainerRunConfig {
 /// The "LitGPT" style Trainer abstraction.
 /// It owns the loop state, the optimizer, and handles the "boring" stuff.
 pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
-    config: TrainerConfig,
+    pub(crate) config: TrainerConfig,
     params: &'a mut HashMap<TensorId, Tensor<R>>,
     parameter_ids: Vec<TensorId>,
     parameter_names: Vec<(String, TensorId)>,
@@ -62,22 +60,22 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     global_step: usize,
     // Training metrics
     row_layout: RowLayout,
-    batch_size: usize,
+    pub(crate) batch_size: usize,
     // JSON logging
-    steps_json_path: String,
+    pub(crate) steps_json_path: String,
     // UI mode
-    headless: bool,
+    pub(crate) headless: bool,
     // Gradient clipping state (for loss pre-scaling heuristic)
     prev_grad_norm: Option<f64>,
     // Resume support
-    start_step: usize,
+    pub(crate) start_step: usize,
     /// Loader position at `start_step`; checkpoint positions count from here.
     start_position: DataPosition,
     // Checkpoint metadata
-    model_config: OxidizrModelConfig,
+    pub(crate) model_config: OxidizrModelConfig,
     data_file_path: Option<String>,
     /// Warmup, post-warmup schedule and step count of this run.
-    lr_plan: LrPlan,
+    pub(crate) lr_plan: LrPlan,
     /// Guard against a silently all-ones or nearly-all-zeros loss mask: the
     /// masked-in fraction is reported once per run, not once per step.
     mask_stats_logged: bool,
@@ -282,58 +280,11 @@ where
             let (input, target, loss_mask) = (batch.inputs, batch.targets, batch.loss_mask);
             let scored = batch.scored;
 
-            // Forward pass (returns logits + auxiliary losses + z-losses)
-            // Wrap in catch_unwind to provide user-friendly OOM error
+            // Forward pass (returns logits + auxiliary losses + z-losses).
             let fwd_start = if profile { Some(Instant::now()) } else { None };
-            let output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = oom_guard(Pass::Forward, self.batch_size, || {
                 step_model.forward(&self.client, &input)
-            })) {
-                Ok(result) => result?,
-                Err(panic_info) => {
-                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "Unknown panic".to_string()
-                    };
-
-                    if panic_msg.contains("can't allocate buffer")
-                        || panic_msg.contains("out of memory")
-                    {
-                        let size_info = if let Some(start) = panic_msg.find("size:") {
-                            let size_str = &panic_msg[start + 5..];
-                            if let Some(size) = size_str.split_whitespace().next() {
-                                if let Ok(bytes) = size.parse::<u64>() {
-                                    format!(" ({:.1} MB)", bytes as f64 / 1_000_000.0)
-                                } else {
-                                    String::new()
-                                }
-                            } else {
-                                String::new()
-                            }
-                        } else {
-                            String::new()
-                        };
-
-                        return Err(Error::TrainingError {
-                            reason: format!(
-                                "GPU out of memory during forward pass{}\n\n\
-                                The model requires more VRAM than available. Try:\n\
-                                • Halve batch_size (current: {}) and double gradient_accumulation \
-                                  - peak memory now tracks batch_size alone, and the effective \
-                                  batch size is unchanged\n\
-                                • Reduce max_seq_len in config\n\
-                                • Use a smaller model configuration\n\
-                                • Free GPU memory from other processes (check with: nvidia-smi)",
-                                size_info, self.batch_size
-                            ),
-                        });
-                    }
-
-                    std::panic::resume_unwind(panic_info);
-                }
-            };
+            })?;
             if let Some(start) = fwd_start {
                 eprintln!(
                     "[PROFILE] forward: {:.3}ms",
@@ -484,9 +435,8 @@ where
             // Summing per-micro-batch gradients therefore computes the same
             // thing as one backward over the chained loss, while holding one
             // micro-batch's activations instead of `accum_steps` of them.
-            // Wrap in catch_unwind to provide user-friendly OOM error instead of panic
             let bwd_start = if profile { Some(Instant::now()) } else { None };
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            oom_guard(Pass::Backward, self.batch_size, || {
                 // Prune to the trainable parameters. Every other node's gradient is
                 // unreadable by the optimizer and would only inflate peak memory -
                 // a frozen weight under LoRA costs a full-size gradient per step.
@@ -496,57 +446,7 @@ where
                     &mut accumulated_grads,
                     &self.client,
                 )
-            })) {
-                Ok(result) => result?,
-                Err(panic_info) => {
-                    // Extract panic message
-                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "Unknown panic".to_string()
-                    };
-
-                    // Check if it's an OOM error
-                    if panic_msg.contains("can't allocate buffer")
-                        || panic_msg.contains("out of memory")
-                    {
-                        // Extract the requested size if present
-                        let size_info = if let Some(start) = panic_msg.find("size:") {
-                            let size_str = &panic_msg[start + 5..];
-                            if let Some(size) = size_str.split_whitespace().next() {
-                                if let Ok(bytes) = size.parse::<u64>() {
-                                    format!(" ({:.1} MB)", bytes as f64 / 1_000_000.0)
-                                } else {
-                                    String::new()
-                                }
-                            } else {
-                                String::new()
-                            }
-                        } else {
-                            String::new()
-                        };
-
-                        return Err(Error::TrainingError {
-                            reason: format!(
-                                "GPU out of memory during backward pass{}\n\n\
-                                The model requires more VRAM than available. Try:\n\
-                                • Halve batch_size (current: {}) and double gradient_accumulation \
-                                  - peak memory now tracks batch_size alone, and the effective \
-                                  batch size is unchanged\n\
-                                • Reduce max_seq_len in config\n\
-                                • Use a smaller model configuration\n\
-                                • Free GPU memory from other processes (check with: nvidia-smi)",
-                                size_info, self.batch_size
-                            ),
-                        });
-                    }
-
-                    // Re-panic for other errors
-                    std::panic::resume_unwind(panic_info);
-                }
-            }
+            })?;
             if let Some(start) = bwd_start {
                 eprintln!(
                     "[PROFILE] backward: {:.3}ms",
@@ -743,316 +643,8 @@ where
     ///
     /// A pure function of `step`, so a resumed run continues the schedule at
     /// its restored `global_step`.
-    fn lr_at(&self, step: usize) -> f64 {
+    pub(crate) fn lr_at(&self, step: usize) -> f64 {
         self.lr_plan.lr_at(step)
-    }
-
-    pub fn fit<D: DataLoader<R>>(
-        &mut self,
-        model: &crate::model::LitGPT<R>,
-        data_loader: &mut D,
-    ) -> Result<()> {
-        // Write the blazr-compatible config.json, so blazr can serve the checkpoint directly.
-        self.save_blazr_config_if_needed();
-
-        if self.headless {
-            self.fit_headless(model, data_loader)
-        } else {
-            self.fit_normal(model, data_loader)
-        }
-    }
-
-    /// Write the blazr-compatible config.json to the checkpoint directory.
-    fn save_blazr_config_if_needed(&self) {
-        // Create checkpoint directory if it doesn't exist
-        if !Path::new(&self.config.checkpoint_dir).exists() {
-            if let Err(e) = std::fs::create_dir_all(&self.config.checkpoint_dir) {
-                if !self.headless {
-                    eprintln!("Warning: Failed to create checkpoint directory: {}", e);
-                }
-                return;
-            }
-        }
-
-        // config.json is rewritten at every start. It derives from the model
-        // config that this run's weights follow, so a stale file from an older
-        // oxidizr cannot disagree with the weights. Sidecars copy once.
-        let first_write = !checkpoint_config_exists(&self.config.checkpoint_dir);
-        match write_checkpoint_config(&self.model_config, &self.config.checkpoint_dir) {
-            Ok(()) => {
-                if !self.headless && first_write {
-                    println!("📝 Saved config.json for blazr inference compatibility");
-                }
-            }
-            Err(e) => {
-                if !self.headless {
-                    eprintln!("Warning: Failed to save blazr config.json: {}", e);
-                }
-            }
-        }
-        if first_write {
-            if let Err(e) = copy_checkpoint_sidecars(
-                &self.config.checkpoint_sidecars,
-                &self.config.checkpoint_dir,
-            ) {
-                if !self.headless {
-                    eprintln!("Warning: Failed to copy checkpoint sidecar files: {}", e);
-                }
-            }
-        }
-    }
-
-    fn fit_headless<D: DataLoader<R>>(
-        &mut self,
-        model: &crate::model::LitGPT<R>,
-        data_loader: &mut D,
-    ) -> Result<()> {
-        let training_start = Instant::now();
-
-        // max_steps=0 means unlimited (train for full epochs)
-        let effective_steps = self.lr_plan.total_steps();
-
-        // Log warmup info if enabled
-        if self.lr_plan.warmup_steps() > 0 {
-            println!(
-                "{{\"warmup\": {{\"steps\": {}, \"base_lr\": {:.6e}}}}}",
-                self.lr_plan.warmup_steps(),
-                self.lr_plan.base_lr()
-            );
-        }
-
-        // Resume support: start from start_step
-        for step in self.start_step..effective_steps {
-            let step_result = self.training_step(model, data_loader);
-            let (loss, grad_norm) = match step_result {
-                Ok(result) => result,
-                Err(e) => {
-                    let line = serde_json::json!({
-                        "error": format!("Training error at step {}", step + 1),
-                        "message": e.to_string(),
-                    });
-                    eprintln!("{line}");
-                    return Err(e);
-                }
-            };
-            let current_epoch = self.epoch_progress(step + 1);
-
-            // Log at intervals
-            if step % self.config.log_interval == 0 || step == self.start_step {
-                let elapsed = training_start.elapsed().as_secs_f64();
-                // Count only steps done in THIS session (not resumed steps)
-                let steps_this_session = step - self.start_step + 1;
-                let samples_processed =
-                    steps_this_session * self.batch_size * self.config.gradient_accumulation;
-                let samples_s = samples_processed as f64 / elapsed;
-
-                // Get VRAM usage via nvidia-smi
-                let vram = std::process::Command::new("nvidia-smi")
-                    .args([
-                        "--query-compute-apps=used_memory",
-                        "--format=csv,noheader,nounits",
-                    ])
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
-                    .unwrap_or_else(|| "0".to_string());
-
-                println!("{{\"step\": {}, \"loss\": {:.4}, \"grad_norm\": {:.4}, \"learning_rate\": {:.6e}, \"epoch\": {:.2}, \"samples/s\": {:.2}, \"vram\": \"{}\"}}",
-                    step + 1, loss, grad_norm, self.lr_at(step), current_epoch, samples_s, vram);
-                self.record_step(step + 1, loss, grad_norm, current_epoch);
-            }
-
-            let completed = step + 1;
-            if self.is_save_step(completed) {
-                self.save_checkpoint(model, completed)?;
-                println!("{{\"checkpoint\": {{\"step\": {completed}}}}}");
-            }
-        }
-
-        // Always save final checkpoint
-        let prefix = self.model_config.checkpoint_prefix();
-        println!(
-            "Saving final checkpoint to {}/{}_final.safetensors",
-            self.config.checkpoint_dir, prefix
-        );
-        self.save_final_checkpoint(model)?;
-
-        println!("{{\"status\": \"complete\"}}");
-        Ok(())
-    }
-
-    /// Appends one step line to `steps.json`. Both output modes call this.
-    ///
-    /// `step` is the 1-based count of completed steps. The line records the
-    /// learning rate that step applied. A write error prints a warning and
-    /// never stops the run.
-    fn record_step(&self, step: usize, loss: f64, grad_norm: f64, epoch: f64) {
-        let record = crate::run_record::StepRecord {
-            step,
-            loss,
-            grad_norm,
-            learning_rate: self.lr_at(step.saturating_sub(1)),
-            epoch,
-        };
-        if let Err(e) = record.append_to(Path::new(&self.steps_json_path)) {
-            eprintln!("Warning: {e}");
-        }
-    }
-
-    fn fit_normal<D: DataLoader<R>>(
-        &mut self,
-        model: &crate::model::LitGPT<R>,
-        data_loader: &mut D,
-    ) -> Result<()> {
-        // Respect max_steps limit (0 = unlimited, train for full epochs)
-        let effective_steps = self.lr_plan.total_steps();
-
-        // MultiProgress: scrollable logs above, sticky progress bar below
-        let mp = MultiProgress::new();
-
-        // Progress bar style - ETA calculated manually using rolling average.
-        // The template is a constant. On a template error the default bar
-        // still shows progress, so the run continues.
-        let sty =
-            ProgressStyle::with_template("{bar:40.cyan/dim} {pos:>7}/{len:7} [{elapsed}<{msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_bar())
-                .progress_chars("━━─");
-
-        let pb = mp.add(ProgressBar::new(effective_steps as u64));
-        pb.set_style(sty);
-
-        // Resume support - this goes to scrollable area
-        if self.start_step > 0 {
-            pb.set_position(self.start_step as u64);
-            mp.println(format!("📍 Resuming from step {}", self.start_step))
-                .ok();
-        }
-
-        // Log warmup info if enabled
-        if self.lr_plan.warmup_steps() > 0 {
-            mp.println(format!(
-                "🔥 Warmup: {} steps, base LR: {:.6e}",
-                self.lr_plan.warmup_steps(),
-                self.lr_plan.base_lr()
-            ))
-            .ok();
-        }
-
-        let mut last_loss = 0.0;
-        let mut last_grad_norm = 0.0;
-
-        // Rolling average for it/s calculation (last N step times)
-        const ROLLING_WINDOW: usize = 5;
-        let mut step_times: VecDeque<f64> = VecDeque::with_capacity(ROLLING_WINDOW);
-        let mut step_start = Instant::now();
-
-        for step in self.start_step..effective_steps {
-            let step_result = self.training_step(model, data_loader);
-
-            // Handle errors explicitly so TUI shows them properly
-            let (loss, grad_norm) = match step_result {
-                Ok(result) => result,
-                Err(e) => {
-                    // Clear progress bar and show error
-                    pb.finish_and_clear();
-                    let err_msg = format!("{}", e);
-                    mp.println(format!("\n❌ Training error at step {}:", step + 1))
-                        .ok();
-
-                    // Check for common CUDA errors
-                    if err_msg.contains("out of memory")
-                        || err_msg.contains("CUDA")
-                        || err_msg.contains("cuda")
-                    {
-                        mp.println(format!("   🔥 CUDA Error: {}", err_msg)).ok();
-                        mp.println(
-                            "   💡 Try: reduce batch_size, seq_len, or use gradient accumulation",
-                        )
-                        .ok();
-                    } else if err_msg.contains("NaN") || err_msg.contains("nan") {
-                        mp.println(format!("   🔥 Numerical Error: {}", err_msg))
-                            .ok();
-                        mp.println("   💡 Try: lower learning rate or check data")
-                            .ok();
-                    } else {
-                        mp.println(format!("   🔥 Error: {}", err_msg)).ok();
-                    }
-
-                    mp.println("").ok();
-                    return Err(e);
-                }
-            };
-            last_loss = loss;
-            last_grad_norm = grad_norm;
-
-            // Track step time for rolling average
-            let step_duration = step_start.elapsed().as_secs_f64();
-            step_times.push_back(step_duration);
-            if step_times.len() > ROLLING_WINDOW {
-                step_times.pop_front();
-            }
-            step_start = Instant::now();
-
-            let current_epoch = self.epoch_progress(step + 1);
-
-            // Calculate samples/s as rolling average of recent steps
-            // Each step processes batch_size * gradient_accumulation samples
-            let avg_step_time: f64 = step_times.iter().sum::<f64>() / step_times.len() as f64;
-            let samples_per_step = (self.batch_size * self.config.gradient_accumulation) as f64;
-            let samples_s = if avg_step_time > 0.0 {
-                samples_per_step / avg_step_time
-            } else {
-                0.0
-            };
-
-            // Silent log to file at intervals (no terminal output for steps)
-            if step % self.config.log_interval == 0 || step == 0 {
-                self.record_step(step + 1, loss, grad_norm, current_epoch);
-            }
-
-            // Calculate ETA based on rolling average
-            let remaining_steps = effective_steps - step - 1;
-            let eta_secs = avg_step_time * remaining_steps as f64;
-            let eta_str = format_duration(eta_secs);
-
-            // Update progress bar (sticky at bottom)
-            pb.set_position((step + 1) as u64);
-            pb.set_message(format!(
-                "{}] loss: {:.4} | grad: {:.4} | {:.2} samples/s",
-                eta_str, loss, grad_norm, samples_s
-            ));
-
-            // Checkpoint messages go to scrollable area above
-            let completed = step + 1;
-            if self.is_save_step(completed) {
-                self.save_checkpoint(model, completed)?;
-                mp.println(format!("💾 Checkpoint saved: step {completed}"))
-                    .ok();
-            }
-        }
-
-        pb.finish_with_message(format!(
-            "loss: {:.4} | grad: {:.4} | done ✓",
-            last_loss, last_grad_norm
-        ));
-
-        // Final messages
-        let prefix = self.model_config.checkpoint_prefix();
-        mp.println(format!(
-            "\n💾 Saving final checkpoint to {}/{}_final.safetensors",
-            self.config.checkpoint_dir, prefix
-        ))
-        .ok();
-        self.save_final_checkpoint(model)?;
-
-        mp.println(format!(
-            "✅ Training complete | final loss: {:.4} | grad: {:.4}",
-            last_loss, last_grad_norm
-        ))
-        .ok();
-
-        Ok(())
     }
 
     fn assert_stable_parameter_ids(&self, model: &crate::model::LitGPT<R>) -> Result<()> {
@@ -1139,15 +731,10 @@ where
     }
 
     /// Fractional epochs of data drawn after `completed` optimizer steps.
-    fn epoch_progress(&self, completed: usize) -> f64 {
+    pub(crate) fn epoch_progress(&self, completed: usize) -> f64 {
         let pos = self.data_position_after(completed);
         let rows_per_epoch = self.row_layout.batches_per_epoch() * self.row_layout.batch_size();
         pos.epoch as f64 + pos.row as f64 / rows_per_epoch as f64
-    }
-
-    /// Whether an interval checkpoint is due once `completed` steps are done.
-    fn is_save_step(&self, completed: usize) -> bool {
-        self.config.save_interval > 0 && completed.is_multiple_of(self.config.save_interval)
     }
 
     /// Saves the checkpoint set labelled with `step`, the count of completed
@@ -1456,25 +1043,6 @@ where
         Ok(loss.clone())
     } else {
         var_reshape(loss, &[]).map_err(Error::from)
-    }
-}
-
-/// Format seconds into human-readable duration (e.g., "5m32s", "2h14m", "3d05h")
-fn format_duration(secs: f64) -> String {
-    let total_secs = secs.round() as u64;
-    let days = total_secs / 86400;
-    let hours = (total_secs % 86400) / 3600;
-    let minutes = (total_secs % 3600) / 60;
-    let seconds = total_secs % 60;
-
-    if days > 0 {
-        format!("{}d{:02}h", days, hours)
-    } else if hours > 0 {
-        format!("{}h{:02}m", hours, minutes)
-    } else if minutes > 0 {
-        format!("{}m{:02}s", minutes, seconds)
-    } else {
-        format!("{}s", seconds)
     }
 }
 
