@@ -88,6 +88,22 @@ Enable Mixture of Experts:
 | `gradient_accumulation` | Gradient accumulation steps | 1 |
 | `shuffle_rows` | Visit rows in a per-epoch permutation seeded from `seed` and the epoch; `false` = stream order | true |
 
+#### Loss weighting under gradient accumulation
+
+A run without a loss mask takes the mean loss of each micro-batch and scales it by `1 / gradient_accumulation`.
+
+A masked run (`trainer.target_mask` or `model.speech_layout`) weights every scored token of the step equally:
+
+- The trainer draws all `gradient_accumulation` micro-batches of the step before the first forward pass.
+- Each loader counts the scored positions from its host copy of the mask. No device read is needed.
+- Each micro-batch adds its summed masked loss times `1 / total`. `total` counts the scored tokens of the whole step.
+- A micro-batch with no scored token adds no cross-entropy term. Its MoE auxiliary losses still apply.
+- A step with no scored token and no auxiliary loss reports loss 0 and applies no gradient.
+
+The reported loss is the per-token mean over the step. MoE auxiliary losses keep the `1 / gradient_accumulation` weight in both modes.
+
+The unmasked path keeps the old mean form on purpose. The sum form gives the same value in exact arithmetic, but its float rounding differs. The mean form keeps unmasked runs, and their resumes, bit-identical to earlier releases.
+
 ### Checkpointing
 
 | Parameter | Description | Default |

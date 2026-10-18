@@ -80,6 +80,13 @@ pub(super) fn build_target_mask(
     out
 }
 
+/// Number of positions a mask from [`build_target_mask`] scores.
+///
+/// The mask holds exactly `0.0` and `1.0`, so this counts the `1.0` entries.
+pub(super) fn scored_count(mask: &[f32]) -> usize {
+    mask.iter().filter(|m| **m != 0.0).count()
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -172,6 +179,7 @@ pub(super) mod tests {
             mask_of(&batch),
             vec![0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0]
         );
+        assert_eq!(batch.scored, 4, "scored counts the host mask's 1.0 entries");
     }
 
     #[test]
@@ -181,6 +189,7 @@ pub(super) mod tests {
         let mut l = LitDataLoader::<CpuRuntime>::new(tokens, 1, 5, CpuDevice::new());
         let batch = l.next_batch().expect("batch");
         assert!(batch.loss_mask.is_none());
+        assert_eq!(batch.scored, 5, "an unmasked batch scores every position");
         assert_eq!(batch.inputs.shape(), [1usize, 5]);
         assert_eq!(batch.targets.shape(), [1usize, 5]);
     }

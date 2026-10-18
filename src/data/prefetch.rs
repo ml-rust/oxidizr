@@ -2,7 +2,7 @@
 
 use super::batch::{Batch, DataLoader};
 use super::construction::LitDataLoader;
-use super::mask::build_target_mask;
+use super::mask::{build_target_mask, scored_count};
 use crate::prelude::{DType, Error, Result, Tensor};
 use boostr::runtime::Runtime;
 use std::path::Path;
@@ -21,6 +21,8 @@ struct PrefetchedBatch {
     targets: Vec<u32>,
     /// Loss mask over the target positions, `None` when masking is off
     loss_mask: Option<Vec<f32>>,
+    /// Positions the loss scores, see [`Batch::scored`]
+    scored: usize,
     /// Batch dimensions
     batch_size: usize,
     seq_len: usize,
@@ -156,6 +158,9 @@ where
             .target_mask
             .as_ref()
             .map(|mask| build_target_mask(mask, &window, batch_size, seq_len));
+        let scored = loss_mask
+            .as_deref()
+            .map_or(batch_size * seq_len, scored_count);
 
         let mut inputs = Vec::with_capacity(batch_size * seq_len);
         let mut targets = Vec::with_capacity(batch_size * seq_len);
@@ -168,6 +173,7 @@ where
             inputs,
             targets,
             loss_mask,
+            scored,
             batch_size,
             seq_len,
         })
@@ -218,6 +224,7 @@ where
             inputs,
             targets,
             loss_mask,
+            scored: batch.scored,
         })
     }
 
@@ -383,6 +390,7 @@ mod tests {
             assert_eq!(ids(&a.inputs), ids(&b.inputs));
             assert_eq!(ids(&a.targets), ids(&b.targets));
             assert_eq!(mask_of(&a), mask_of(&b));
+            assert_eq!(a.scored, b.scored);
         }
     }
 

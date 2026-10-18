@@ -6,10 +6,9 @@ use crate::checkpoint_set::{
 use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
 use crate::config::{OxidizrModelConfig, TrainerConfig};
 use crate::data::{DataLoader, DataPosition, RowLayout};
-use crate::prelude::{
-    cross_entropy, cross_entropy_masked, DType, Error, FusedAdamW, Result, Tensor,
-};
+use crate::prelude::{DType, Error, FusedAdamW, Result, Tensor};
 use crate::schedule::LrPlan;
+use crate::step_loss::StepWeighting;
 use crate::weight_decay::{DecayPlan, WeightDecaySpec};
 use boostr::autograd::{backward_wrt, var_add, var_mul_scalar, var_reshape, GradStore, Var};
 use boostr::ops::{FusedOptimizerOps, TensorOps};
@@ -204,6 +203,13 @@ where
     /// micro-batches can therefore differ in its last bits, and the reported
     /// `grad_norm` with it. The reported loss cannot move: it is the same
     /// device `add` over the same scalars in the same micro-batch order.
+    ///
+    /// # Loss Weighting
+    /// The step draws all its micro-batches before the first forward pass.
+    /// [`StepWeighting`] then picks the cross-entropy form. A masked step
+    /// weights every scored token of the step by `1 / total`. An unmasked step
+    /// keeps the per-micro-batch mean. Either way the cross-entropy part of
+    /// the reported loss is the per-token mean over the step.
     pub fn training_step<D: DataLoader<R>>(
         &mut self,
         model: &crate::model::LitGPT<R>,
@@ -237,18 +243,29 @@ where
         // micro-batch's graph is ever alive.
         let mut accumulated_grads: GradStore<R> = GradStore::new();
 
+        // Draw every micro-batch of the step before the first forward pass.
+        // A masked step weights each scored token by `1 / total`, and `total`
+        // needs every micro-batch's host-side scored count. The loader hands
+        // out the same batches in the same order, so data positions are
+        // unchanged.
+        let data_start = if profile { Some(Instant::now()) } else { None };
+        let mut batches = Vec::with_capacity(accum_steps);
+        for _ in 0..accum_steps {
+            batches.push(data_loader.next_batch()?);
+        }
+        let weighting = StepWeighting::for_batches(&batches)?;
+        if let Some(start) = data_start {
+            eprintln!(
+                "[PROFILE] data_load: {:.3}ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+
         // Gradient Accumulation Loop - forward and backward, one micro-batch
         // at a time
-        for _micro_batch_idx in 0..accum_steps {
-            let data_start = if profile { Some(Instant::now()) } else { None };
-            let batch = data_loader.next_batch()?;
+        for batch in batches {
             let (input, target, loss_mask) = (batch.inputs, batch.targets, batch.loss_mask);
-            if let Some(start) = data_start {
-                eprintln!(
-                    "[PROFILE] data_load: {:.3}ms",
-                    start.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+            let scored = batch.scored;
 
             // Forward pass (returns logits + auxiliary losses + z-losses)
             // Wrap in catch_unwind to provide user-friendly OOM error
@@ -342,35 +359,35 @@ where
             let logits_flat = var_reshape(&logits, &[b * s, v])?;
             let target_flat = target.reshape(&[b * s])?;
 
-            let ce_loss = match &loss_mask {
-                Some(mask) => {
-                    let mask_flat = mask.reshape(&[b * s])?;
-                    if !self.mask_stats_logged {
-                        self.mask_stats_logged = true;
-                        // The mask holds exactly 0.0/1.0 (see `data/mask.rs`), so its sum
-                        // IS the masked-in count. Reduce on device and transfer one
-                        // scalar instead of the whole mask.
-                        let mask_contig = mask_flat.contiguous()?;
-                        let mask_sum = self.client.sum(&mask_contig, &[0], false)?;
-                        let masked_in = scalar_f32(&self.client, &mask_sum)? as usize;
-                        let positions = mask_contig.elem_count();
-                        let total = positions.max(1);
-                        eprintln!(
-                            "[loss-mask] masked loss scoring on: {masked_in}/{positions} positions \
-                             masked in ({:.2}%) in the first batch",
-                            masked_in as f64 * 100.0 / total as f64
-                        );
-                    }
-                    cross_entropy_masked(&self.client, &logits_flat, &target_flat, &mask_flat)?
-                }
-                None => cross_entropy(&self.client, &logits_flat, &target_flat)?,
+            let mask_flat = match &loss_mask {
+                Some(mask) => Some(mask.reshape(&[b * s])?),
+                None => None,
             };
+            if mask_flat.is_some() && !self.mask_stats_logged {
+                self.mask_stats_logged = true;
+                // `scored` comes from the loader's host copy of the mask, so
+                // this report needs no device read.
+                let positions = b * s;
+                eprintln!(
+                    "[loss-mask] masked loss scoring on: {scored}/{positions} positions \
+                     masked in ({:.2}%) in the first batch",
+                    scored as f64 * 100.0 / positions.max(1) as f64
+                );
+            }
+            // `None`: this micro-batch scores no position and adds no CE term.
+            let ce_loss = weighting.ce_term(
+                &self.client,
+                &logits_flat,
+                &target_flat,
+                mask_flat.as_ref(),
+                scored,
+            )?;
 
             // NaN checking is expensive (GPU->CPU sync) - only do on first step or when DEBUG_NAN is set
             let check_nan = self.global_step == 0 || std::env::var("DEBUG_NAN").is_ok();
 
             // Check for NaN in CE loss before combining (only when check_nan is true)
-            if check_nan {
+            if let (true, Some(ce_loss)) = (check_nan, &ce_loss) {
                 let ce_loss_val = scalar_f32(&self.client, ce_loss.tensor())? as f64;
                 if ce_loss_val.is_nan() || ce_loss_val.is_infinite() {
                     eprintln!("\n❌ NaN/Inf detected in CE loss! This usually indicates:");
@@ -392,7 +409,7 @@ where
                     let loss_t = scalar_loss_var(aux_loss)?;
                     let scaled_aux =
                         var_mul_scalar(&loss_t, load_balance_alpha / num_aux, &self.client)?;
-                    loss = var_add(&loss, &scaled_aux, &self.client)?;
+                    loss = Some(add_loss_term(loss, scaled_aux, &self.client)?);
                 }
             }
 
@@ -404,9 +421,15 @@ where
                 for z_loss in &z_losses {
                     let loss_t = scalar_loss_var(z_loss)?;
                     let scaled_z = var_mul_scalar(&loss_t, z_loss_alpha / num_z, &self.client)?;
-                    loss = var_add(&loss, &scaled_z, &self.client)?;
+                    loss = Some(add_loss_term(loss, scaled_z, &self.client)?);
                 }
             }
+
+            // A micro-batch with no scored position and no auxiliary loss has
+            // nothing to differentiate.
+            let Some(loss) = loss else {
+                continue;
+            };
 
             // Check combined loss for NaN (only when check_nan is true)
             if check_nan {
@@ -522,11 +545,11 @@ where
 
         // Transfer loss to CPU for logging (single sync point)
         let loss_sync_start = if profile { Some(Instant::now()) } else { None };
-        let acc_loss = accumulated_loss.ok_or_else(|| Error::TrainingError {
-            reason: "No loss accumulated".to_string(),
-        })?;
-        let total_loss_for_logging =
-            scalar_f32(&self.client, &acc_loss)? as f64 * accum_steps as f64;
+        // A masked step whose micro-batches score nothing reports 0.
+        let total_loss_for_logging = match accumulated_loss {
+            Some(acc_loss) => scalar_f32(&self.client, &acc_loss)? as f64 * accum_steps as f64,
+            None => weighting.loss_without_terms()?,
+        };
         if let Some(start) = loss_sync_start {
             eprintln!(
                 "[PROFILE] loss_sync: {:.3}ms",
@@ -1344,6 +1367,22 @@ where
     }
 
     Ok(())
+}
+
+/// Adds `term` to a micro-batch loss that can still be empty.
+///
+/// An empty loss becomes `term`. Otherwise this is the same `var_add`, in the
+/// same order, that the loss chain always ran, so unmasked runs keep their bits.
+fn add_loss_term<R, C>(loss: Option<Var<R>>, term: Var<R>, client: &C) -> Result<Var<R>>
+where
+    R: Runtime<DType = DType>,
+    C: RuntimeClient<R> + TensorOps<R>,
+    R::Client: TensorOps<R>,
+{
+    match loss {
+        None => Ok(term),
+        Some(loss) => Ok(var_add(&loss, &term, client)?),
+    }
 }
 
 fn scalar_loss_var<R>(loss: &Var<R>) -> Result<Var<R>>

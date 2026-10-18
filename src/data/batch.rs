@@ -2,7 +2,7 @@
 //! and building its loss mask.
 
 use super::construction::LitDataLoader;
-use super::mask::build_target_mask;
+use super::mask::{build_target_mask, scored_count};
 use crate::prelude::{DType, Result, Tensor};
 use boostr::runtime::Runtime;
 
@@ -16,6 +16,9 @@ pub struct Batch<R: Runtime<DType = DType>> {
     /// Shape `[batch_size, seq_len]`, F32. `None` when masking is off (every
     /// position is scored).
     pub loss_mask: Option<Tensor<R>>,
+    /// Number of positions the loss scores, counted from the host copy of
+    /// `loss_mask`. `batch_size * seq_len` when masking is off.
+    pub scored: usize,
 }
 
 /// Common interface for all data loaders
@@ -63,22 +66,22 @@ where
 
         // Built from the same `window`, over the post-shift target window, so it
         // lines up element-for-element with `targets` above.
-        let loss_mask = match &self.target_mask {
+        let (loss_mask, scored) = match &self.target_mask {
             Some(target_mask) => {
                 let mask = build_target_mask(target_mask, &window, self.batch_size, self.seq_len);
-                Some(Tensor::<R>::from_slice(
-                    &mask,
-                    &[self.batch_size, self.seq_len],
-                    &self.device,
-                )?)
+                let scored = scored_count(&mask);
+                let tensor =
+                    Tensor::<R>::from_slice(&mask, &[self.batch_size, self.seq_len], &self.device)?;
+                (Some(tensor), scored)
             }
-            None => None,
+            None => (None, self.batch_size * self.seq_len),
         };
 
         Ok(Batch {
             inputs,
             targets,
             loss_mask,
+            scored,
         })
     }
 }

@@ -23,6 +23,7 @@ pub mod prelude;
 pub mod run_record;
 pub mod schedule;
 pub mod speech_corpus;
+pub mod step_loss;
 pub mod trainer;
 pub mod vocab;
 pub mod weight_decay;
