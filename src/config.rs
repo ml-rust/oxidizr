@@ -1,7 +1,7 @@
 use crate::checkpoint_set::{optimizer_path_for, weights_step, CheckpointLabel};
 use crate::data::DataPosition;
 use crate::data_hash::{hash_json, legacy_file_hash, legacy_hash_str, HashAlgo};
-use crate::schedule::LrSchedule;
+use crate::schedule::{LrDecayShape, LrSchedule};
 use boostr::model::{SpeechLayout, SpeechVocab};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -653,10 +653,11 @@ pub struct TrainerConfig {
     #[serde(default = "default_warmup_ratio")]
     pub warmup_ratio: Option<f64>, // Fraction of total steps for warmup (default: 0.1 = 10%)
     // Only used if warmup_steps is None
-    /// Post-warmup learning-rate decay. `constant` (the default) reproduces
-    /// the prior warmup-then-flat behavior byte for byte; `cosine`/`linear`
-    /// decay from the end of warmup to `min_lr_ratio * learning_rate` by the
-    /// run's last step. See [`crate::schedule::LrSchedule`].
+    /// Post-warmup learning-rate schedule. `constant` (the default) holds
+    /// `learning_rate` after warmup. `cosine`/`linear` decay from the end of
+    /// warmup to `min_lr_ratio * learning_rate` by the run's last step. `wsd`
+    /// holds, then decays over the run's last steps. See
+    /// [`crate::schedule::LrSchedule`].
     #[serde(default)]
     pub lr_schedule: LrSchedule,
 
@@ -664,6 +665,20 @@ pub struct TrainerConfig {
     /// Unused when `lr_schedule` is `constant`.
     #[serde(default = "default_min_lr_ratio")]
     pub min_lr_ratio: f64,
+
+    /// `wsd` only: fraction of the run's steps the decay phase spans, in
+    /// `(0, 1]`. `None` with no `decay_steps` uses
+    /// [`crate::schedule::DEFAULT_DECAY_RATIO`].
+    #[serde(default)]
+    pub decay_ratio: Option<f64>,
+
+    /// `wsd` only: step count of the decay phase. Excludes `decay_ratio`.
+    #[serde(default)]
+    pub decay_steps: Option<usize>,
+
+    /// `wsd` only: decay curve, `linear` (default), `cosine` or `sqrt`.
+    #[serde(default)]
+    pub decay_shape: Option<LrDecayShape>,
 
     /// Target device: "gpu" (default) or "cpu"
     #[serde(default)]
@@ -844,27 +859,7 @@ impl LitConfig {
             }
         }
 
-        if self.trainer.lr_schedule.needs_total_steps()
-            && self.trainer.max_steps == 0
-            && self.trainer.num_epochs == 0
-        {
-            anyhow::bail!(
-                "trainer.lr_schedule = {:?} decays the learning rate toward a total step \
-                 count, but neither trainer.max_steps nor trainer.num_epochs names one \
-                 (both are 0). Set trainer.max_steps to the run's last step, or \
-                 trainer.num_epochs to a positive number of epochs.",
-                self.trainer.lr_schedule
-            );
-        }
-        if !(0.0..=1.0).contains(&self.trainer.min_lr_ratio) {
-            anyhow::bail!(
-                "trainer.min_lr_ratio ({}) must be between 0.0 and 1.0: it names the \
-                 fraction of learning_rate the schedule decays to.",
-                self.trainer.min_lr_ratio
-            );
-        }
-
-        Ok(())
+        crate::schedule::validate(&self.trainer)
     }
 
     // Original "Nano" config for local testing (~83M parameters - Llama-style baseline)
@@ -936,6 +931,9 @@ impl LitConfig {
                 warmup_ratio: Some(0.1), // 10% warmup
                 lr_schedule: crate::schedule::LrSchedule::Constant,
                 min_lr_ratio: 0.0,
+                decay_ratio: None,
+                decay_steps: None,
+                decay_shape: None,
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
                 seed: None,
@@ -1027,6 +1025,9 @@ impl LitConfig {
                 warmup_ratio: Some(0.1), // 10% warmup
                 lr_schedule: crate::schedule::LrSchedule::Constant,
                 min_lr_ratio: 0.0,
+                decay_ratio: None,
+                decay_steps: None,
+                decay_shape: None,
                 target_device: TargetDevice::Gpu,
                 distributed: DistributedConfig::default(),
                 seed: None,

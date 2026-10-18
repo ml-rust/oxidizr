@@ -5,15 +5,23 @@
 
 mod common;
 
-use common::{scratch_dir, tiny_config, tokens, write_config_yaml, write_token_file};
+use common::{data_loader, scratch_dir, tiny_config, tokens, write_config_yaml, write_token_file};
 use oxidizr::commands::{run_train, TrainArgs};
+use oxidizr::config::LitConfig;
 use oxidizr::run_record::{exit_code, RunRecord, RunStatus, StepRecord, STEPS_FILE};
+use oxidizr::schedule::LrPlan;
 use std::path::Path;
 
 /// Headless CPU train args for the files under `dir`.
 fn headless_args(dir: &Path, data: &Path, max_steps: usize) -> TrainArgs {
+    let cfg = tiny_config(&dir.join("ckpt"), max_steps);
+    headless_args_for(dir, data, &cfg, "run")
+}
+
+/// Headless CPU train args that run `cfg` and write the run directory `dir/<run>`.
+fn headless_args_for(dir: &Path, data: &Path, cfg: &LitConfig, run: &str) -> TrainArgs {
     let cfg_path = dir.join("config.yaml");
-    write_config_yaml(&cfg_path, &tiny_config(&dir.join("ckpt"), max_steps));
+    write_config_yaml(&cfg_path, cfg);
     TrainArgs {
         config_file: cfg_path.to_string_lossy().into_owned(),
         data_file: Some(data.to_string_lossy().into_owned()),
@@ -22,7 +30,7 @@ fn headless_args(dir: &Path, data: &Path, max_steps: usize) -> TrainArgs {
         batch_size: None,
         gradient_accumulation: None,
         headless: true,
-        max_steps: Some(max_steps),
+        max_steps: Some(cfg.trainer.max_steps),
         resume: None,
         gpus: None,
         sync_backend: None,
@@ -30,8 +38,109 @@ fn headless_args(dir: &Path, data: &Path, max_steps: usize) -> TrainArgs {
         max_checkpoints: None,
         dtype: None,
         checkpoint_dir: None,
-        run_dir: Some(dir.join("run").to_string_lossy().into_owned()),
+        run_dir: Some(dir.join(run).to_string_lossy().into_owned()),
     }
+}
+
+/// Every `steps.json` line of the run directory `run_dir`.
+fn step_records(run_dir: &Path) -> Vec<StepRecord> {
+    std::fs::read_to_string(run_dir.join(STEPS_FILE))
+        .expect("steps.json")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse step line"))
+        .collect()
+}
+
+/// The plan `LitTrainer` builds for `cfg` over the token stream of `common::data_loader`.
+fn lr_plan(cfg: &LitConfig) -> LrPlan {
+    let layout = data_loader(cfg).row_layout().expect("row layout");
+    let epoch_steps = layout.total_steps(cfg.trainer.gradient_accumulation, cfg.trainer.num_epochs);
+    LrPlan::new(&cfg.trainer, epoch_steps).expect("lr plan")
+}
+
+/// Six cosine steps after two warmup steps, logged and saved every three steps.
+fn logged_cosine_config(dir: &Path) -> LitConfig {
+    let mut cfg = tiny_config(&dir.join("ckpt"), 6);
+    cfg.trainer.log_interval = 1;
+    cfg.trainer.save_interval = 3;
+    cfg
+}
+
+#[test]
+fn steps_json_records_the_learning_rate_each_step_applied() {
+    let dir = scratch_dir("headless-run-applied-lr");
+    let data = dir.join("tokens.bin");
+    let cfg = logged_cosine_config(&dir);
+    write_token_file(&data, &tokens(&cfg, 4000));
+
+    let result = run_train(headless_args_for(&dir, &data, &cfg, "run"));
+
+    assert!(result.is_ok(), "training failed: {result:?}");
+    let records = step_records(&dir.join("run"));
+    assert_eq!(records.len(), 6, "{records:?}");
+    let plan = lr_plan(&cfg);
+    for record in &records {
+        let applied = plan.lr_at(record.step - 1);
+        assert_eq!(
+            record.learning_rate.to_bits(),
+            applied.to_bits(),
+            "step {}: logged {:e}, applied {applied:e}",
+            record.step,
+            record.learning_rate
+        );
+    }
+    // Warmup 2: step 3 is the first post-warmup step and applies the full rate.
+    let base = cfg.trainer.learning_rate;
+    assert_eq!(records[0].learning_rate, base * 0.5);
+    assert_eq!(records[1].learning_rate, base);
+    assert_eq!(records[2].learning_rate, base);
+    // Steps 4..=6 decay toward min_lr_ratio * base and never reach it.
+    for pair in records[2..].windows(2) {
+        assert!(pair[1].learning_rate < pair[0].learning_rate, "{pair:?}");
+    }
+    assert!(records[5].learning_rate > base * cfg.trainer.min_lr_ratio);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_resumed_run_continues_the_schedule_at_the_restored_step() {
+    let dir = scratch_dir("headless-run-resumed-lr");
+    let data = dir.join("tokens.bin");
+    let cfg = logged_cosine_config(&dir);
+    write_token_file(&data, &tokens(&cfg, 4000));
+    let full = run_train(headless_args_for(&dir, &data, &cfg, "full"));
+    assert!(full.is_ok(), "training failed: {full:?}");
+
+    let ckpt = dir.join("ckpt");
+    let weights = std::fs::read_dir(&ckpt)
+        .expect("checkpoint dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .find(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_step_3.safetensors"))
+        })
+        .expect("step-3 weights");
+    let mut args = headless_args_for(&dir, &data, &cfg, "resumed");
+    args.resume = Some(weights.to_string_lossy().into_owned());
+    let resumed = run_train(args);
+    assert!(resumed.is_ok(), "resume failed: {resumed:?}");
+
+    let full = step_records(&dir.join("full"));
+    let resumed = step_records(&dir.join("resumed"));
+    let steps: Vec<usize> = resumed.iter().map(|r| r.step).collect();
+    assert_eq!(steps, vec![4, 5, 6]);
+    for record in &resumed {
+        let reference = &full[record.step - 1];
+        assert_eq!(reference.step, record.step);
+        assert_eq!(
+            record.learning_rate.to_bits(),
+            reference.learning_rate.to_bits(),
+            "step {}",
+            record.step
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

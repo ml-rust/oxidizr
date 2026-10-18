@@ -157,6 +157,7 @@ Key `trainer` fields:
 |-------|---------|
 | `learning_rate`, `batch_size`, `gradient_accumulation` | Optimizer step size and batch shape |
 | `max_steps`, `num_epochs` | Training length |
+| `warmup_steps`, `lr_schedule`, `min_lr_ratio` | Warmup, then `constant`, `cosine`, `linear` or `wsd` decay. Logged rates are the rates each step applied |
 | `checkpoint_dir`, `save_interval`, `max_checkpoints` | Checkpoint location, frequency, and retention (`0` keeps all) |
 | `log_interval` | Steps between metric updates |
 | `target_device` | `gpu` or `cpu`. The CLI `--target-device` overrides it |

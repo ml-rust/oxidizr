@@ -62,7 +62,7 @@ Output:
 | `step`          | Current training step       |
 | `loss`          | Training loss               |
 | `grad_norm`     | Gradient norm               |
-| `learning_rate` | Current learning rate       |
+| `learning_rate` | Learning rate this step applied |
 | `epoch`         | Epoch progress (fractional) |
 | `samples/s`     | Samples per second          |
 | `vram`          | Device memory in use (MiB), `"0"` when unknown |

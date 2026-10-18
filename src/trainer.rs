@@ -9,6 +9,7 @@ use crate::data::{DataLoader, DataPosition, RowLayout};
 use crate::prelude::{
     cross_entropy, cross_entropy_masked, DType, Error, FusedAdamW, Result, Tensor,
 };
+use crate::schedule::LrPlan;
 use boostr::autograd::{backward_wrt, var_add, var_mul_scalar, var_reshape, GradStore, Var};
 use boostr::ops::{FusedOptimizerOps, TensorOps};
 use boostr::optimizer::AdamWConfig;
@@ -70,13 +71,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     // Checkpoint metadata
     model_config: OxidizrModelConfig,
     data_file_path: Option<String>,
-    // Learning rate warmup (critical for Mamba SSM parameter alignment)
-    warmup_steps: usize,     // Effective warmup steps (0 = disabled)
-    base_learning_rate: f64, // Base LR to warmup towards
-    /// The run's last step, for the post-warmup decay schedule to decay
-    /// across. `LitConfig::validate` guarantees this is nonzero whenever
-    /// `config.lr_schedule` needs one (see `LrSchedule::needs_total_steps`).
-    effective_total_steps: usize,
+    /// Warmup, post-warmup schedule and step count of this run.
+    lr_plan: LrPlan,
     /// Guard against a silently all-ones or nearly-all-zeros loss mask: the
     /// masked-in fraction is reported once per run, not once per step.
     mask_stats_logged: bool,
@@ -140,27 +136,7 @@ where
         config.distributed.validate()?;
         let name_maps = NameMaps::new(&parameter_names, &parameter_ids)?;
 
-        // Calculate effective warmup steps (explicit steps OR ratio * total_steps)
-        // Priority: warmup_steps > warmup_ratio > disabled (0)
-        let warmup_steps = if let Some(steps) = config.warmup_steps {
-            steps
-        } else if let Some(ratio) = config.warmup_ratio {
-            (total_steps as f64 * ratio).ceil() as usize
-        } else {
-            0 // No warmup
-        };
-
-        // Store base learning rate for warmup calculation
-        let base_learning_rate = config.learning_rate;
-
-        // The step the post-warmup decay schedule decays across: an explicit
-        // `max_steps` caps it, otherwise the epoch-derived `total_steps`
-        // applies — the step count `fit_headless`/`fit_normal` run to.
-        let effective_total_steps = if config.max_steps == 0 {
-            total_steps
-        } else {
-            config.max_steps.min(total_steps)
-        };
+        let lr_plan = LrPlan::new(&config, total_steps)?;
 
         Ok(Self {
             config,
@@ -181,9 +157,7 @@ where
             start_position,
             model_config,
             data_file_path,
-            warmup_steps,
-            base_learning_rate,
-            effective_total_steps,
+            lr_plan,
             mask_stats_logged: false,
             last_loss: None,
         })
@@ -230,25 +204,8 @@ where
         // for every entry, preserving the TensorId keys that AdamW uses for state.
         let step_model = model.rebuild_with_parameters(self.params)?;
         self.assert_stable_parameter_ids(&step_model)?;
-        // Apply learning rate warmup at the START of each step (critical for Mamba SSM alignment)
-        // This ensures consistent LR throughout forward/backward/optimizer
-        if self.warmup_steps > 0 && self.global_step < self.warmup_steps {
-            let warmup_ratio = (self.global_step + 1) as f64 / self.warmup_steps as f64;
-            let warmup_lr = (self.base_learning_rate * warmup_ratio).max(1e-7);
-            self.optimizer.set_lr(warmup_lr);
-        } else {
-            // Past warmup (or warmup disabled): `Constant` holds
-            // `base_learning_rate` flat, exactly as before this schedule
-            // existed; `Cosine`/`Linear` decay it toward
-            // `min_lr_ratio * base_learning_rate` by `effective_total_steps`.
-            let multiplier = self.config.lr_schedule.decay_multiplier(
-                self.global_step,
-                self.warmup_steps,
-                self.effective_total_steps,
-                self.config.min_lr_ratio,
-            );
-            self.optimizer.set_lr(self.base_learning_rate * multiplier);
-        }
+        // Set this step's learning rate once, before forward, backward and the optimizer.
+        self.optimizer.set_lr(self.lr_at(self.global_step));
 
         #[allow(unused_assignments)]
         let mut last_grad_norm = 0.0;
@@ -709,23 +666,12 @@ where
         self.last_loss
     }
 
-    /// Get the current effective learning rate (accounting for warmup)
-    /// Call AFTER global_step has been incremented (i.e., after training_step)
-    fn current_learning_rate(&self) -> f64 {
-        if self.warmup_steps > 0 && self.global_step <= self.warmup_steps {
-            // During warmup: LR = base_lr * step / warmup_steps
-            self.base_learning_rate * (self.global_step as f64 / self.warmup_steps as f64)
-        } else {
-            // After warmup: base LR times the schedule's decay multiplier
-            // (1.0, i.e. unchanged, when `lr_schedule` is `Constant`).
-            let multiplier = self.config.lr_schedule.decay_multiplier(
-                self.global_step,
-                self.warmup_steps,
-                self.effective_total_steps,
-                self.config.min_lr_ratio,
-            );
-            self.base_learning_rate * multiplier
-        }
+    /// Learning rate `training_step` applies in 0-indexed step `step`.
+    ///
+    /// A pure function of `step`, so a resumed run continues the schedule at
+    /// its restored `global_step`.
+    fn lr_at(&self, step: usize) -> f64 {
+        self.lr_plan.lr_at(step)
     }
 
     pub fn fit<D: DataLoader<R>>(
@@ -791,13 +737,14 @@ where
         let training_start = Instant::now();
 
         // max_steps=0 means unlimited (train for full epochs)
-        let effective_steps = self.effective_total_steps;
+        let effective_steps = self.lr_plan.total_steps();
 
         // Log warmup info if enabled
-        if self.warmup_steps > 0 {
+        if self.lr_plan.warmup_steps() > 0 {
             println!(
                 "{{\"warmup\": {{\"steps\": {}, \"base_lr\": {:.6e}}}}}",
-                self.warmup_steps, self.base_learning_rate
+                self.lr_plan.warmup_steps(),
+                self.lr_plan.base_lr()
             );
         }
 
@@ -839,7 +786,7 @@ where
                     .unwrap_or_else(|| "0".to_string());
 
                 println!("{{\"step\": {}, \"loss\": {:.4}, \"grad_norm\": {:.4}, \"learning_rate\": {:.6e}, \"epoch\": {:.2}, \"samples/s\": {:.2}, \"vram\": \"{}\"}}",
-                    step + 1, loss, grad_norm, self.current_learning_rate(), current_epoch, samples_s, vram);
+                    step + 1, loss, grad_norm, self.lr_at(step), current_epoch, samples_s, vram);
                 self.record_step(step + 1, loss, grad_norm, current_epoch);
             }
 
@@ -864,13 +811,15 @@ where
 
     /// Appends one step line to `steps.json`. Both output modes call this.
     ///
-    /// A write error prints a warning and never stops the run.
+    /// `step` is the 1-based count of completed steps. The line records the
+    /// learning rate that step applied. A write error prints a warning and
+    /// never stops the run.
     fn record_step(&self, step: usize, loss: f64, grad_norm: f64, epoch: f64) {
         let record = crate::run_record::StepRecord {
             step,
             loss,
             grad_norm,
-            learning_rate: self.current_learning_rate(),
+            learning_rate: self.lr_at(step.saturating_sub(1)),
             epoch,
         };
         if let Err(e) = record.append_to(Path::new(&self.steps_json_path)) {
@@ -884,7 +833,7 @@ where
         data_loader: &mut D,
     ) -> Result<()> {
         // Respect max_steps limit (0 = unlimited, train for full epochs)
-        let effective_steps = self.effective_total_steps;
+        let effective_steps = self.lr_plan.total_steps();
 
         // MultiProgress: scrollable logs above, sticky progress bar below
         let mp = MultiProgress::new();
@@ -908,10 +857,11 @@ where
         }
 
         // Log warmup info if enabled
-        if self.warmup_steps > 0 {
+        if self.lr_plan.warmup_steps() > 0 {
             mp.println(format!(
                 "🔥 Warmup: {} steps, base LR: {:.6e}",
-                self.warmup_steps, self.base_learning_rate
+                self.lr_plan.warmup_steps(),
+                self.lr_plan.base_lr()
             ))
             .ok();
         }

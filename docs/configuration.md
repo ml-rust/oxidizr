@@ -104,6 +104,41 @@ Enable Mixture of Experts:
 | `max_grad_norm` | Global gradient norm clip | 1.0 |
 | `max_grad_value` | Per-element gradient clamp, applied before the norm clip. Must be finite and positive. Omit to disable. | none |
 
+### Learning Rate Schedule
+
+Warmup runs first. Step `s` of `W` warmup steps applies `learning_rate * (s + 1) / W`, at least `1e-7`. The schedule covers every later step up to the run's last step `T`. `T` is `max_steps`, capped by the steps in `num_epochs` epochs.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `warmup_steps` | Warmup step count. Overrides `warmup_ratio` | none |
+| `warmup_ratio` | Warmup as a fraction of the epoch steps, rounded up | 0.1 |
+| `lr_schedule` | `constant`, `cosine`, `linear` or `wsd` | `constant` |
+| `min_lr_ratio` | Fraction of `learning_rate` reached at step `T`, in `[0, 1]` | 0.0 |
+| `decay_ratio` | `wsd` only: fraction of `T` the decay spans, in `(0, 1]`. Excludes `decay_steps` | 0.1 |
+| `decay_steps` | `wsd` only: decay step count. Excludes `decay_ratio` | none |
+| `decay_shape` | `wsd` only: `linear`, `cosine` or `sqrt` | `linear` |
+
+Schedules after warmup:
+
+- `constant`: holds `learning_rate`.
+- `cosine`, `linear`: decay from `learning_rate` at step `W` to `min_lr_ratio * learning_rate` at step `T`.
+- `wsd`: holds `learning_rate` until step `T - D`, then decays over `D` steps to `min_lr_ratio * learning_rate`. `D` is `decay_steps`, else `ceil(decay_ratio * T)`.
+
+Every step from `T` on applies `min_lr_ratio * learning_rate`. A decaying schedule needs `max_steps` or `num_epochs` above 0. A `wsd` run is an error when `W + D` exceeds `T`. The decay keys are an error with any schedule other than `wsd`.
+
+```yaml
+trainer:
+  learning_rate: 0.0003
+  max_steps: 10000
+  warmup_steps: 500
+  lr_schedule: wsd
+  decay_ratio: 0.2      # decay over steps 8000..10000
+  decay_shape: sqrt
+  min_lr_ratio: 0.1
+```
+
+The schedule is a function of the step, so a resumed run continues it at the restored step. The `learning_rate` in headless output and `steps.json` is the rate the logged step applied.
+
 ## Complete Example
 
 ### Standard Transformer
