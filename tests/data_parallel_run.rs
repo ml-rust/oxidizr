@@ -10,8 +10,8 @@ mod common;
 use boostr::runtime::{Communicator, LocalCommunicator, ReduceOp};
 use boostr::{CpuRuntime, DType, NumrError, NumrResult};
 use common::{
-    bits_by_name, build_model, holdout_eval, scratch_dir, tiny_config, tokens, train_parts,
-    write_config_yaml, write_token_file,
+    bits_by_name, build_model, event_files, holdout_eval, scratch_dir, tiny_config, tokens,
+    train_parts, write_config_yaml, write_token_file,
 };
 use oxidizr::checkpoint_set::CheckpointLabel;
 use oxidizr::commands::{run_train, run_train_with_group, TrainArgs};
@@ -107,11 +107,14 @@ fn file_bits(cfg: &LitConfig, path: &str) -> Bits {
 }
 
 /// Sorted entry names of `dir`.
+///
+/// TensorBoard event files are left out: only a `tensorboard` build writes them.
 fn entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .expect("read dir")
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with("events.out.tfevents."))
         .collect();
     names.sort();
     names
@@ -140,6 +143,12 @@ fn a_world_two_run_writes_rank_zero_outputs_and_matches_one_rank_on_the_merged_b
 
     let run_dir = dir.join("dp");
     assert_eq!(entries(&run_dir), vec!["run.json", "steps.json"]);
+    let events = usize::from(cfg!(feature = "tensorboard"));
+    assert_eq!(
+        event_files(&run_dir).len(),
+        events,
+        "rank 0 alone writes events"
+    );
     let record = RunRecord::load(&run_dir).expect("run.json");
     assert_eq!(record.status, RunStatus::Completed, "{record:?}");
     assert_eq!(record.final_step, 4);

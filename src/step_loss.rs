@@ -116,6 +116,16 @@ impl StepWeighting {
         }
     }
 
+    /// Scored tokens of the step. `None` for an unmasked step, which scores every token.
+    ///
+    /// After [`over_ranks`](Self::over_ranks) the count covers every rank.
+    pub fn scored_tokens(&self) -> Option<usize> {
+        match self {
+            Self::MicroBatchMean { .. } => None,
+            Self::ScoredTokens { total_scored, .. } => Some(*total_scored),
+        }
+    }
+
     /// Cross-entropy term of one micro-batch, before the `1 / micro_batches`
     /// scale.
     ///
@@ -514,5 +524,18 @@ mod tests {
     fn unmasked_steps_have_no_empty_loss() {
         let weighting = StepWeighting::MicroBatchMean { micro_batches: 2 };
         assert!(weighting.loss_without_terms().is_err());
+    }
+
+    #[test]
+    fn only_a_masked_step_reports_its_global_scored_count() {
+        let mean = StepWeighting::MicroBatchMean { micro_batches: 2 };
+        assert_eq!(mean.scored_tokens(), None);
+        let local = StepWeighting::ScoredTokens {
+            micro_batches: 2,
+            total_scored: 5,
+        };
+        assert_eq!(local.scored_tokens(), Some(5));
+        let global = local.over_ranks(2, Some(11)).expect("over ranks");
+        assert_eq!(global.scored_tokens(), Some(11));
     }
 }

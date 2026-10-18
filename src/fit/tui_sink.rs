@@ -73,13 +73,7 @@ impl StepSink for TuiSink {
         self.last = (report.loss, report.grad_norm);
         if let Some(pb) = &self.pb {
             pb.set_position(report.step as u64);
-            pb.set_message(format!(
-                "{}] loss: {:.4} | grad: {:.4} | {:.2} samples/s",
-                format_duration(report.eta_secs),
-                report.loss,
-                report.grad_norm,
-                report.recent_samples_per_sec
-            ));
+            pb.set_message(step_message(report));
         }
         Ok(())
     }
@@ -151,6 +145,21 @@ impl StepSink for TuiSink {
     }
 }
 
+/// The bar message of `report`: ETA, loss, norm, recent throughput, and MFU when configured.
+fn step_message(report: &StepReport) -> String {
+    let mfu = report
+        .mfu
+        .map_or_else(String::new, |mfu| format!(" | MFU {:.1}%", mfu * 100.0));
+    format!(
+        "{}] loss: {:.4} | grad: {:.4} | {:.2} samples/s | {:.0} tok/s{mfu}",
+        format_duration(report.eta_secs),
+        report.loss,
+        report.grad_norm,
+        report.recent_samples_per_sec,
+        report.recent_tokens_per_sec
+    )
+}
+
 /// Seconds as the largest two units, such as `5m32s`, `2h14m` or `3d05h`.
 fn format_duration(secs: f64) -> String {
     let total_secs = secs.round() as u64;
@@ -203,7 +212,22 @@ mod tests {
             session_samples_per_sec: 1.0,
             recent_samples_per_sec: 1.0,
             eta_secs: 1.0,
+            tokens: 16,
+            scored_tokens: None,
+            tokens_per_sec: 8.0,
+            recent_tokens_per_sec: 8.0,
+            mfu: None,
+            spike: None,
         };
+        assert_eq!(
+            step_message(&report),
+            "1s] loss: 2.5000 | grad: 0.5000 | 1.00 samples/s | 8 tok/s"
+        );
+        let with_mfu = StepReport {
+            mfu: Some(0.4137),
+            ..report.clone()
+        };
+        assert!(step_message(&with_mfu).ends_with("8 tok/s | MFU 41.4%"));
         sink.on_step(&report).expect("step");
         assert_eq!(sink.last, (2.5, 0.5));
         assert_eq!(sink.pb.as_ref().map(ProgressBar::position), Some(3));

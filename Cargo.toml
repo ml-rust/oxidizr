@@ -30,8 +30,11 @@ exclude = [
 default = ["f16"]
 # Half-precision (F16 / BF16) dtype support.
 f16 = ["boostr/f16"]
-# CUDA GPU acceleration (via boostr CubeCL backend)
-cuda = ["boostr/cuda"]
+# CUDA GPU acceleration (via boostr CubeCL backend). NVML reports GPU memory;
+# it loads libnvidia-ml at run time, so the build needs no NVIDIA library.
+cuda = ["boostr/cuda", "dep:nvml-wrapper"]
+# TensorBoard event files of the training scalars in the run directory.
+tensorboard = []
 # Multi-GPU data parallelism over NCCL (boostr/nccl).
 nccl = ["cuda", "boostr/nccl"]
 # HuggingFace Hub integration for model publishing
@@ -88,7 +91,9 @@ voxr = { version = "0.7", optional = true }
 
 # Data & Config
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `float_roundtrip` parses every f64 back to its exact bits. The spike guard's
+# EMA state in a checkpoint meta must resume bit-identical.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
 anyhow = "1.0"
 rand = "0.8"
@@ -109,6 +114,10 @@ memmap2 = "0.9"
 # Environment and interactive CLI
 dotenvy = "0.15"
 dialoguer = "0.11"
+
+# NVML bindings for GPU memory (optional, `cuda`). The library loads at run
+# time, and a missing driver reads as "unavailable".
+nvml-wrapper = { version = "0.13", optional = true }
 
 # HuggingFace Hub (optional, for model publishing)
 hf-hub = { version = "0.4", optional = true }

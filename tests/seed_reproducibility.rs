@@ -93,6 +93,8 @@ fn trainer_config(seed: Option<u64>) -> TrainerConfig {
         shuffle_rows: true,
         loss_scale: None,
         eval: None,
+        metrics: None,
+        spike_guard: None,
     }
 }
 

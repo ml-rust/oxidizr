@@ -26,6 +26,11 @@ impl Throughput {
         }
     }
 
+    /// Samples each step processes.
+    pub(crate) fn samples_per_step(&self) -> usize {
+        self.samples_per_step
+    }
+
     /// Restarts the step clock. The fit loop calls this right before its first step.
     pub(crate) fn restart_step_clock(&mut self) {
         self.step_start = Instant::now();

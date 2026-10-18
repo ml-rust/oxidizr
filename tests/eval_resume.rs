@@ -15,6 +15,7 @@ use oxidizr::fit::{
     CheckpointNote, EvalReport, FitStart, FitSummary, JsonSink, StepReport, StepSink,
 };
 use oxidizr::loss_scale::read_loss_scale_state;
+use oxidizr::metrics::GpuMemory;
 use oxidizr::model::load_checkpoint_into_model;
 use oxidizr::prelude::{Error, Result};
 use oxidizr::run_record::EVALS_FILE;
@@ -29,8 +30,8 @@ const HOLDOUT: usize = 40;
 
 type Bits = BTreeMap<String, Vec<u32>>;
 
-fn zero_vram() -> String {
-    "0".to_string()
+fn no_gpu() -> Option<GpuMemory> {
+    None
 }
 
 /// A sink that stops the run right after the interval checkpoint of step `at` commits.
@@ -135,7 +136,7 @@ fn session(cfg: &LitConfig, resume: bool, sink: &mut dyn StepSink) -> (Session, 
 
 /// A headless sink whose output nobody reads.
 fn quiet() -> JsonSink<std::io::Sink, std::io::Sink> {
-    JsonSink::new(std::io::sink(), std::io::sink(), zero_vram)
+    JsonSink::new(std::io::sink(), std::io::sink(), no_gpu)
 }
 
 fn final_meta(dir: &Path) -> CheckpointMeta {
@@ -226,7 +227,7 @@ fn a_resume_after_the_stopping_eval_runs_no_step() {
     assert!(stopped.stop_reason.is_some(), "eval 3 spends the patience");
 
     let mut out = Vec::new();
-    let mut sink = JsonSink::new(&mut out, std::io::sink(), zero_vram);
+    let mut sink = JsonSink::new(&mut out, std::io::sink(), no_gpu);
     let (resumed, result) = session(&cfg, true, &mut sink);
     result.expect("resumed run");
     assert_eq!(resumed.final_step, 3);

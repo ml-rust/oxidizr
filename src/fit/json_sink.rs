@@ -1,6 +1,7 @@
 //! Headless output: one JSON line per event on stdout, the error line on stderr.
 
 use super::sink::{CheckpointNote, EvalReport, FitStart, FitSummary, StepReport, StepSink};
+use crate::metrics::{device_mib_text, gpu_memory, process_mib_text, GpuMemory, SpikeEvent};
 use crate::prelude::{Error, Result};
 use std::io::{self, Stderr, Stdout, Write};
 
@@ -10,20 +11,36 @@ use std::io::{self, Stderr, Stdout, Write};
 pub struct JsonSink<O: Write, E: Write> {
     out: O,
     err: E,
-    /// Reports device memory in use, in MiB, for each logged step.
-    vram: fn() -> String,
+    /// Reads the GPU memory of this process for each logged step. `None` when unknown.
+    memory: fn() -> Option<GpuMemory>,
 }
 
 impl JsonSink<Stdout, Stderr> {
-    /// The sink of `--headless`: stdout, stderr and `nvidia-smi` for memory.
+    /// The sink of `--headless`: stdout, stderr and NVML for memory.
     pub fn stdio() -> Self {
-        Self::new(io::stdout(), io::stderr(), query_vram)
+        Self::new(io::stdout(), io::stderr(), gpu_memory)
     }
 }
 
 impl<O: Write, E: Write> JsonSink<O, E> {
-    pub fn new(out: O, err: E, vram: fn() -> String) -> Self {
-        Self { out, err, vram }
+    pub fn new(out: O, err: E, memory: fn() -> Option<GpuMemory>) -> Self {
+        Self { out, err, memory }
+    }
+
+    /// The `{"spike": ...}` event line of `event`.
+    fn write_spike(&mut self, event: &SpikeEvent) -> Result<()> {
+        writeln!(
+            self.out,
+            "{{\"spike\": {{\"step\": {}, \"loss\": {}, \"mean\": {}, \"std\": {}, \"z\": {}, \
+             \"action\": \"{}\"}}}}",
+            event.step,
+            fixed4(event.loss),
+            fixed4(event.mean),
+            fixed4(event.std),
+            fixed4(event.z()),
+            event.action.name()
+        )?;
+        Ok(())
     }
 }
 
@@ -40,21 +57,36 @@ impl<O: Write, E: Write> StepSink for JsonSink<O, E> {
     }
 
     fn on_step(&mut self, report: &StepReport) -> Result<()> {
+        if let Some(event) = &report.spike {
+            self.write_spike(event)?;
+        }
         if !report.logged {
             return Ok(());
         }
-        let vram = (self.vram)();
+        let memory = (self.memory)();
+        // New keys go after `vram`, so the keys before it keep their order.
+        let mut tail = String::new();
+        if let Some(scored) = report.scored_tokens {
+            tail.push_str(&format!(", \"scored_tokens\": {scored}"));
+        }
+        if let Some(mfu) = report.mfu {
+            tail.push_str(&format!(", \"mfu\": {}", fixed4(mfu)));
+        }
         writeln!(
             self.out,
             "{{\"step\": {}, \"loss\": {:.4}, \"grad_norm\": {:.4}, \"learning_rate\": {:.6e}, \
-             \"epoch\": {:.2}, \"samples/s\": {:.2}, \"vram\": \"{}\"}}",
+             \"epoch\": {:.2}, \"samples/s\": {:.2}, \"vram\": \"{}\", \"tokens\": {}, \
+             \"tokens_per_sec\": {:.2}, \"vram_device\": \"{}\"{tail}}}",
             report.step,
             report.loss,
             report.grad_norm,
             report.learning_rate,
             report.epoch,
             report.session_samples_per_sec,
-            vram
+            process_mib_text(memory),
+            report.tokens,
+            report.tokens_per_sec,
+            device_mib_text(memory),
         )?;
         Ok(())
     }
@@ -121,20 +153,6 @@ fn fixed4(value: f64) -> String {
     }
 }
 
-/// Memory of the first compute process `nvidia-smi` lists, in MiB. `"0"` when unknown.
-fn query_vram() -> String {
-    std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-compute-apps=used_memory",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
-        .unwrap_or_else(|| "0".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,11 +168,27 @@ mod tests {
             session_samples_per_sec: 3.0912,
             recent_samples_per_sec: 9.0,
             eta_secs: 1.0,
+            tokens: 2048,
+            scored_tokens: None,
+            tokens_per_sec: 395.6736,
+            recent_tokens_per_sec: 1152.0,
+            mfu: None,
+            spike: None,
         }
     }
 
-    fn zero_vram() -> String {
-        "0".to_string()
+    fn no_gpu() -> Option<GpuMemory> {
+        None
+    }
+
+    fn one_gpu() -> Option<GpuMemory> {
+        const MIB: u64 = 1024 * 1024;
+        Some(GpuMemory {
+            process_bytes: Some(812 * MIB),
+            devices: 1,
+            device_used_bytes: 1024 * MIB,
+            device_total_bytes: 12288 * MIB,
+        })
     }
 
     fn lines(bytes: &[u8]) -> Vec<String> {
@@ -168,7 +202,7 @@ mod tests {
     #[test]
     fn every_event_writes_the_documented_line() {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let mut sink = JsonSink::new(&mut out, &mut err, zero_vram);
+        let mut sink = JsonSink::new(&mut out, &mut err, no_gpu);
         let start = FitStart {
             start_step: 0,
             total_steps: 30,
@@ -195,7 +229,7 @@ mod tests {
             lines(&out),
             [
                 r#"{"warmup": {"steps": 2, "base_lr": 3.000000e-3}}"#,
-                r#"{"step": 21, "loss": 11.4948, "grad_norm": 0.1980, "learning_rate": 2.000000e-3, "epoch": 0.21, "samples/s": 3.09, "vram": "0"}"#,
+                r#"{"step": 21, "loss": 11.4948, "grad_norm": 0.1980, "learning_rate": 2.000000e-3, "epoch": 0.21, "samples/s": 3.09, "vram": "n/a", "tokens": 2048, "tokens_per_sec": 395.67, "vram_device": "n/a"}"#,
                 r#"{"checkpoint": {"step": 21}}"#,
                 "Saving final checkpoint to ckpt/m_final.safetensors",
                 r#"{"status": "complete"}"#,
@@ -207,7 +241,7 @@ mod tests {
     #[test]
     fn a_step_error_writes_one_json_line_to_stderr() {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let mut sink = JsonSink::new(&mut out, &mut err, zero_vram);
+        let mut sink = JsonSink::new(&mut out, &mut err, no_gpu);
         let error = Error::TrainingError {
             reason: "NaN loss detected".to_string(),
         };
@@ -225,7 +259,7 @@ mod tests {
     #[test]
     fn eval_best_and_early_stop_events_write_json_lines() {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let mut sink = JsonSink::new(&mut out, &mut err, zero_vram);
+        let mut sink = JsonSink::new(&mut out, &mut err, no_gpu);
         let mut report = EvalReport {
             loss: 2.3125,
             perplexity: 10.0625,
@@ -268,7 +302,7 @@ mod tests {
     #[test]
     fn no_warmup_writes_no_warmup_line() {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let mut sink = JsonSink::new(&mut out, &mut err, zero_vram);
+        let mut sink = JsonSink::new(&mut out, &mut err, no_gpu);
         let start = FitStart {
             start_step: 3,
             total_steps: 6,
@@ -277,5 +311,51 @@ mod tests {
         };
         sink.on_start(&start).expect("start");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_masked_step_with_mfu_appends_its_keys_after_vram_device() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut sink = JsonSink::new(&mut out, &mut err, one_gpu);
+        let step = StepReport {
+            scored_tokens: Some(731),
+            mfu: Some(0.41237),
+            ..report(true)
+        };
+        sink.on_step(&step).expect("step");
+        assert_eq!(
+            lines(&out),
+            [
+                r#"{"step": 21, "loss": 11.4948, "grad_norm": 0.1980, "learning_rate": 2.000000e-3, "epoch": 0.21, "samples/s": 3.09, "vram": "812", "tokens": 2048, "tokens_per_sec": 395.67, "vram_device": "1024/12288", "scored_tokens": 731, "mfu": 0.4124}"#
+            ]
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&lines(&out)[0]).expect("JSON");
+        assert_eq!(parsed["scored_tokens"], 731);
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn a_spike_writes_its_event_line_on_every_step() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut sink = JsonSink::new(&mut out, &mut err, no_gpu);
+        let spike = SpikeEvent {
+            step: 21,
+            loss: 11.49481,
+            mean: 3.5,
+            std: 0.0,
+            action: crate::metrics::SpikeAction::Skip,
+        };
+        let step = StepReport {
+            spike: Some(spike),
+            ..report(false)
+        };
+        sink.on_step(&step).expect("silent step");
+        assert_eq!(
+            lines(&out),
+            [
+                r#"{"spike": {"step": 21, "loss": 11.4948, "mean": 3.5000, "std": 0.0000, "z": null, "action": "skip"}}"#
+            ]
+        );
+        assert!(err.is_empty());
     }
 }

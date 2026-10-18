@@ -226,6 +226,62 @@ trainer:
 
 The checkpoint meta records the held-out row count and the stop counters. A resume continues the counters exactly. A resume with another held-out row count is an error, because the count decides which rows the saved data position counts.
 
+### Throughput and MFU
+
+Every step reports its token count and tokens per second. `trainer.metrics` adds model FLOPs utilization (MFU).
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `metrics.peak_tflops` | Peak dense TFLOP/s of one device at the run's precision. Finite and positive. Absent: no MFU | none |
+
+Rules:
+
+- `tokens` is the step's rows over every rank times `max_seq_len`: `batch_size * gradient_accumulation * world * max_seq_len`. A masked run also reports `scored_tokens`, the scored targets over every rank.
+- `tokens_per_sec` is the session's tokens over every rank divided by its elapsed seconds.
+- `MFU = flops_per_token * tokens_per_sec / (world * peak_tflops * 1e12)`. `peak_tflops` is per device. oxidizr never guesses it.
+- `flops_per_token = 6 * N + 12 * L * W * T`, the PaLM form:
+  - `N` counts every parameter of rank 2 or more. Norm scales, biases and the SSM `A`/`D` vectors stay out.
+  - The input embedding is a gather and stays out. The output head counts once, tied or not.
+  - A routed MoE expert counts `experts_per_tok / num_experts` of its weights. The router and the shared expert count in full.
+  - A frozen weight, such as a LoRA base weight, counts 4 per token instead of 6: it has no weight gradient.
+  - `L` is the attention layers, `W` is `num_heads * head_dim`, and `T` is `max_seq_len`, capped at `sliding_window`.
+- Limits: the count ignores the causal mask, softmax, norms, activations, the MLA latent width, the Mamba scan and the Gated DeltaNet recurrence. Mamba and Gated DeltaNet layers add only their weights. MFU is therefore a lower bound.
+
+```yaml
+trainer:
+  metrics:
+    peak_tflops: 165.0   # one device's dense bf16 peak, from its datasheet
+```
+
+### Loss-Spike Guard
+
+`trainer.spike_guard` flags a step whose loss jumps far above its recent average. Without the key the guard is off, and the run, its meta and its model hash stay as before.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `spike_guard.window` | EMA span in steps. A new loss weighs `2 / (window + 1)`. At least 1 | 100 |
+| `spike_guard.z_threshold` | Standard deviations above the EMA mean that flag a spike. Finite and positive | 6.0 |
+| `spike_guard.min_steps` | Losses the EMA must hold before the guard flags any step. Values below 2 act as 2 | 50 |
+| `spike_guard.action` | `skip` or `warn` | `skip` |
+
+Rules:
+
+- The guard keeps an exponential moving mean and variance of the step loss. It reads the loss after the data-parallel sum, before the optimizer step. Every rank holds the same loss, so every rank flags the same steps.
+- A finite loss above `mean + z_threshold * std` is a spike. A spike never enters the EMA. A non-finite loss is never judged and never enters the EMA: it keeps the overflow skip of [Loss Scaling](#loss-scaling-f16).
+- `warn` prints a stderr line and writes a `{"spike": ...}` headless line. The step trains as usual.
+- `skip` does the same and skips the optimizer step. The parameters and the AdamW step count stay unchanged. The step still draws its batches, so the data position stays valid. With finite gradients the f16 loss scale stays unchanged. A spike step with an overflow backs the scale off as any overflow does.
+- `run.json` records `spikes_detected` and `spikes_skipped`. The checkpoint meta records the EMA and the counters under `spike_guard`, so a resume continues exactly.
+- An unknown key inside `spike_guard` or `metrics` is an error.
+
+```yaml
+trainer:
+  spike_guard:
+    window: 100
+    z_threshold: 6.0
+    min_steps: 50
+    action: skip
+```
+
 ### Learning Rate Schedule
 
 Warmup runs first. Step `s` of `W` warmup steps applies `learning_rate * (s + 1) / W`, at least `1e-7`. The schedule covers every later step up to the run's last step `T`. `T` is `max_steps`, capped by the steps in `num_epochs` epochs.

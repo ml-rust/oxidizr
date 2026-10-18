@@ -7,6 +7,7 @@ use crate::data::{DataLoader, DataPosition, RowLayout};
 use crate::dp::{reduce_step_gradients, reduce_step_weighting, AbortHook};
 use crate::eval::Evaluator;
 use crate::loss_scale::{resolve_loss_scale, restore_loss_scale, weighted_loss, LossScaler};
+use crate::metrics::TrainMetrics;
 use crate::oom_guard::{oom_guard, Pass};
 use crate::prelude::{DType, Error, FusedAdamW, Result, Tensor};
 use crate::schedule::LrPlan;
@@ -96,6 +97,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     pub(crate) abort_hook: Option<AbortHook>,
     /// True once rank 0's early-stop broadcast told this rank to stop.
     pub(crate) peer_stop: bool,
+    /// Scored tokens, MFU config, the spike guard and the scalar log.
+    pub(crate) metrics: TrainMetrics,
 }
 
 impl<'a, R> LitTrainer<'a, R>
@@ -164,6 +167,7 @@ where
         let loss_scaler = resolve_loss_scale(config.loss_scale.as_ref(), model_config.dtype)?
             .map(LossScaler::new)
             .transpose()?;
+        let metrics = TrainMetrics::new(&config)?;
 
         Ok(Self {
             config,
@@ -193,6 +197,7 @@ where
             comm: Arc::new(NoOpCommunicator),
             abort_hook: None,
             peer_stop: false,
+            metrics,
         })
     }
 
@@ -476,6 +481,9 @@ where
             &*self.params,
             local_loss,
         )?;
+        // The global loss and scored count, identical on every rank.
+        let loss = self.metrics.probe_loss(self.global_step, loss);
+        self.metrics.last_scored = weighting.scored_tokens();
 
         // Check parameter/gradient matching at step 1.
         // Gradients must be keyed by the same stable TensorIds used in self.params.
@@ -556,6 +564,12 @@ where
             self.print_gradient_breakdown(&grads);
         }
 
+        // The spike guard judges the global loss, so every rank decides alike.
+        let spike_skip = self.metrics.judge(self.global_step, loss);
+        if let (Some(event), false) = (self.metrics.last_spike, self.quiet()) {
+            eprintln!("{}", event.describe());
+        }
+
         // 2. Skip step if gradient norm is invalid (inf/NaN). Under loss
         // scaling this is the overflow signal: the scale backs off below.
         let overflow = !grad_norm.is_finite();
@@ -568,6 +582,9 @@ where
                 );
                 self.diagnose_bad_gradients(&grads);
             }
+            last_grad_norm = grad_norm;
+        } else if spike_skip {
+            // A spike skip reports the measured norm, as an overflow skip does.
             last_grad_norm = grad_norm;
         } else {
             // 3. Optional tighter target norm clipping delegates to the same boostr utility.
@@ -601,7 +618,12 @@ where
         }
 
         let quiet = self.quiet();
-        if let Some(scaler) = self.loss_scaler.as_mut() {
+        // A spike skip with finite gradients leaves the loss scale untouched.
+        let scaler = self
+            .loss_scaler
+            .as_mut()
+            .filter(|_| overflow || !spike_skip);
+        if let Some(scaler) = scaler {
             let scale = scaler.scale();
             scaler.record_step(overflow);
             if overflow && !quiet {
@@ -794,6 +816,7 @@ where
             eval: self.eval_checkpoint(),
             world_size: self.world_size(),
             global_batch_rows: self.row_layout.batch_size(),
+            spike_guard: self.metrics.spike_state(),
         })
     }
 

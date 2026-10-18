@@ -161,7 +161,9 @@ Key `trainer` fields:
 | `warmup_steps`, `lr_schedule`, `min_lr_ratio` | Warmup, then `constant`, `cosine`, `linear` or `wsd` decay. Logged rates are the rates each step applied |
 | `weight_decay`, `weight_decay_rule`, `no_decay_patterns` | AdamW decay coefficient, and the parameters it applies to. `skip_1d` (fresh-run default) skips norms, biases and SSM `a_log`/`D`. `decay_all` decays everything. `skip_all` decays nothing. A resume keeps the checkpoint's rule |
 | `checkpoint_dir`, `save_interval`, `max_checkpoints` | Checkpoint location, frequency, and retention (`0` keeps all) |
-| `log_interval` | Steps between metric updates |
+| `log_interval` | Steps between metric updates. Each update reports tokens and tokens per second over every rank |
+| `metrics.peak_tflops` | One device's peak TFLOP/s. Set, the logs report MFU. Absent, no MFU |
+| `spike_guard` | Loss-spike guard: an EMA of the step loss over `window` steps. A loss `z_threshold` std above it after `min_steps` losses is a spike. `action: skip` skips its optimizer step, `warn` reports it. Absent, nothing changes |
 | `eval` | Validation on `holdout_rows`, `holdout_fraction` or a `data_file`, every `interval` steps over `batches` batches. `early_stopping` (`patience`, `min_delta`) stops the run cleanly. A new best writes the `best` checkpoint. Absent, nothing changes |
 | `target_device` | `gpu` or `cpu`. The CLI `--target-device` overrides it |
 | `load_balance_alpha` | MoE load-balance loss weight |
@@ -278,7 +280,8 @@ The CPU test suite runs every data-parallel path on in-process CPU ranks. The NC
 | Feature | Default | Enables |
 |---------|---------|---------|
 | `f16` | On | F16 and BF16 dtypes |
-| `cuda` | Off | CUDA backend (boostr CubeCL) |
+| `cuda` | Off | CUDA backend (boostr CubeCL), and GPU memory per process from NVML, loaded at run time |
+| `tensorboard` | Off | TensorBoard event files of the training and eval scalars in the run directory |
 | `nccl` | Off | Multi-GPU data parallelism over NCCL. Implies `cuda` |
 | `huggingface` | Off | `push` command |
 | `audio` | Off | `prep-corpus` command, with the voxr corpus pipeline and the Whisper, NeuCodec, and Silero VAD models |

@@ -22,6 +22,7 @@ pub mod eval;
 pub mod fit;
 pub mod grad_clip;
 pub mod loss_scale;
+pub mod metrics;
 pub mod model;
 mod oom_guard;
 pub mod prelude;

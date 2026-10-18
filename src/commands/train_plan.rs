@@ -12,6 +12,7 @@ use crate::distributed::{
 };
 use crate::dp::check_resume_world;
 use crate::loss_scale::{read_loss_scale_state, resolve_loss_scale};
+use crate::metrics::{read_spike_guard_state, SpikeGuardState};
 use crate::weight_decay::{inherited_weight_decay, resolve_weight_decay, WeightDecaySpec};
 use anyhow::Result;
 use boostr::optimizer::GradScalerState;
@@ -40,6 +41,8 @@ pub struct RunPlan {
     pub resume: ResumePoint,
     pub optimizer_resume: OptimizerResume,
     pub loss_scale_state: Option<GradScalerState>,
+    /// The spike guard state of the resumed checkpoint. `None` for a fresh run.
+    pub spike_guard_state: Option<SpikeGuardState>,
     pub weight_decay: WeightDecaySpec,
     /// The training tokens. Generated tokens are drawn once, so every rank reads the same.
     pub source: TokenSource,
@@ -108,6 +111,7 @@ impl RunPlan {
         // The config's weight decay rule, or the rule of the checkpoint this run resumes.
         let inherited_decay = inherited_weight_decay(meta, start_step)?;
         let loss_scale_state = read_loss_scale_state(meta, start_step)?;
+        let spike_guard_state = read_spike_guard_state(meta, start_step)?;
         let weight_decay =
             resolve_weight_decay(&config.trainer, inherited_decay.as_ref(), headless)?;
 
@@ -129,6 +133,7 @@ impl RunPlan {
             resume,
             optimizer_resume,
             loss_scale_state,
+            spike_guard_state,
             weight_decay,
             source,
         })

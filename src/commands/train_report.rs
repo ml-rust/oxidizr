@@ -52,32 +52,9 @@ pub fn estimate_params(cfg: &OxidizrModelConfig) -> String {
     }
 }
 
-/// GPU memory of the first GPU, from `nvidia-smi`. `None` when it does not answer.
+/// GPU memory of this process and of the GPUs it uses, from NVML. `None` when NVML is unavailable.
 pub fn cuda_memory_info() -> Option<String> {
-    let output = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.total,memory.used,memory.free",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let stats = String::from_utf8_lossy(&output.stdout);
-    let line = stats.lines().next()?;
-    let parts: Vec<f32> = line
-        .trim()
-        .split(',')
-        .map(|p| p.trim().parse().unwrap_or(0.0))
-        .collect();
-    let [total_mb, used_mb, free_mb] = parts.as_slice() else {
-        return None;
-    };
-    Some(format!(
-        "Total: {:.2} GB, Used: {:.2} GB, Free: {:.2} GB",
-        total_mb / 1024.0,
-        used_mb / 1024.0,
-        free_mb / 1024.0
-    ))
+    crate::metrics::summary_text(crate::metrics::gpu_memory())
 }
 
 /// What the banner reports about one run.

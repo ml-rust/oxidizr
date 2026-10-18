@@ -104,6 +104,7 @@ where
             since_best: eval.stopper.since_best(),
         };
         eval.record(completed, &report);
+        self.metrics.scalars.eval(completed, &report);
         sink.on_eval(completed, &report)?;
         if decision == Decision::Improved && self.config.save_interval > 0 {
             self.write_set(model, CheckpointLabel::Best, completed)?;

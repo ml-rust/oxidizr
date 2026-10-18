@@ -3,6 +3,7 @@ use crate::data::DataPosition;
 use crate::data_hash::{hash_json, legacy_file_hash, legacy_hash_str, HashAlgo};
 use crate::eval::EvalConfig;
 use crate::loss_scale::{resolve_loss_scale, LossScaleConfig};
+use crate::metrics::{MetricsConfig, SpikeGuardConfig, SpikeGuardState};
 use crate::schedule::{LrDecayShape, LrSchedule};
 use crate::weight_decay::WeightDecayRule;
 use boostr::model::{SpeechLayout, SpeechVocab};
@@ -805,6 +806,15 @@ pub struct TrainerConfig {
     /// `skip_serializing_if` keeps the key out of serialized configs while unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval: Option<EvalConfig>,
+
+    /// Throughput reporting. See [`MetricsConfig`]. Absent, the run reports no MFU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsConfig>,
+
+    /// The loss-spike guard. See [`SpikeGuardConfig`]. Absent, the guard is
+    /// off and the run trains bit-identical to a run without the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spike_guard: Option<SpikeGuardConfig>,
     // Unknown keys are ignored, as serde does for every config struct here.
     // Older configs carry `group_size` and `beta_kl`, which no trainer reads.
 }
@@ -873,6 +883,10 @@ impl LitConfig {
         crate::weight_decay::resolve_weight_decay(&self.trainer, None, true)?;
         if let Some(eval) = &self.trainer.eval {
             eval.validate()?;
+        }
+        self.trainer.metrics.unwrap_or_default().check()?;
+        if let Some(guard) = &self.trainer.spike_guard {
+            guard.check()?;
         }
 
         // Mamba2 constraint: hidden_size * expand == num_heads * head_dim
@@ -1037,6 +1051,8 @@ impl LitConfig {
                 shuffle_rows: true,
                 loss_scale: None,
                 eval: None,
+                metrics: None,
+                spike_guard: None,
             },
         }
     }
@@ -1137,6 +1153,8 @@ impl LitConfig {
                 shuffle_rows: true,
                 loss_scale: None,
                 eval: None,
+                metrics: None,
+                spike_guard: None,
             },
         }
     }
@@ -1206,6 +1224,10 @@ pub struct CheckpointMeta {
     /// metadata written before data parallelism: there it is `batch_size`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_batch_rows: Option<usize>,
+    /// Spike guard EMA and counters after `step` steps. A resume continues
+    /// from it. Absent without `trainer.spike_guard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spike_guard: Option<SpikeGuardState>,
 }
 
 fn default_dtype_string() -> String {
@@ -1252,6 +1274,7 @@ impl CheckpointMeta {
             evals_since_best: None,
             world_size: None,
             global_batch_rows: None,
+            spike_guard: None,
         })
     }
 

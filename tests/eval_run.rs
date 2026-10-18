@@ -5,8 +5,8 @@ mod common;
 
 use boostr::{CpuDevice, CpuRuntime};
 use common::{
-    bits_by_name, build_model, data_loader, eval_loaders, holdout_eval, scratch_dir, tiny_config,
-    train_parts, trainer, write_config_yaml,
+    bits_by_name, build_model, data_loader, eval_loaders, holdout_eval, scratch_dir,
+    steps_without_timing, tiny_config, train_parts, trainer, write_config_yaml,
 };
 use oxidizr::checkpoint_set::{remove_old_checkpoints, CheckpointLabel};
 use oxidizr::commands::train_data::{run_loaders, TokenSource};
@@ -14,6 +14,7 @@ use oxidizr::config::{find_latest_checkpoint, CheckpointMeta, LitConfig};
 use oxidizr::data::{DataPosition, LitDataLoader, RowOrder};
 use oxidizr::eval::{EarlyStoppingConfig, Evaluator};
 use oxidizr::fit::{JsonSink, StepSink, TuiSink};
+use oxidizr::metrics::GpuMemory;
 use oxidizr::run_record::{EvalRecord, EVALS_FILE, STEPS_FILE};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -22,8 +23,8 @@ use std::path::Path;
 const STEPS: usize = 6;
 const HOLDOUT: usize = 40;
 
-fn zero_vram() -> String {
-    "0".to_string()
+fn no_gpu() -> Option<GpuMemory> {
+    None
 }
 
 /// `tiny_config` with a held-out eval after every step.
@@ -126,7 +127,10 @@ fn evals_leave_the_training_run_bit_identical() {
     let without = fit(&without_cfg, &mut train, None, &mut TuiSink::hidden());
 
     assert_eq!(with.bits, without.bits);
-    assert_eq!(read(&with_dir, STEPS_FILE), read(&without_dir, STEPS_FILE));
+    assert_eq!(
+        steps_without_timing(&read(&with_dir, STEPS_FILE)),
+        steps_without_timing(&read(&without_dir, STEPS_FILE))
+    );
     assert_eq!(evals(&with_dir).len(), STEPS);
     assert!(!without_dir.join(EVALS_FILE).exists());
     let _ = fs::remove_dir_all(dir);
@@ -181,7 +185,7 @@ fn early_stopping_ends_the_run_cleanly_at_the_expected_eval() {
         &cfg,
         &mut train,
         Some(evaluator),
-        &mut JsonSink::new(&mut out, &mut err, zero_vram),
+        &mut JsonSink::new(&mut out, &mut err, no_gpu),
     );
 
     assert_eq!(run.final_step, 3);

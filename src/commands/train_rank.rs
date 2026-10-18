@@ -233,6 +233,8 @@ where
     if rank0 || (plan.loss_scale_state.is_some() && trainer.loss_scale_state().is_some()) {
         trainer.restore_loss_scale(plan.loss_scale_state)?;
     }
+    // Every rank restores the same state, so every rank flags the same steps.
+    trainer.restore_spike_guard(plan.spike_guard_state)?;
     if let Some(evaluator) = evaluator {
         trainer.attach_eval(evaluator);
     }
@@ -271,6 +273,7 @@ where
         p.final_step = trainer.global_step();
         p.last_loss = trainer.last_loss();
         p.eval = trainer.eval_outcome();
+        p.metrics = trainer.run_metrics();
     });
 
     let stopped = trainer.early_stop_reason();

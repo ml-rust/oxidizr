@@ -6,6 +6,7 @@
 //!   Absent for a run without `trainer.eval`.
 
 use crate::eval::EvalOutcome;
+use crate::metrics::RunMetrics;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -59,6 +60,18 @@ pub struct RunRecord {
     /// Why early stopping ended the run. Absent when it ran every step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// Session tokens per second over every rank at the last step. Absent when no step ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_sec: Option<f64>,
+    /// Model FLOPs utilization at the last step. Absent without `trainer.metrics.peak_tflops`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mfu: Option<f64>,
+    /// Steps the spike guard flagged, resumed steps included. Absent without `trainer.spike_guard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spikes_detected: Option<u64>,
+    /// Flagged steps that skipped the optimizer. Absent without `trainer.spike_guard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spikes_skipped: Option<u64>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -109,6 +122,8 @@ pub struct RunProgress {
     pub last_loss: Option<f64>,
     /// What the evals reached. `None` without `trainer.eval`.
     pub eval: Option<EvalOutcome>,
+    /// Throughput and spike figures of the last step.
+    pub metrics: RunMetrics,
 }
 
 impl RunProgress {
@@ -123,6 +138,7 @@ impl RunProgress {
             final_step: 0,
             last_loss: None,
             eval: None,
+            metrics: RunMetrics::default(),
         }
     }
 
@@ -147,6 +163,10 @@ impl RunProgress {
             evals: self.eval.as_ref().map(|e| e.evals),
             stopped_early: self.eval.as_ref().is_some_and(|e| e.stop_reason.is_some()),
             stop_reason: self.eval.as_ref().and_then(|e| e.stop_reason.clone()),
+            tokens_per_sec: self.metrics.tokens_per_sec,
+            mfu: self.metrics.mfu,
+            spikes_detected: self.metrics.spikes.map(|s| s.detected),
+            spikes_skipped: self.metrics.spikes.map(|s| s.skipped),
         }
     }
 }
@@ -189,13 +209,37 @@ fn append_line<T: Serialize>(value: &T, path: &Path, what: &str) -> anyhow::Resu
 }
 
 /// One line of `steps.json`.
+///
+/// The keys after `epoch` are absent in lines older oxidizr releases wrote.
+/// They then read as 0 or `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecord {
     pub step: usize,
+    /// JSON writes a non-finite value as `null`. It reads back as NaN.
+    #[serde(deserialize_with = "null_as_nan")]
     pub loss: f64,
+    /// An overflow step writes `null`. It reads back as NaN.
+    #[serde(deserialize_with = "null_as_nan")]
     pub grad_norm: f64,
     pub learning_rate: f64,
     pub epoch: f64,
+    /// Tokens the step processed over every rank.
+    #[serde(default)]
+    pub tokens: usize,
+    /// Session tokens per second over every rank.
+    #[serde(default, deserialize_with = "null_as_nan")]
+    pub tokens_per_sec: f64,
+    /// Tokens the loss scored over every rank. Absent for an unmasked run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scored_tokens: Option<usize>,
+    /// Model FLOPs utilization. Absent without `trainer.metrics.peak_tflops`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mfu: Option<f64>,
+}
+
+/// An f64 that JSON wrote as `null` because it was not finite reads back as NaN.
+fn null_as_nan<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(f64::NAN))
 }
 
 impl StepRecord {
@@ -250,6 +294,9 @@ mod tests {
         for key in ["best_eval_loss", "evals", "stopped_early", "stop_reason"] {
             assert!(json.get(key).is_none(), "{key} without an eval");
         }
+        for key in ["tokens_per_sec", "mfu", "spikes_detected", "spikes_skipped"] {
+            assert!(json.get(key).is_none(), "{key} without a step or a guard");
+        }
     }
 
     #[test]
@@ -269,5 +316,36 @@ mod tests {
         assert_eq!(json["stopped_early"], true);
         assert_eq!(json["stop_reason"], "patience spent");
         assert_eq!(exit_code(&result), 0);
+    }
+
+    #[test]
+    fn throughput_and_spike_figures_reach_run_json() {
+        let mut progress = RunProgress::start("runs/x", "cpu");
+        progress.metrics = RunMetrics {
+            tokens_per_sec: Some(1024.5),
+            mfu: Some(0.25),
+            spikes: Some(crate::metrics::SpikeGuardState {
+                detected: 3,
+                skipped: 2,
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_value(progress.finish(&Ok(()))).expect("serialize");
+        assert_eq!(json["tokens_per_sec"], 1024.5);
+        assert_eq!(json["mfu"], 0.25);
+        assert_eq!(json["spikes_detected"], 3);
+        assert_eq!(json["spikes_skipped"], 2);
+    }
+
+    #[test]
+    fn a_step_line_with_null_floats_reads_back_as_nan() {
+        let line = r#"{"step":4,"loss":2.5,"grad_norm":null,"learning_rate":0.001,"epoch":0.1}"#;
+        let record: StepRecord = serde_json::from_str(line).expect("parse");
+        assert!(record.grad_norm.is_nan());
+        assert_eq!(
+            (record.tokens, record.scored_tokens, record.mfu),
+            (0, None, None)
+        );
+        assert_eq!(record.tokens_per_sec, 0.0);
     }
 }

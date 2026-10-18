@@ -7,6 +7,7 @@ use super::tui_sink::TuiSink;
 use crate::checkpoint_config::{checkpoint_config_exists, write_checkpoint_config};
 use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
 use crate::data::DataLoader;
+use crate::metrics::{mfu, model_flops_per_token, ScalarLog};
 use crate::model::LitGPT;
 use crate::prelude::{DType, Result};
 use crate::run_record::StepRecord;
@@ -53,6 +54,8 @@ where
     /// The loop writes the same `steps.json` lines and checkpoints for every sink.
     /// A log step is a multiple of `log_interval`, or the first step of this session.
     /// `log_interval: 0` logs the first step of the session only.
+    /// Under the `tensorboard` feature each log step and eval also goes to a
+    /// new event file beside `steps.json`.
     /// A step error goes to [`StepSink::on_error`] and returns at once.
     ///
     /// With an attached eval, an eval runs after every multiple of
@@ -93,6 +96,18 @@ where
         // A resumed rank 0 can start stopped. Every rank must agree before step one.
         self.sync_early_stop()?;
 
+        if !self.quiet() {
+            let run_dir = Path::new(&self.steps_json_path)
+                .parent()
+                .unwrap_or(Path::new("."));
+            self.metrics.scalars = ScalarLog::open(run_dir);
+        }
+        // FLOPs per token and the peak of one device, when MFU is configured.
+        let mfu_basis = match self.metrics.peak_tflops() {
+            Some(peak) => Some((model_flops_per_token(model, &self.model_config)?, peak)),
+            None => None,
+        };
+
         let total_steps = self.lr_plan.total_steps();
         // Samples of every rank. `batch_size` counts one rank's rows.
         let mut clock = Throughput::start(
@@ -121,19 +136,11 @@ where
             };
             clock.end_step();
             let completed = index + 1;
-            let report = StepReport {
-                step: completed,
-                loss,
-                grad_norm,
-                learning_rate: self.lr_at(index),
-                epoch: self.epoch_progress(completed),
-                logged: self.is_log_step(index),
-                session_samples_per_sec: clock.session_rate(completed - self.start_step),
-                recent_samples_per_sec: clock.recent_rate(),
-                eta_secs: clock.mean_step_secs() * (total_steps - completed) as f64,
-            };
+            let report = self.step_report(index, (loss, grad_norm), &clock, mfu_basis);
+            self.metrics.last_rates = Some((report.tokens_per_sec, report.mfu));
             if report.logged {
                 self.record_step(&report);
+                self.metrics.scalars.step(&report);
             }
             sink.on_step(&report)?;
             last = Some((loss, grad_norm));
@@ -163,6 +170,41 @@ where
         })
     }
 
+    /// The report of the 0-indexed step `index`, which returned `(loss, grad_norm)`.
+    ///
+    /// `mfu_basis` holds FLOPs per token and one device's peak TFLOP/s.
+    fn step_report(
+        &self,
+        index: usize,
+        (loss, grad_norm): (f64, f64),
+        clock: &Throughput,
+        mfu_basis: Option<(f64, f64)>,
+    ) -> StepReport {
+        let completed = index + 1;
+        let seq_len = self.model_config.max_seq_len;
+        let session_samples_per_sec = clock.session_rate(completed - self.start_step);
+        let recent_samples_per_sec = clock.recent_rate();
+        let tokens_per_sec = session_samples_per_sec * seq_len as f64;
+        let total_steps = self.lr_plan.total_steps();
+        StepReport {
+            step: completed,
+            loss,
+            grad_norm,
+            learning_rate: self.lr_at(index),
+            epoch: self.epoch_progress(completed),
+            logged: self.is_log_step(index),
+            session_samples_per_sec,
+            recent_samples_per_sec,
+            eta_secs: clock.mean_step_secs() * total_steps.saturating_sub(completed) as f64,
+            tokens: clock.samples_per_step() * seq_len,
+            scored_tokens: self.metrics.last_scored,
+            tokens_per_sec,
+            recent_tokens_per_sec: recent_samples_per_sec * seq_len as f64,
+            mfu: mfu_basis.map(|(flops, peak)| mfu(flops, tokens_per_sec, self.world_size(), peak)),
+            spike: self.metrics.last_spike,
+        }
+    }
+
     /// Whether the 0-indexed step `index` writes a log line.
     fn is_log_step(&self, index: usize) -> bool {
         let interval = self.config.log_interval;
@@ -188,6 +230,10 @@ where
             grad_norm: report.grad_norm,
             learning_rate: report.learning_rate,
             epoch: report.epoch,
+            tokens: report.tokens,
+            tokens_per_sec: report.tokens_per_sec,
+            scored_tokens: report.scored_tokens,
+            mfu: report.mfu,
         };
         if let Err(e) = record.append_to(Path::new(&self.steps_json_path)) {
             eprintln!("Warning: {e}");

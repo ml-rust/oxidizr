@@ -82,7 +82,7 @@ Each checkpoint is a set of three files in `checkpoint_dir`:
 |------|---------|
 | `<prefix>_step_N.safetensors` | Model weights after N completed optimizer steps |
 | `<prefix>_step_N.optimizer.safetensors` | AdamW state: `exp_avg`, `exp_avg_sq`, `master` per trainable tensor, and `__step` |
-| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, `no_decay_patterns` when set, `loss_scale` for an f16 run, `world_size`, `global_batch_rows`, and the eval keys under `trainer.eval` |
+| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, `no_decay_patterns` when set, `loss_scale` for an f16 run, `world_size`, `global_batch_rows`, the eval keys under `trainer.eval`, and `spike_guard` under `trainer.spike_guard` |
 
 The end of a run writes the same set as `<prefix>_final.safetensors`,
 `<prefix>_final.optimizer.safetensors` and `checkpoint_final.meta.json`.
@@ -96,6 +96,18 @@ Under `trainer.eval` the meta also records:
 | `evals_since_best` | Evals since that loss |
 
 A run without `trainer.eval` writes none of these keys.
+
+Under `trainer.spike_guard` the meta also records `spike_guard`:
+
+| Key | Content |
+|-----|---------|
+| `spike_guard.mean` | EMA of the step loss after step N |
+| `spike_guard.variance` | EMA variance of the step loss |
+| `spike_guard.observed` | Losses the EMA holds. Flagged and non-finite losses never enter it |
+| `spike_guard.detected` | Steps the guard flagged |
+| `spike_guard.skipped` | Flagged steps that skipped the optimizer |
+
+The meta stores each float at full precision, so a resume continues the EMA bit-identical. A resume with a guard and no `spike_guard` key restarts the EMA and warns. A resume without a guard drops the key and warns. A run without `trainer.spike_guard` writes no `spike_guard` key.
 
 ### Best Checkpoint
 
@@ -135,6 +147,9 @@ When resuming:
 7. A run with `trainer.eval` continues the early-stop counters from
    `best_eval_loss` and `evals_since_best`. A meta whose counters already
    spent the patience stops the run before its first step.
+8. A run with `trainer.spike_guard` continues the loss EMA and the spike
+   counters from `spike_guard`. A skipped spike step still counted its
+   batches, so `data_position` stays valid.
 
 With all three files, the resumed run matches an uninterrupted run exactly.
 The training step uses no random state, so no RNG state is saved.

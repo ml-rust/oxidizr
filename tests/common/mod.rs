@@ -183,6 +183,8 @@ pub fn tiny_config(checkpoint_dir: &Path, max_steps: usize) -> LitConfig {
             shuffle_rows: true,
             loss_scale: None,
             eval: None,
+            metrics: None,
+            spike_guard: None,
         },
     }
 }
@@ -416,4 +418,39 @@ where
             (name.clone(), tensor.to_vec::<f32>())
         })
         .collect()
+}
+
+/// Keys of a `steps.json` line that depend on wall-clock time.
+pub const TIMING_KEYS: [&str; 2] = ["tokens_per_sec", "mfu"];
+
+/// The lines of `steps_json` without [`TIMING_KEYS`], so two runs compare equal.
+pub fn steps_without_timing(steps_json: &str) -> Vec<serde_json::Value> {
+    steps_json
+        .lines()
+        .map(|line| {
+            let mut value: serde_json::Value =
+                serde_json::from_str(line).expect("a steps.json line");
+            if let Some(map) = value.as_object_mut() {
+                for key in TIMING_KEYS {
+                    map.remove(key);
+                }
+            }
+            value
+        })
+        .collect()
+}
+
+/// TensorBoard event files in `dir`.
+pub fn event_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|it| {
+            it.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("events.out.tfevents."))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }

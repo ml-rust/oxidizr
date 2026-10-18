@@ -186,6 +186,14 @@ where
     ///
     /// At world 1 no collective runs and the step keeps its bits.
     ///
+    /// # Loss-Spike Guard
+    /// Under `trainer.spike_guard` the guard judges the global step loss after
+    /// the sum, before the optimizer. Every rank holds the same loss, so every
+    /// rank flags the same steps. A `skip` spike skips the optimizer step like
+    /// an overflow: the parameters and the AdamW timestep stay put, and the
+    /// step still draws its batches. With finite gradients the loss scale
+    /// stays untouched. A flagged or non-finite loss never enters the EMA.
+    ///
     /// # Errors
     /// Returns the first error of the step. In a world above 1 the step calls
     /// [`abort_collectives`](Self::abort_collectives) first, so peers blocked in

@@ -6,6 +6,7 @@ use super::optimizer_io::write_optimizer_file;
 use crate::config::{CheckpointMeta, OxidizrModelConfig};
 use crate::data::DataPosition;
 use crate::eval::EvalCheckpoint;
+use crate::metrics::SpikeGuardState;
 use crate::model::{save_checkpoint_from_params, LitGPT};
 use crate::prelude::{DType, FusedAdamW, Result, Tensor};
 use crate::weight_decay::WeightDecaySpec;
@@ -47,6 +48,8 @@ pub struct CheckpointSave<'a, R: Runtime<DType = DType>> {
     pub world_size: usize,
     /// Rows of one global batch over every rank, the batch `position` counts.
     pub global_batch_rows: usize,
+    /// Spike guard EMA and counters after `step` steps. `None` without a guard.
+    pub spike_guard: Option<SpikeGuardState>,
 }
 
 /// Write the optimizer state, then the weights, then the meta.
@@ -100,6 +103,7 @@ where
         meta.evals_since_best = save.eval.evals_since_best;
         meta.world_size = Some(save.world_size);
         meta.global_batch_rows = Some(save.global_batch_rows);
+        meta.spike_guard = save.spike_guard;
         meta.save_to(&meta_path)
     });
     if let Err(e) = written {

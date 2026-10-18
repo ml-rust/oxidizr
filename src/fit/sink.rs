@@ -1,5 +1,6 @@
 //! The hooks the fit loop reports to, and the values it passes them.
 
+use crate::metrics::SpikeEvent;
 use crate::prelude::{Error, Result};
 
 /// What the fit loop knows before its first step.
@@ -32,6 +33,20 @@ pub struct StepReport {
     pub recent_samples_per_sec: f64,
     /// Remaining steps times the mean time of the recent steps.
     pub eta_secs: f64,
+    /// Tokens the step processed over every rank: its rows times `max_seq_len`.
+    pub tokens: usize,
+    /// Tokens the loss scored over every rank. `None` for an unmasked step,
+    /// which scores every processed token.
+    pub scored_tokens: Option<usize>,
+    /// `session_samples_per_sec` times `max_seq_len`: tokens of every rank per second.
+    pub tokens_per_sec: f64,
+    /// `recent_samples_per_sec` times `max_seq_len`.
+    pub recent_tokens_per_sec: f64,
+    /// Model FLOPs utilization at `tokens_per_sec`. `None` without
+    /// `trainer.metrics.peak_tflops`.
+    pub mfu: Option<f64>,
+    /// The spike guard's event of this step. `None` when it flagged nothing.
+    pub spike: Option<SpikeEvent>,
 }
 
 /// One eval at a step boundary.
