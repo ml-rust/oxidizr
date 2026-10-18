@@ -1,10 +1,19 @@
-//! Shared helpers for the integration tests: a tiny CPU model, its trainer, and scratch dirs.
+//! Shared helpers for the integration tests: a tiny model, its trainer, and scratch dirs.
+//!
+//! The plain helpers build on the CPU runtime. The `_on` helpers take any
+//! runtime whose client satisfies [`TrainClient`].
 
 // Each test binary compiles this module and uses a subset of it.
 #![allow(dead_code)]
 
+use boostr::ops::FusedOptimizerOps;
 use boostr::tensor::TensorId;
-use boostr::{CpuClient, CpuDevice, CpuRuntime, DType, Tensor, TypeConversionOps, VarMap};
+use boostr::{
+    BinaryOps, CompareOps, ConvOps, CpuClient, CpuDevice, CpuRuntime, DType, DequantOps,
+    FlashAttentionOps, GatedDeltaNetOps, IndexingOps, NormalizationOps, QuantMatmulOps, RandomOps,
+    ReduceOps, RoPEOps, Runtime, RuntimeClient, ScalarOps, ShapeOps, Tensor, TensorOps,
+    TypeConversionOps, UnaryOps, VarMap,
+};
 use oxidizr::commands::train_data::{run_loaders, TokenSource};
 use oxidizr::config::{
     DTypePrecision, DistributedConfig, GdnSpec, LitConfig, OxidizrModelConfig, TargetDevice,
@@ -18,6 +27,56 @@ use oxidizr::trainer::{LitTrainer, TrainerRunConfig};
 use oxidizr::weight_decay::{resolve_weight_decay, WeightDecaySpec};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+
+/// Client ops a training run needs: the bounds `commands::train` puts on its
+/// runtime, plus the ones a checkpoint load adds.
+pub trait TrainClient<R: Runtime<DType = DType>>:
+    RuntimeClient<R>
+    + TensorOps<R>
+    + FusedOptimizerOps<R>
+    + RandomOps<R>
+    + ScalarOps<R>
+    + BinaryOps<R>
+    + CompareOps<R>
+    + ConvOps<R>
+    + FlashAttentionOps<R>
+    + IndexingOps<R>
+    + NormalizationOps<R>
+    + QuantMatmulOps<R>
+    + RoPEOps<R>
+    + TypeConversionOps<R>
+    + DequantOps<R>
+    + GatedDeltaNetOps<R>
+    + UnaryOps<R>
+    + ReduceOps<R>
+    + ShapeOps<R>
+{
+}
+
+impl<R, C> TrainClient<R> for C
+where
+    R: Runtime<DType = DType>,
+    C: RuntimeClient<R>
+        + TensorOps<R>
+        + FusedOptimizerOps<R>
+        + RandomOps<R>
+        + ScalarOps<R>
+        + BinaryOps<R>
+        + CompareOps<R>
+        + ConvOps<R>
+        + FlashAttentionOps<R>
+        + IndexingOps<R>
+        + NormalizationOps<R>
+        + QuantMatmulOps<R>
+        + RoPEOps<R>
+        + TypeConversionOps<R>
+        + DequantOps<R>
+        + GatedDeltaNetOps<R>
+        + UnaryOps<R>
+        + ReduceOps<R>
+        + ShapeOps<R>,
+{
+}
 
 /// A two-layer dense model small enough to train in a unit-sized test.
 pub fn tiny_model_config(tie_word_embeddings: bool) -> OxidizrModelConfig {
@@ -159,18 +218,32 @@ pub fn write_config_yaml(path: &Path, cfg: &LitConfig) {
 pub fn build_model(cfg: &LitConfig) -> LitGPT<CpuRuntime> {
     let device = CpuDevice::new();
     let client = CpuClient::new(device.clone());
-    let mut varmap = VarMap::<CpuRuntime>::new();
-    LitGPT::<CpuRuntime>::new_seeded(cfg, &mut varmap, &device, &client).expect("build model")
+    build_model_on::<CpuRuntime>(cfg, &device, &client)
+}
+
+/// [`build_model`] on `device`, drawing on `client`.
+pub fn build_model_on<R>(cfg: &LitConfig, device: &R::Device, client: &R::Client) -> LitGPT<R>
+where
+    R: Runtime<DType = DType>,
+    R::Client: TrainClient<R>,
+{
+    let mut varmap = VarMap::<R>::new();
+    LitGPT::<R>::new_seeded(cfg, &mut varmap, device, client).expect("build model")
 }
 
 /// The optimizer inputs `commands::train` derives from a model.
-pub struct TrainParts {
+pub struct TrainParts<R: Runtime<DType = DType> = CpuRuntime> {
     pub ids: Vec<TensorId>,
-    pub params: HashMap<TensorId, Tensor<CpuRuntime>>,
+    pub params: HashMap<TensorId, Tensor<R>>,
     pub names: Vec<(String, TensorId)>,
 }
 
 pub fn train_parts(model: &LitGPT<CpuRuntime>) -> TrainParts {
+    train_parts_on(model)
+}
+
+/// [`train_parts`] for a model on any runtime.
+pub fn train_parts_on<R: Runtime<DType = DType>>(model: &LitGPT<R>) -> TrainParts<R> {
     let trainable = model.trainable_parameters();
     let ids = trainable.iter().map(|(id, _)| *id).collect();
     let params = trainable
@@ -252,6 +325,32 @@ pub fn trainer_with_decay<'a>(
 ) -> LitTrainer<'a, CpuRuntime> {
     let device = CpuDevice::new();
     let client = CpuClient::new(device.clone());
+    trainer_on(
+        cfg,
+        parts,
+        row_layout,
+        (start_step, start_position),
+        weight_decay,
+        (client, device),
+    )
+}
+
+/// [`trainer_with_decay`] on any runtime: it trains on `backend`'s
+/// `(client, device)` and starts at `start`'s `(step, position)`.
+pub fn trainer_on<'a, R>(
+    cfg: &LitConfig,
+    parts: &'a mut TrainParts<R>,
+    row_layout: RowLayout,
+    start: (usize, DataPosition),
+    weight_decay: WeightDecaySpec,
+    backend: (R::Client, R::Device),
+) -> LitTrainer<'a, R>
+where
+    R: Runtime<DType = DType>,
+    R::Client: TrainClient<R>,
+{
+    let (start_step, start_position) = start;
+    let (client, device) = backend;
     let steps_json_path = format!("{}/steps.json", cfg.trainer.checkpoint_dir);
     LitTrainer::new(
         cfg.trainer.clone(),
@@ -281,6 +380,29 @@ pub fn trainer_with_decay<'a>(
 /// equal bits still mean equal tensors.
 pub fn bits_by_name(parts: &TrainParts) -> BTreeMap<String, Vec<u32>> {
     let client = CpuClient::new(CpuDevice::new());
+    bits_by_name_on(parts, &client)
+}
+
+/// [`bits_by_name`] for parameters on `client`'s runtime.
+pub fn bits_by_name_on<R>(parts: &TrainParts<R>, client: &R::Client) -> BTreeMap<String, Vec<u32>>
+where
+    R: Runtime<DType = DType>,
+    R::Client: TypeConversionOps<R>,
+{
+    values_by_name_on(parts, client)
+        .into_iter()
+        .map(|(name, values)| (name, values.iter().map(|v| v.to_bits()).collect()))
+        .collect()
+}
+
+/// Host values of every trainable tensor, keyed by parameter name.
+///
+/// A half-precision tensor is widened to f32 on `client` first. The cast is exact.
+pub fn values_by_name_on<R>(parts: &TrainParts<R>, client: &R::Client) -> BTreeMap<String, Vec<f32>>
+where
+    R: Runtime<DType = DType>,
+    R::Client: TypeConversionOps<R>,
+{
     parts
         .names
         .iter()
@@ -291,8 +413,7 @@ pub fn bits_by_name(parts: &TrainParts) -> BTreeMap<String, Vec<u32>> {
             } else {
                 client.cast(&tensor, DType::F32).expect("widen to f32")
             };
-            let values = tensor.to_vec::<f32>();
-            (name.clone(), values.iter().map(|v| v.to_bits()).collect())
+            (name.clone(), tensor.to_vec::<f32>())
         })
         .collect()
 }
