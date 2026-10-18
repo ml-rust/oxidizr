@@ -12,6 +12,7 @@ use oxidizr::data::{DataPosition, LitDataLoader, RowLayout, RowOrder};
 use oxidizr::model::LitGPT;
 use oxidizr::schedule::LrSchedule;
 use oxidizr::trainer::{LitTrainer, TrainerRunConfig};
+use oxidizr::weight_decay::{resolve_weight_decay, WeightDecaySpec};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -81,6 +82,8 @@ pub fn tiny_config(checkpoint_dir: &Path, max_steps: usize) -> LitConfig {
             adamw_beta2: 0.95,
             adamw_eps: 1e-6,
             weight_decay: 0.1,
+            weight_decay_rule: None,
+            no_decay_patterns: None,
             z_loss_alpha: 0.0,
             warmup_steps: Some(2),
             warmup_ratio: None,
@@ -168,12 +171,34 @@ pub fn data_loader(cfg: &LitConfig) -> LitDataLoader<CpuRuntime> {
 }
 
 /// A trainer over `params` that starts at `start_step` and `start_position`.
+///
+/// It uses the fresh-run weight decay rule of `cfg`.
 pub fn trainer<'a>(
     cfg: &LitConfig,
     parts: &'a mut TrainParts,
     row_layout: RowLayout,
     start_step: usize,
     start_position: DataPosition,
+) -> LitTrainer<'a, CpuRuntime> {
+    let weight_decay = resolve_weight_decay(&cfg.trainer, None, true).expect("weight decay rule");
+    trainer_with_decay(
+        cfg,
+        parts,
+        row_layout,
+        start_step,
+        start_position,
+        weight_decay,
+    )
+}
+
+/// [`trainer`] with the resolved weight decay rule `weight_decay`.
+pub fn trainer_with_decay<'a>(
+    cfg: &LitConfig,
+    parts: &'a mut TrainParts,
+    row_layout: RowLayout,
+    start_step: usize,
+    start_position: DataPosition,
+    weight_decay: WeightDecaySpec,
 ) -> LitTrainer<'a, CpuRuntime> {
     let device = CpuDevice::new();
     let client = CpuClient::new(device.clone());
@@ -194,6 +219,7 @@ pub fn trainer<'a>(
             start_step,
             model_config: cfg.model.clone(),
             data_file_path: None,
+            weight_decay,
         },
     )
     .expect("build trainer")

@@ -158,6 +158,7 @@ Key `trainer` fields:
 | `learning_rate`, `batch_size`, `gradient_accumulation` | Optimizer step size and batch shape |
 | `max_steps`, `num_epochs` | Training length |
 | `warmup_steps`, `lr_schedule`, `min_lr_ratio` | Warmup, then `constant`, `cosine`, `linear` or `wsd` decay. Logged rates are the rates each step applied |
+| `weight_decay`, `weight_decay_rule`, `no_decay_patterns` | AdamW decay coefficient, and the parameters it applies to. `skip_1d` (fresh-run default) skips norms, biases and SSM `a_log`/`D`. `decay_all` decays everything. `skip_all` decays nothing. A resume keeps the checkpoint's rule |
 | `checkpoint_dir`, `save_interval`, `max_checkpoints` | Checkpoint location, frequency, and retention (`0` keeps all) |
 | `log_interval` | Steps between metric updates |
 | `target_device` | `gpu` or `cpu`. The CLI `--target-device` overrides it |

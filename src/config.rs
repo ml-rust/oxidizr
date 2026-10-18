@@ -2,6 +2,7 @@ use crate::checkpoint_set::{optimizer_path_for, weights_step, CheckpointLabel};
 use crate::data::DataPosition;
 use crate::data_hash::{hash_json, legacy_file_hash, legacy_hash_str, HashAlgo};
 use crate::schedule::{LrDecayShape, LrSchedule};
+use crate::weight_decay::WeightDecayRule;
 use boostr::model::{SpeechLayout, SpeechVocab};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -629,8 +630,25 @@ pub struct TrainerConfig {
     pub adamw_eps: f64, // Numerical stability (default: 1e-6)
     // Higher ε prevents NaN in BF16 when variance is small
     #[serde(default = "default_weight_decay")]
-    pub weight_decay: f64, // L2 regularization (default: 0.1)
-    // Decoupled from LR, applied to weights only
+    pub weight_decay: f64, // Decoupled weight decay (default: 0.1)
+
+    /// Which parameters `weight_decay` applies to. See [`WeightDecayRule`].
+    ///
+    /// Unset, a fresh run uses `skip_1d`, and a resume keeps the checkpoint's
+    /// rule. A meta without a rule reads as `decay_all`, so old runs resume
+    /// exactly. An explicit value that differs from the checkpoint's rule
+    /// warns, and under `--headless` it is an error.
+    ///
+    /// `skip_serializing_if` keeps the key out of serialized configs while
+    /// unset, so existing configs serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_decay_rule: Option<WeightDecayRule>,
+
+    /// Checkpoint-name substrings kept out of weight decay on top of
+    /// `skip_1d`. Valid only under `skip_1d`. Unset, a resume keeps the
+    /// checkpoint's patterns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_decay_patterns: Option<Vec<String>>,
 
     // -------------------------------------------------------------------------
     // Router Z-Loss (prevents MoE routing collapse)
@@ -782,6 +800,8 @@ impl LitConfig {
             &self.trainer.checkpoint_sidecars,
         )?;
         crate::grad_clip::check_max_grad_value(self.trainer.max_grad_value)?;
+        // A fresh run's rule. A resume checks its inherited rule again in train.
+        crate::weight_decay::resolve_weight_decay(&self.trainer, None, true)?;
 
         // Mamba2 constraint: hidden_size * expand == num_heads * head_dim
         if let (Some(num_heads), Some(head_dim), Some(expand)) = (
@@ -925,6 +945,8 @@ impl LitConfig {
                 adamw_beta2: 0.95, // Lower β₂ for MoE stability
                 adamw_eps: 1e-6,   // Higher ε for BF16 safety
                 weight_decay: 0.1, // Industry standard
+                weight_decay_rule: None,
+                no_decay_patterns: None,
                 z_loss_alpha: 0.0, // No MoE, no z-loss needed
                 // Learning rate warmup
                 warmup_steps: None,      // Use ratio instead
@@ -1016,9 +1038,11 @@ impl LitConfig {
                 max_grad_value: None,     // No per-element clipping
                 // AdamW hyperparameters (SOTA defaults from optimization.md)
                 adamw_beta1: 0.9,
-                adamw_beta2: 0.95,  // Lower β₂ for MoE stability
-                adamw_eps: 1e-6,    // Higher ε for BF16 safety
-                weight_decay: 0.1,  // Industry standard
+                adamw_beta2: 0.95, // Lower β₂ for MoE stability
+                adamw_eps: 1e-6,   // Higher ε for BF16 safety
+                weight_decay: 0.1, // Industry standard
+                weight_decay_rule: None,
+                no_decay_patterns: None,
                 z_loss_alpha: 1e-3, // Router z-loss for MoE stability
                 // Learning rate warmup
                 warmup_steps: None,      // Use ratio instead
@@ -1065,6 +1089,15 @@ pub struct CheckpointMeta {
     /// from it warns instead.
     #[serde(default = "HashAlgo::legacy")]
     pub hash_algo: HashAlgo,
+    /// Weight decay rule of the run that wrote the checkpoint. A resume
+    /// inherits it. Absent in metadata written before parameter groups:
+    /// those runs decayed every parameter, so absent reads as `decay_all`.
+    /// See [`crate::weight_decay::WeightDecaySpec::of_meta`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_decay_rule: Option<WeightDecayRule>,
+    /// `trainer.no_decay_patterns` of that run. Empty when it set none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub no_decay_patterns: Vec<String>,
 }
 
 fn default_dtype_string() -> String {
@@ -1103,6 +1136,8 @@ impl CheckpointMeta {
             data_position,
             optimizer_file: None,
             hash_algo: HashAlgo::Fnv1a64,
+            weight_decay_rule: None,
+            no_decay_patterns: Vec::new(),
         })
     }
 

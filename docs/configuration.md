@@ -139,6 +139,36 @@ trainer:
 
 The schedule is a function of the step, so a resumed run continues it at the restored step. The `learning_rate` in headless output and `steps.json` is the rate the logged step applied.
 
+### Weight Decay
+
+AdamW applies decoupled weight decay. A rule picks the parameters it applies to.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `adamw_beta1` | AdamW first-moment coefficient | 0.9 |
+| `adamw_beta2` | AdamW second-moment coefficient | 0.95 |
+| `adamw_eps` | AdamW epsilon | 1e-6 |
+| `weight_decay` | Decay coefficient of the decayed parameters | 0.1 |
+| `weight_decay_rule` | `decay_all`, `skip_1d` or `skip_all` | `skip_1d` for a fresh run, the checkpoint's rule for a resume |
+| `no_decay_patterns` | Checkpoint-name substrings kept out of decay. `skip_1d` only | none |
+
+Rules:
+
+- `skip_1d`: no decay on tensors of rank below 2, on every tensor whose name ends in `bias`, and on the SSM `a_log` and `D` (`d_param`) tensors. This covers every norm weight, Mamba `dt_bias`, and Mamba1's 2-D `a_log`. Embeddings, LoRA `lora_a`/`lora_b`, and every other weight of rank 2 or more decay.
+- `decay_all`: every parameter decays. Runs before this key existed used this rule.
+- `skip_all`: no parameter decays.
+
+A pattern matches any part of a checkpoint name, such as `model.layers.0.self_attn.q_proj.weight` or `lm_head.weight`. An empty pattern is an error. Patterns under `decay_all` or `skip_all` are an error. A tied embedding is one tensor, so it counts once.
+
+```yaml
+trainer:
+  weight_decay: 0.1
+  weight_decay_rule: skip_1d
+  no_decay_patterns: [embed_tokens]   # also keep the embedding out of decay
+```
+
+The checkpoint meta records the rule, and a resume inherits each unset key. A meta without a rule reads as `decay_all`, so a run started before this key resumes bit for bit. A set key that differs from the checkpoint's rule prints a warning, and the resume is not exact. Under `--headless` it is an error. The run logs the rule once at start, with the tensor and parameter count of each side. Headless mode writes that line to stderr.
+
 ## Complete Example
 
 ### Standard Transformer

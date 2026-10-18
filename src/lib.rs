@@ -25,3 +25,4 @@ pub mod schedule;
 pub mod speech_corpus;
 pub mod trainer;
 pub mod vocab;
+pub mod weight_decay;

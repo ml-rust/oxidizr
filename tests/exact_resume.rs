@@ -9,7 +9,7 @@ mod common;
 use boostr::CpuRuntime;
 use common::{
     bits_by_name, build_model, data_loader, scratch_dir, tiny_config, tiny_model_config,
-    train_parts, trainer, TrainParts,
+    train_parts, trainer, trainer_with_decay, TrainParts,
 };
 use oxidizr::checkpoint_set::{
     manual_resume_target, optimizer_path_for, plan_optimizer_resume, remove_old_checkpoints,
@@ -19,6 +19,9 @@ use oxidizr::config::{find_latest_checkpoint, CheckpointMeta, LitConfig};
 use oxidizr::data::DataPosition;
 use oxidizr::model::{load_checkpoint_into_model, LitGPT};
 use oxidizr::trainer::LitTrainer;
+use oxidizr::weight_decay::{
+    inherited_weight_decay, resolve_weight_decay, WeightDecayRule, WeightDecaySpec,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,8 +54,17 @@ fn train_fresh(
 
 /// The reference run, and a directory holding the step-`HALF` and final sets of a stopped run.
 fn reference_and_stopped_run(tag: &str) -> (LitConfig, Bits, PathBuf) {
+    reference_and_stopped_run_with(tag, |_| {})
+}
+
+/// [`reference_and_stopped_run`] with `edit` applied to the config of both runs.
+fn reference_and_stopped_run_with(
+    tag: &str,
+    edit: impl FnOnce(&mut LitConfig),
+) -> (LitConfig, Bits, PathBuf) {
     let dir = scratch_dir(tag);
-    let cfg = tiny_config(&dir, STEPS);
+    let mut cfg = tiny_config(&dir, STEPS);
+    edit(&mut cfg);
     let reference = train_fresh(&cfg, STEPS, |_, _| {});
     train_fresh(&cfg, HALF, |t, model| {
         t.save_checkpoint(model, HALF).expect("save step set");
@@ -64,6 +76,8 @@ fn reference_and_stopped_run(tag: &str) -> (LitConfig, Bits, PathBuf) {
 struct Resumed {
     bits: Bits,
     timestep_after_load: u64,
+    /// Tensors in the no-decay group of the resumed trainer.
+    no_decay_tensors: usize,
 }
 
 /// Resume from `weights` as `commands::train` does, then train to `STEPS`.
@@ -75,22 +89,28 @@ fn resume(cfg: &LitConfig, weights: &str, meta: Option<&str>, start_step: usize)
         .map(|m| CheckpointMeta::load(m).expect("meta"))
         .and_then(|m| m.data_position)
         .expect("data position");
+    // The weight decay rule comes from the meta, as `commands::train` resolves it.
+    let inherited = inherited_weight_decay(meta, start_step).expect("inherited rule");
+    let weight_decay =
+        resolve_weight_decay(&cfg.trainer, inherited.as_ref(), true).expect("weight decay rule");
     let mut parts = train_parts(&model);
     let mut loader = data_loader(cfg);
     let layout = loader.row_layout().expect("row layout");
     loader.seek(position).expect("seek");
-    let timestep_after_load = {
-        let mut t = trainer(cfg, &mut parts, layout, start_step, position);
+    let (timestep_after_load, no_decay_tensors) = {
+        let mut t = trainer_with_decay(cfg, &mut parts, layout, start_step, position, weight_decay);
         t.apply_optimizer_resume(&plan).expect("apply plan");
         let timestep = t.optimizer_timestep();
+        let no_decay = t.decay_plan().no_decay_ids().len();
         for _ in start_step..STEPS {
             t.training_step(&model, &mut loader).expect("training step");
         }
-        timestep
+        (timestep, no_decay)
     };
     Resumed {
         bits: bits_by_name(&parts),
         timestep_after_load,
+        no_decay_tensors,
     }
 }
 
@@ -123,6 +143,54 @@ fn auto_resume_is_bit_identical_to_an_uninterrupted_run() {
     assert!(matches!(plan, OptimizerResume::Load(_)), "{plan:?}");
 
     let resumed = resume(&cfg, &weights, Some(&meta), step);
+    assert_eq!(resumed.timestep_after_load, HALF as u64);
+    assert_identical(&reference, &resumed.bits);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_old_meta_without_a_rule_resumes_bit_identical_under_decay_all() {
+    // The run that wrote the old meta decayed every parameter.
+    let (mut cfg, reference, dir) = reference_and_stopped_run_with("resume-old-rule", |cfg| {
+        cfg.trainer.weight_decay_rule = Some(WeightDecayRule::DecayAll);
+    });
+    let meta_path = dir.join(CheckpointLabel::Step(HALF).meta_file_name());
+    let mut meta = CheckpointMeta::load(&meta_path.to_string_lossy()).expect("meta");
+    assert_eq!(meta.weight_decay_rule, Some(WeightDecayRule::DecayAll));
+    meta.weight_decay_rule = None;
+    meta.save_to(&meta_path).expect("rewrite meta");
+    let text = fs::read_to_string(&meta_path).expect("read meta");
+    assert!(!text.contains("weight_decay_rule"), "{text}");
+
+    // The resumed config sets no rule, as a config from before the field does.
+    cfg.trainer.weight_decay_rule = None;
+    let weights = weights_path(&cfg, &dir, CheckpointLabel::Step(HALF));
+    let meta = meta_path.to_string_lossy().into_owned();
+    let resumed = resume(&cfg, &weights, Some(&meta), HALF);
+    assert_eq!(resumed.no_decay_tensors, 0);
+    assert_identical(&reference, &resumed.bits);
+
+    // A fresh run with the same config uses skip_1d and differs: the inherited rule matters.
+    let skip_1d = train_fresh(&cfg, STEPS, |_, _| {});
+    assert!(reference.iter().any(|(n, b)| skip_1d.get(n) != Some(b)));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_skip_1d_run_resumes_bit_identical() {
+    let (cfg, reference, dir) = reference_and_stopped_run_with("resume-skip-1d", |cfg| {
+        cfg.trainer.weight_decay_rule = Some(WeightDecayRule::Skip1d);
+    });
+    let meta = dir
+        .join(CheckpointLabel::Step(HALF).meta_file_name())
+        .to_string_lossy()
+        .into_owned();
+    let recorded = WeightDecaySpec::of_meta(&CheckpointMeta::load(&meta).expect("meta"));
+    assert_eq!(recorded.rule, WeightDecayRule::Skip1d);
+
+    let weights = weights_path(&cfg, &dir, CheckpointLabel::Step(HALF));
+    let resumed = resume(&cfg, &weights, Some(&meta), HALF);
+    assert!(resumed.no_decay_tensors > 0, "skip_1d grouped no tensor");
     assert_eq!(resumed.timestep_after_load, HALF as u64);
     assert_identical(&reference, &resumed.bits);
     let _ = fs::remove_dir_all(dir);

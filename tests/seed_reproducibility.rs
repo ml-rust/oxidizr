@@ -74,6 +74,8 @@ fn trainer_config(seed: Option<u64>) -> TrainerConfig {
         adamw_beta2: 0.95,
         adamw_eps: 1e-6,
         weight_decay: 0.1,
+        weight_decay_rule: None,
+        no_decay_patterns: None,
         z_loss_alpha: 0.0,
         warmup_steps: None,
         warmup_ratio: Some(0.1),

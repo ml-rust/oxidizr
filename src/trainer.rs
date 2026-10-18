@@ -10,6 +10,7 @@ use crate::prelude::{
     cross_entropy, cross_entropy_masked, DType, Error, FusedAdamW, Result, Tensor,
 };
 use crate::schedule::LrPlan;
+use crate::weight_decay::{DecayPlan, WeightDecaySpec};
 use boostr::autograd::{backward_wrt, var_add, var_mul_scalar, var_reshape, GradStore, Var};
 use boostr::ops::{FusedOptimizerOps, TensorOps};
 use boostr::optimizer::AdamWConfig;
@@ -39,6 +40,8 @@ pub struct TrainerRunConfig {
     pub start_step: usize,
     pub model_config: OxidizrModelConfig,
     pub data_file_path: Option<String>,
+    /// Resolved weight decay rule, from `crate::weight_decay::resolve_weight_decay`.
+    pub weight_decay: WeightDecaySpec,
 }
 
 /// The "LitGPT" style Trainer abstraction.
@@ -51,6 +54,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     /// Checkpoint names of the trainable parameters, for optimizer state files.
     name_maps: NameMaps,
     optimizer: FusedAdamW<R>,
+    /// The no-decay set the optimizer's parameter group holds.
+    decay_plan: DecayPlan,
     client: R::Client,
     /// Training device. Loaded optimizer state goes here.
     device: R::Device,
@@ -116,25 +121,29 @@ where
             start_step,
             model_config,
             data_file_path,
+            weight_decay,
         } = run;
-
-        // Init FusedAdamW with configurable SOTA parameters (from optimization.md)
-        // - beta2 = 0.95: Lower β₂ stabilizes MoE sparse expert updates
-        // - eps = 1e-6: Higher ε for BF16 numerical safety
-        // - weight_decay = 0.1: Industry standard (decoupled from LR)
-        let optimizer = FusedAdamW::new(AdamWConfig {
-            lr: config.learning_rate,
-            beta1: config.adamw_beta1,
-            beta2: config.adamw_beta2,
-            eps: config.adamw_eps,
-            weight_decay: config.weight_decay,
-        });
-
-        // Whole batches of `num_epochs` epochs, `gradient_accumulation` per step.
-        let total_steps = row_layout.total_steps(config.gradient_accumulation, config.num_epochs);
 
         config.distributed.validate()?;
         let name_maps = NameMaps::new(&parameter_names, &parameter_ids)?;
+
+        // The no-decay group is config, not state: build it before any state load.
+        let decay_plan =
+            DecayPlan::for_params(weight_decay, &parameter_ids, &*params, name_maps.names())?;
+        // beta2 = 0.95 stabilizes sparse MoE expert updates. eps = 1e-6 keeps BF16 finite.
+        let optimizer = FusedAdamW::with_param_groups(
+            AdamWConfig {
+                lr: config.learning_rate,
+                beta1: config.adamw_beta1,
+                beta2: config.adamw_beta2,
+                eps: config.adamw_eps,
+                weight_decay: config.weight_decay,
+            },
+            decay_plan.param_groups(),
+        )?;
+
+        // Whole batches of `num_epochs` epochs, `gradient_accumulation` per step.
+        let total_steps = row_layout.total_steps(config.gradient_accumulation, config.num_epochs);
 
         let lr_plan = LrPlan::new(&config, total_steps)?;
 
@@ -145,6 +154,7 @@ where
             parameter_names,
             name_maps,
             optimizer,
+            decay_plan,
             client,
             device,
             global_step: start_step,
@@ -1118,12 +1128,18 @@ where
             params: self.params,
             optimizer: &self.optimizer,
             name_maps: &self.name_maps,
+            weight_decay: self.decay_plan.spec(),
         })
     }
 
     /// Applies the optimizer part of a resume plan to this trainer's optimizer.
     pub fn apply_optimizer_resume(&mut self, plan: &OptimizerResume) -> Result<()> {
         apply_optimizer_resume(&mut self.optimizer, &self.name_maps, &self.device, plan)
+    }
+
+    /// The weight decay rule and the no-decay set of this run.
+    pub fn decay_plan(&self) -> &DecayPlan {
+        &self.decay_plan
     }
 
     /// The optimizer's step count. A step skipped for a non-finite norm does not count.

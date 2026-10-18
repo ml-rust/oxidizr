@@ -82,7 +82,7 @@ Each checkpoint is a set of three files in `checkpoint_dir`:
 |------|---------|
 | `<prefix>_step_N.safetensors` | Model weights after N completed optimizer steps |
 | `<prefix>_step_N.optimizer.safetensors` | AdamW state: `exp_avg`, `exp_avg_sq`, `master` per trainable tensor, and `__step` |
-| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, and `optimizer_file` |
+| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, and `no_decay_patterns` when set |
 
 The end of a run writes the same set as `<prefix>_final.safetensors`,
 `<prefix>_final.optimizer.safetensors` and `checkpoint_final.meta.json`.
@@ -106,9 +106,19 @@ When resuming:
 3. Training continues at step N, with the learning-rate schedule at step N.
 4. The data loader seeks to `data_position`, so the resumed run draws the
    same rows, in the same shuffled order, as an uninterrupted run.
+5. The weight decay rule comes from the meta's `weight_decay_rule` and
+   `no_decay_patterns`, unless the config sets them.
 
 With all three files, the resumed run matches an uninterrupted run exactly.
 The training step uses no random state, so no RNG state is saved.
+
+The weight decay rule is config, not optimizer state. The optimizer file
+holds no parameter groups. The meta records the rule instead. A meta without
+`weight_decay_rule` comes from a run that decayed every parameter, so it reads
+as `decay_all`. A config key that differs from the meta prints a warning, and
+the resume is not exact. Under `--headless` the mismatch stops the run. A
+resume without a meta uses `decay_all`. A resume at step 0 uses the config
+rule, `skip_1d` by default. See [Weight Decay](../configuration.md#weight-decay).
 
 `--resume <dir>/<prefix>_final.safetensors` resumes at the step that
 `checkpoint_final.meta.json` records.

@@ -10,6 +10,7 @@ use oxidizr::commands::{run_train, TrainArgs};
 use oxidizr::config::LitConfig;
 use oxidizr::run_record::{exit_code, RunRecord, RunStatus, StepRecord, STEPS_FILE};
 use oxidizr::schedule::LrPlan;
+use oxidizr::weight_decay::WeightDecayRule;
 use std::path::Path;
 
 /// Headless CPU train args for the files under `dir`.
@@ -140,6 +141,33 @@ fn a_resumed_run_continues_the_schedule_at_the_restored_step() {
             record.step
         );
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_headless_resume_with_another_weight_decay_rule_is_an_error() {
+    let dir = scratch_dir("headless-run-decay-mismatch");
+    let data = dir.join("tokens.bin");
+    let mut cfg = logged_cosine_config(&dir);
+    write_token_file(&data, &tokens(&cfg, 4000));
+    let full = run_train(headless_args_for(&dir, &data, &cfg, "full"));
+    assert!(full.is_ok(), "training failed: {full:?}");
+    let meta = std::fs::read_to_string(dir.join("ckpt").join("checkpoint_step_3.meta.json"))
+        .expect("step-3 meta");
+    assert!(meta.contains(r#""weight_decay_rule": "skip_1d""#), "{meta}");
+
+    cfg.trainer.weight_decay_rule = Some(WeightDecayRule::DecayAll);
+    let mut args = headless_args_for(&dir, &data, &cfg, "resumed");
+    args.resume = Some("auto".to_string());
+    let resumed = run_train(args);
+    let err = format!(
+        "{:#}",
+        resumed.expect_err("a changed rule resumed headless")
+    );
+    assert!(
+        err.contains("decay_all") && err.contains("skip_1d"),
+        "{err}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

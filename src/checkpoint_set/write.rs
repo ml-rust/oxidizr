@@ -7,6 +7,7 @@ use crate::config::{CheckpointMeta, OxidizrModelConfig};
 use crate::data::DataPosition;
 use crate::model::{save_checkpoint_from_params, LitGPT};
 use crate::prelude::{DType, FusedAdamW, Result, Tensor};
+use crate::weight_decay::WeightDecaySpec;
 use boostr::ops::TensorOps;
 use boostr::runtime::{Runtime, RuntimeClient};
 use boostr::tensor::TensorId;
@@ -34,6 +35,8 @@ pub struct CheckpointSave<'a, R: Runtime<DType = DType>> {
     pub params: &'a HashMap<TensorId, Tensor<R>>,
     pub optimizer: &'a FusedAdamW<R>,
     pub name_maps: &'a NameMaps,
+    /// Weight decay rule of the run, recorded in the meta for a resume to inherit.
+    pub weight_decay: &'a WeightDecaySpec,
 }
 
 /// Write the optimizer state, then the weights, then the meta.
@@ -71,6 +74,8 @@ where
     )
     .and_then(|mut meta| {
         meta.optimizer_file = Some(optimizer_name);
+        meta.weight_decay_rule = Some(save.weight_decay.rule);
+        meta.no_decay_patterns = save.weight_decay.no_decay_patterns.clone();
         meta.save_to(&meta_path)
     });
     if let Err(e) = written {

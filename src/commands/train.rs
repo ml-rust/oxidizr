@@ -25,6 +25,7 @@ use crate::data::{
 };
 use crate::model::LitGPT;
 use crate::trainer::{LitTrainer, TrainerRunConfig};
+use crate::weight_decay::{inherited_weight_decay, resolve_weight_decay};
 
 /// Training command arguments
 #[derive(Args, Debug)]
@@ -718,6 +719,9 @@ where
         resume_meta_path.as_deref(),
         start_step,
     )?;
+    // The config's weight decay rule, or the rule of the checkpoint this run resumes.
+    let inherited_decay = inherited_weight_decay(resume_meta_path.as_deref(), start_step)?;
+    let weight_decay = resolve_weight_decay(&config.trainer, inherited_decay.as_ref(), headless)?;
 
     if !headless {
         println!("Model initialized successfully");
@@ -888,9 +892,17 @@ where
             start_step,
             model_config: config.model.clone(),
             data_file_path: args.data_file.clone(),
+            weight_decay,
         },
     )?;
     trainer.apply_optimizer_resume(&optimizer_resume)?;
+    // Headless stdout carries JSON metrics only.
+    let decay_summary = trainer.decay_plan().summary(config_trainer.weight_decay);
+    if headless {
+        eprintln!("{decay_summary}");
+    } else {
+        println!("{decay_summary}");
+    }
 
     if !headless {
         println!("Trainer initialized with AdamW optimizer\n");
