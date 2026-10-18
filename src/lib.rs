@@ -17,6 +17,7 @@ pub mod config_paths;
 pub mod data;
 pub mod data_hash;
 pub mod distributed;
+pub mod dp;
 pub mod eval;
 pub mod fit;
 pub mod grad_clip;

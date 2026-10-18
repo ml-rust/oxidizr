@@ -66,6 +66,47 @@ impl StepWeighting {
         })
     }
 
+    /// The weighting of this rank's step over `world` data-parallel ranks.
+    ///
+    /// `micro_batches` becomes the count over every rank. A masked step takes
+    /// `global_scored`, its scored count summed over every rank. An unmasked
+    /// step takes `None`. Each micro-batch loss is then scaled by
+    /// `1 / (micro_batches * world)`, so the sum over ranks is the step mean.
+    ///
+    /// # Errors
+    /// Returns an error when `world` is 0, when `global_scored` does not
+    /// match the step's form, or when the micro-batch count overflows.
+    pub fn over_ranks(self, world: usize, global_scored: Option<usize>) -> Result<Self> {
+        if world == 0 {
+            return Err(Error::TrainingError {
+                reason: "a data-parallel step needs at least one rank, got world size 0"
+                    .to_string(),
+            });
+        }
+        let micro_batches =
+            self.micro_batches()
+                .checked_mul(world)
+                .ok_or_else(|| Error::TrainingError {
+                    reason: format!(
+                        "{} micro-batches times {world} ranks overflows a count",
+                        self.micro_batches()
+                    ),
+                })?;
+        match (self, global_scored) {
+            (Self::MicroBatchMean { .. }, None) => Ok(Self::MicroBatchMean { micro_batches }),
+            (Self::ScoredTokens { .. }, Some(total_scored)) => Ok(Self::ScoredTokens {
+                micro_batches,
+                total_scored,
+            }),
+            (Self::MicroBatchMean { .. }, Some(_)) => Err(Error::TrainingError {
+                reason: "an unmasked step got a global scored count. Pass None".to_string(),
+            }),
+            (Self::ScoredTokens { .. }, None) => Err(Error::TrainingError {
+                reason: "a masked step needs the scored count summed over every rank".to_string(),
+            }),
+        }
+    }
+
     /// Micro-batches in the step. The trainer scales each loss by its inverse.
     pub fn micro_batches(&self) -> usize {
         match self {
@@ -255,15 +296,25 @@ mod tests {
     /// The trainer's accumulation through [`StepWeighting`]: one backward per
     /// micro-batch, summed. Returns the gradient and the summed scaled loss.
     fn accumulate(parts: &[Part]) -> (Vec<f64>, f64) {
+        accumulate_weighted(parts, |batches, _| {
+            StepWeighting::for_batches(batches).expect("weighting")
+        })
+    }
+
+    /// [`accumulate`] with `weighting_of(batches, index)` weighting part `index`.
+    fn accumulate_weighted(
+        parts: &[Part],
+        weighting_of: impl Fn(&[Batch<CpuRuntime>], usize) -> StepWeighting,
+    ) -> (Vec<f64>, f64) {
         let (client, device) = setup();
         let w = param(&device);
         let batches: Vec<_> = parts.iter().map(|p| batch(p, &device)).collect();
-        let weighting = StepWeighting::for_batches(&batches).expect("weighting");
-        let scale = 1.0 / weighting.micro_batches() as f64;
 
         let mut grad = vec![0.0f64; LOGITS.len()];
         let mut loss = 0.0f64;
-        for (part, b) in parts.iter().zip(&batches) {
+        for (index, (part, b)) in parts.iter().zip(&batches).enumerate() {
+            let weighting = weighting_of(&batches, index);
+            let scale = 1.0 / weighting.micro_batches() as f64;
             let logits = rows_of(&w, part);
             let targets = b.targets.reshape(&[part.rows]).expect("targets");
             let mask = b
@@ -308,6 +359,47 @@ mod tests {
             (loss - want_loss).abs() < 1e-12,
             "loss {loss} != {want_loss}"
         );
+    }
+
+    /// Two ranks with one micro-batch each, weighted over both ranks, sum to
+    /// the merged batch. The ranks score 1 of 2 and 3 of 4 rows.
+    #[test]
+    fn ranks_weighted_over_the_world_match_one_merged_batch() {
+        let (grad, loss) = accumulate_weighted(&uneven(), |batches, index| {
+            let global = batches.iter().map(|b| b.scored).sum();
+            let local = StepWeighting::for_batches(&batches[index..=index]).expect("weighting");
+            local.over_ranks(2, Some(global)).expect("over ranks")
+        });
+        let (want_grad, want_loss) = merged(&UNEVEN_MERGED);
+        assert_close(&grad, &want_grad);
+        assert!(
+            (loss - want_loss).abs() < 1e-12,
+            "loss {loss} != {want_loss}"
+        );
+    }
+
+    #[test]
+    fn over_ranks_scales_the_count_and_checks_the_form() {
+        let mean = StepWeighting::MicroBatchMean { micro_batches: 2 };
+        assert_eq!(
+            mean.over_ranks(3, None).expect("unmasked"),
+            StepWeighting::MicroBatchMean { micro_batches: 6 }
+        );
+        assert!(mean.over_ranks(3, Some(4)).is_err());
+        assert!(mean.over_ranks(0, None).is_err());
+        let masked = StepWeighting::ScoredTokens {
+            micro_batches: 2,
+            total_scored: 5,
+        };
+        assert_eq!(
+            masked.over_ranks(2, Some(11)).expect("masked"),
+            StepWeighting::ScoredTokens {
+                micro_batches: 4,
+                total_scored: 11
+            }
+        );
+        assert!(masked.over_ranks(2, None).is_err());
+        assert_eq!(mean.over_ranks(1, None).expect("world 1"), mean);
     }
 
     /// The per-micro-batch mean is the weighting this module replaces. It

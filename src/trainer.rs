@@ -4,6 +4,7 @@ use crate::checkpoint_set::{
 };
 use crate::config::{OxidizrModelConfig, TrainerConfig};
 use crate::data::{DataLoader, DataPosition, RowLayout};
+use crate::dp::{reduce_step_gradients, reduce_step_weighting, AbortHook};
 use crate::eval::Evaluator;
 use crate::loss_scale::{resolve_loss_scale, restore_loss_scale, weighted_loss, LossScaler};
 use crate::oom_guard::{oom_guard, Pass};
@@ -15,11 +16,12 @@ use boostr::autograd::{backward_wrt, var_add, var_mul_scalar, var_reshape, GradS
 use boostr::ops::{FusedOptimizerOps, TensorOps};
 use boostr::optimizer::{AdamWConfig, GradScalerState};
 use boostr::readback::scalar_f32;
-use boostr::runtime::{Runtime, RuntimeClient};
+use boostr::runtime::{Communicator, NoOpCommunicator, Runtime, RuntimeClient};
 use boostr::tensor::TensorId;
 use boostr::{ReduceOps, TypeConversionOps};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Run-specific metadata needed to construct a `LitTrainer`.
@@ -62,7 +64,7 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     device: R::Device,
     global_step: usize,
     // Training metrics
-    row_layout: RowLayout,
+    pub(crate) row_layout: RowLayout,
     pub(crate) batch_size: usize,
     // JSON logging
     pub(crate) steps_json_path: String,
@@ -88,6 +90,12 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     loss_scaler: Option<LossScaler>,
     /// Validation evals and early stopping. `None` without `trainer.eval`.
     pub(crate) eval: Option<Evaluator<R>>,
+    /// Data-parallel group of this rank. `NoOpCommunicator` for one rank.
+    pub(crate) comm: Arc<dyn Communicator>,
+    /// Aborts the group after an error on this rank. `None` without a hook.
+    pub(crate) abort_hook: Option<AbortHook>,
+    /// True once rank 0's early-stop broadcast told this rank to stop.
+    pub(crate) peer_stop: bool,
 }
 
 impl<'a, R> LitTrainer<'a, R>
@@ -181,55 +189,15 @@ where
             last_loss: None,
             loss_scaler,
             eval: None,
+            comm: Arc::new(NoOpCommunicator),
+            abort_hook: None,
+            peer_stop: false,
         })
     }
 
-    /// Performs one training step (including gradient accumulation)
-    /// Returns (loss, grad_norm)
-    ///
-    /// # Gradient Clipping Strategy
-    /// Gradients are clipped in place. `crate::grad_clip::clip_gradients` first
-    /// clamps each element to `config.max_grad_value` when that is set. It then
-    /// clips to `config.max_grad_norm`. The step then clips, optionally, to the
-    /// tighter `config.target_grad_norm`. A step whose gradient norm is inf/NaN
-    /// is skipped, not clipped.
-    ///
-    /// The clips measure the norm over `self.parameter_ids`: the tensors the
-    /// optimizer steps, and the only keys the merged grad store holds.
-    /// `backward_wrt` still retains the loss node's `dL/dL = 1` seed and every
-    /// activation on a path to a trainable parameter, but that per-micro-batch
-    /// store is filtered to `parameter_ids` on the way into the merged store
-    /// and then dropped.
-    ///
-    /// # Gradient Accumulation Strategy
-    /// Each micro-batch runs its own forward AND backward, and its parameter
-    /// gradients are summed into one store. By linearity,
-    /// `grad(sum_k scaled_loss_k) == sum_k grad(scaled_loss_k)`, so this
-    /// computes what chaining the micro-batch losses into one graph and running
-    /// a single backward computed — but only one micro-batch's activations are
-    /// alive at a time, instead of `gradient_accumulation` of them.
-    ///
-    /// Float addition is not associative, so the accumulation ORDER matters:
-    /// gradients now land in micro-batch order rather than in the merged
-    /// graph's reverse-topological order. A parameter reached from several
-    /// micro-batches can therefore differ in its last bits, and the reported
-    /// `grad_norm` with it. The reported loss cannot move: it is the same
-    /// device `add` over the same scalars in the same micro-batch order.
-    ///
-    /// # Loss Weighting
-    /// The step draws all its micro-batches before the first forward pass.
-    /// [`StepWeighting`] then picks the cross-entropy form. A masked step
-    /// weights every scored token of the step by `1 / total`. An unmasked step
-    /// keeps the per-micro-batch mean. Either way the cross-entropy part of
-    /// the reported loss is the per-token mean over the step.
-    ///
-    /// # Loss Scaling
-    /// An f16 run multiplies each backward loss by the loss scale on top of
-    /// that weighting. After accumulation, every gradient is widened to f32
-    /// and divided by the scale, before any clip. A non-finite norm skips the
-    /// optimizer step, so its timestep stays put, and the scale backs off.
-    /// The step still draws its batches. The reported loss and norm are unscaled.
-    pub fn training_step<D: DataLoader<R>>(
+    /// One optimizer step. [`training_step`](Self::training_step) documents
+    /// the algorithm and wraps this with the abort on error.
+    pub(crate) fn step_once<D: DataLoader<R>>(
         &mut self,
         model: &crate::model::LitGPT<R>,
         data_loader: &mut D,
@@ -248,7 +216,7 @@ where
         let load_balance_alpha = self.config.load_balance_alpha;
 
         // Profiling support - set PROFILE_TRAIN=1 to enable detailed timing
-        let profile = std::env::var("PROFILE_TRAIN").is_ok();
+        let profile = std::env::var("PROFILE_TRAIN").is_ok() && !self.quiet();
         let step_start = if profile { Some(Instant::now()) } else { None };
 
         // Accumulated scaled-loss scalar across micro-batches, held as a plain
@@ -272,7 +240,12 @@ where
         for _ in 0..accum_steps {
             batches.push(data_loader.next_batch()?);
         }
-        let weighting = StepWeighting::for_batches(&batches)?;
+        // Over every data-parallel rank, before the first forward pass: a
+        // masked step needs the global scored count. World 1 keeps `local`.
+        let local_weighting = StepWeighting::for_batches(&batches)?;
+        let weighting = reduce_step_weighting::<R, _>(&*self.comm, &self.client, local_weighting)?;
+        // `gradient_accumulation * world`. Equal to `accum_steps` at world 1.
+        let micro_batches = weighting.micro_batches();
         if let Some(start) = data_start {
             eprintln!(
                 "[PROFILE] data_load: {:.3}ms",
@@ -335,7 +308,7 @@ where
                 Some(mask) => Some(mask.reshape(&[b * s])?),
                 None => None,
             };
-            if mask_flat.is_some() && !self.mask_stats_logged {
+            if mask_flat.is_some() && !self.mask_stats_logged && !self.quiet() {
                 self.mask_stats_logged = true;
                 // `scored` comes from the loader's host copy of the mask, so
                 // this report needs no device read.
@@ -414,10 +387,14 @@ where
                 }
             }
 
-            // Scale loss for gradient accumulation. Under f16 the backward
-            // loss also carries the loss scale. The logged loss never does.
-            let (logged_loss, scaled_loss) =
-                weighted_loss(&loss, accum_steps, self.loss_scaler.as_ref(), &self.client)?;
+            // Scale loss by `1 / micro_batches` over every rank. Under f16 the
+            // backward loss also carries the loss scale. The logged loss never does.
+            let (logged_loss, scaled_loss) = weighted_loss(
+                &loss,
+                micro_batches,
+                self.loss_scaler.as_ref(),
+                &self.client,
+            )?;
 
             // Only the scalar tensor is kept, never the `Var`, so nothing here
             // pins this micro-batch's graph.
@@ -470,9 +447,11 @@ where
         let loss_sync_start = if profile { Some(Instant::now()) } else { None };
         // A masked step whose micro-batches score nothing reports 0.
         let total_loss_for_logging = match accumulated_loss {
-            Some(acc_loss) => scalar_f32(&self.client, &acc_loss)? as f64 * accum_steps as f64,
+            Some(acc_loss) => scalar_f32(&self.client, &acc_loss)? as f64 * micro_batches as f64,
             None => weighting.loss_without_terms()?,
         };
+        // This rank's share of the step loss. At world 1 it is the step loss.
+        let local_loss = total_loss_for_logging / micro_batches as f64;
         if let Some(start) = loss_sync_start {
             eprintln!(
                 "[PROFILE] loss_sync: {:.3}ms",
@@ -485,9 +464,21 @@ where
         // parameter gradients into `accumulated_grads`.
         let mut grads = accumulated_grads;
 
+        // Sum gradients and the loss over every rank, once per step. Every
+        // decision below reads only these summed values, so all ranks agree.
+        // World 1 runs no collective and keeps every bit.
+        let loss = reduce_step_gradients(
+            &*self.comm,
+            &self.client,
+            &mut grads,
+            &self.parameter_ids,
+            &*self.params,
+            local_loss,
+        )?;
+
         // Check parameter/gradient matching at step 1.
         // Gradients must be keyed by the same stable TensorIds used in self.params.
-        if self.global_step == 0 {
+        if self.global_step == 0 && !self.quiet() {
             let total_params = self.parameter_ids.len();
             let grads_count = grads.len();
             let mut params_with_grads = 0;
@@ -549,7 +540,7 @@ where
         }
 
         // DEBUG: Print raw gradient norm BEFORE any clipping
-        if std::env::var("DEBUG_RAW_GRAD").is_ok() {
+        if std::env::var("DEBUG_RAW_GRAD").is_ok() && !self.quiet() {
             eprintln!(
                 "[RAW GRAD NORM] step={} raw_grad_norm={:.6}",
                 self.global_step + 1,
@@ -558,7 +549,9 @@ where
         }
 
         // DEBUG: Print top gradient contributors when DEBUG_MLA_MOE or DEBUG_GRAD is set
-        if std::env::var("DEBUG_MLA_MOE").is_ok() || std::env::var("DEBUG_GRAD").is_ok() {
+        if (std::env::var("DEBUG_MLA_MOE").is_ok() || std::env::var("DEBUG_GRAD").is_ok())
+            && !self.quiet()
+        {
             self.print_gradient_breakdown(&grads);
         }
 
@@ -566,7 +559,7 @@ where
         // scaling this is the overflow signal: the scale backs off below.
         let overflow = !grad_norm.is_finite();
         if overflow {
-            if self.loss_scaler.is_none() {
+            if self.loss_scaler.is_none() && !self.quiet() {
                 eprintln!(
                     "[GradClip] Skipping step {} - gradient norm: {}",
                     self.global_step + 1,
@@ -606,10 +599,11 @@ where
             };
         }
 
+        let quiet = self.quiet();
         if let Some(scaler) = self.loss_scaler.as_mut() {
             let scale = scaler.scale();
             scaler.record_step(overflow);
-            if overflow {
+            if overflow && !quiet {
                 eprintln!(
                     "[LossScale] Skipping step {}: gradient norm {grad_norm} at loss scale \
                      {scale}. The scale backs off to {}.",
@@ -630,7 +624,6 @@ where
         }
 
         self.global_step += 1;
-        let loss = total_loss_for_logging / accum_steps as f64;
         self.last_loss = Some(loss);
         Ok((loss, last_grad_norm))
     }
@@ -749,9 +742,11 @@ where
     ///
     /// Frozen parameters are absent from `self.params`, so the model is their
     /// source. Without it a LoRA run writes an adapter-only checkpoint.
+    ///
+    /// Only rank 0 writes and prunes. Other ranks return `Ok` at once.
     pub fn save_checkpoint(&self, model: &crate::model::LitGPT<R>, step: usize) -> Result<()> {
         self.write_set(model, CheckpointLabel::Step(step), step)?;
-        if self.config.max_checkpoints > 0 {
+        if self.config.max_checkpoints > 0 && !self.quiet() {
             remove_old_checkpoints(
                 Path::new(&self.config.checkpoint_dir),
                 self.config.max_checkpoints,
@@ -761,17 +756,26 @@ where
     }
 
     /// Saves the `_final` checkpoint set at the current step.
+    ///
+    /// Only rank 0 writes. Every rank then waits at a barrier, so no rank
+    /// exits before the set is on disk. World 1 runs no barrier.
     pub fn save_final_checkpoint(&self, model: &crate::model::LitGPT<R>) -> Result<()> {
-        self.write_set(model, CheckpointLabel::Final, self.global_step)
+        self.write_set(model, CheckpointLabel::Final, self.global_step)?;
+        self.barrier()
     }
 
     /// Writes optimizer state, weights, then the meta that marks the set complete.
+    ///
+    /// Every rank holds the same replica, so only rank 0 writes.
     pub(crate) fn write_set(
         &self,
         model: &crate::model::LitGPT<R>,
         label: CheckpointLabel,
         step: usize,
     ) -> Result<()> {
+        if self.quiet() {
+            return Ok(());
+        }
         write_checkpoint_set(CheckpointSave {
             dir: Path::new(&self.config.checkpoint_dir),
             prefix: &self.model_config.checkpoint_prefix(),

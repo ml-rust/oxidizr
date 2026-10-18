@@ -94,3 +94,31 @@ pub trait StepSink {
     fn on_error(&mut self, step: usize, error: &Error);
     fn on_finish(&mut self, summary: &FitSummary) -> Result<()>;
 }
+
+/// A sink that drops every event. Data-parallel ranks other than 0 report to it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullSink;
+
+impl StepSink for NullSink {
+    fn on_start(&mut self, _start: &FitStart) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_step(&mut self, _report: &StepReport) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_eval(&mut self, _step: usize, _report: &EvalReport) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_checkpoint(&mut self, _note: &CheckpointNote) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_error(&mut self, _step: usize, _error: &Error) {}
+
+    fn on_finish(&mut self, _summary: &FitSummary) -> Result<()> {
+        Ok(())
+    }
+}

@@ -5,6 +5,7 @@ use super::run::{evaluate, EvalTotals};
 use super::state::{EvalOutcome, Evaluator};
 use super::stopper::Decision;
 use crate::checkpoint_set::CheckpointLabel;
+use crate::dp::PEER_STOP_REASON;
 use crate::fit::{CheckpointNote, EvalReport, StepSink};
 use crate::model::LitGPT;
 use crate::prelude::{DType, Result};
@@ -62,6 +63,8 @@ where
     /// The eval goes to `evals.json` and to `sink`. A new best loss writes the
     /// `best` checkpoint when `save_interval` is above 0. The interval
     /// checkpoint of the same step comes after, so its meta holds this eval's counters.
+    ///
+    /// Only data-parallel rank 0 evaluates. The fit loop broadcasts its stop decision.
     pub(crate) fn eval_if_due(
         &mut self,
         model: &LitGPT<R>,
@@ -69,6 +72,9 @@ where
         total_steps: usize,
         sink: &mut dyn StepSink,
     ) -> Result<()> {
+        if self.quiet() {
+            return Ok(());
+        }
         let due = self
             .eval
             .as_ref()
@@ -106,8 +112,14 @@ where
     }
 
     /// Why the run stops early. `None` without an eval, or while the patience lasts.
+    ///
+    /// A data-parallel rank other than 0 reports [`PEER_STOP_REASON`] once
+    /// rank 0's stop decision reached it.
     pub fn early_stop_reason(&self) -> Option<&str> {
-        self.eval.as_ref().and_then(Evaluator::stop_reason)
+        self.eval
+            .as_ref()
+            .and_then(Evaluator::stop_reason)
+            .or_else(|| self.peer_stop.then_some(PEER_STOP_REASON))
     }
 
     /// What the evals reached. `None` without an eval.

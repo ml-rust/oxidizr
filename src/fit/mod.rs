@@ -7,5 +7,5 @@ mod throughput;
 mod tui_sink;
 
 pub use json_sink::JsonSink;
-pub use sink::{CheckpointNote, EvalReport, FitStart, FitSummary, StepReport, StepSink};
+pub use sink::{CheckpointNote, EvalReport, FitStart, FitSummary, NullSink, StepReport, StepSink};
 pub use tui_sink::TuiSink;

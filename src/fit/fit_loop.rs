@@ -1,7 +1,7 @@
 //! The one fit loop of `LitTrainer`: steps, logs, checkpoints, the final save.
 
 use super::json_sink::JsonSink;
-use super::sink::{CheckpointNote, FitStart, FitSummary, StepReport, StepSink};
+use super::sink::{CheckpointNote, FitStart, FitSummary, NullSink, StepReport, StepSink};
 use super::throughput::Throughput;
 use super::tui_sink::TuiSink;
 use crate::checkpoint_config::{checkpoint_config_exists, write_checkpoint_config};
@@ -36,8 +36,11 @@ where
     /// Trains the remaining steps with the output mode the run config chose.
     ///
     /// Headless output is JSON lines on stdout. Interactive output is a progress bar.
+    /// Data-parallel ranks other than 0 report to a [`NullSink`].
     pub fn fit<D: DataLoader<R>>(&mut self, model: &LitGPT<R>, data_loader: &mut D) -> Result<()> {
-        if self.headless {
+        if self.quiet() {
+            self.fit_with_sink(model, data_loader, &mut NullSink)
+        } else if self.headless {
             self.fit_with_sink(model, data_loader, &mut JsonSink::stdio())
         } else {
             self.fit_with_sink(model, data_loader, &mut TuiSink::new())
@@ -54,7 +57,30 @@ where
     /// With an attached eval, an eval runs after every multiple of
     /// `trainer.eval.interval` and after the last step. When early stopping
     /// fires, the loop stops at that step boundary and writes the final checkpoint.
+    ///
+    /// # Data parallelism
+    /// In a world above 1 the loop first copies rank 0's model tensors to
+    /// every rank. Only rank 0 writes `config.json`, `steps.json`, evals and
+    /// checkpoints. Only rank 0 evaluates. After every step, rank 0's
+    /// early-stop decision reaches every rank, so all ranks stop together.
+    /// Every rank waits at a barrier after the final save.
+    /// An error on this rank calls [`abort_collectives`](Self::abort_collectives)
+    /// before it returns, so peers do not wait in a collective.
     pub fn fit_with_sink<D: DataLoader<R>>(
+        &mut self,
+        model: &LitGPT<R>,
+        data_loader: &mut D,
+        sink: &mut dyn StepSink,
+    ) -> Result<()> {
+        let result = self.run_fit(model, data_loader, sink);
+        if result.is_err() {
+            self.abort_collectives();
+        }
+        result
+    }
+
+    /// The body of [`fit_with_sink`](Self::fit_with_sink).
+    fn run_fit<D: DataLoader<R>>(
         &mut self,
         model: &LitGPT<R>,
         data_loader: &mut D,
@@ -62,9 +88,15 @@ where
     ) -> Result<()> {
         // blazr reads config.json to serve a checkpoint directly.
         self.save_blazr_config_if_needed();
+        self.sync_initial_parameters(model)?;
+        // A resumed rank 0 can start stopped. Every rank must agree before step one.
+        self.sync_early_stop()?;
 
         let total_steps = self.lr_plan.total_steps();
-        let mut clock = Throughput::start(self.batch_size * self.config.gradient_accumulation);
+        // Samples of every rank. `batch_size` counts one rank's rows.
+        let mut clock = Throughput::start(
+            self.batch_size * self.config.gradient_accumulation * self.world_size(),
+        );
         sink.on_start(&FitStart {
             start_step: self.start_step,
             total_steps,
@@ -111,6 +143,8 @@ where
                 self.save_checkpoint(model, completed)?;
                 sink.on_checkpoint(&CheckpointNote::Saved { step: completed })?;
             }
+            // Every rank learns rank 0's stop decision before the next step draws data.
+            self.sync_early_stop()?;
         }
 
         let path = format!(
@@ -142,7 +176,11 @@ where
     /// Appends the `steps.json` line of `report`.
     ///
     /// A write error prints a warning and never stops the run.
+    /// Only rank 0 writes.
     fn record_step(&self, report: &StepReport) {
+        if self.quiet() {
+            return;
+        }
         let record = StepRecord {
             step: report.step,
             loss: report.loss,
@@ -158,7 +196,11 @@ where
     /// Writes the blazr-compatible config.json to the checkpoint directory.
     ///
     /// Every error is a warning in interactive mode and silent in headless mode.
+    /// Only rank 0 writes.
     fn save_blazr_config_if_needed(&self) {
+        if self.quiet() {
+            return;
+        }
         let dir = &self.config.checkpoint_dir;
         if !Path::new(dir).exists() {
             if let Err(e) = std::fs::create_dir_all(dir) {
