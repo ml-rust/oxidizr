@@ -4,6 +4,7 @@ use crate::checkpoint_set::{
 };
 use crate::config::{OxidizrModelConfig, TrainerConfig};
 use crate::data::{DataLoader, DataPosition, RowLayout};
+use crate::eval::Evaluator;
 use crate::loss_scale::{resolve_loss_scale, restore_loss_scale, weighted_loss, LossScaler};
 use crate::oom_guard::{oom_guard, Pass};
 use crate::prelude::{DType, Error, FusedAdamW, Result, Tensor};
@@ -46,7 +47,7 @@ pub struct TrainerRunConfig {
 /// It owns the loop state, the optimizer, and handles the "boring" stuff.
 pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     pub(crate) config: TrainerConfig,
-    params: &'a mut HashMap<TensorId, Tensor<R>>,
+    pub(crate) params: &'a mut HashMap<TensorId, Tensor<R>>,
     parameter_ids: Vec<TensorId>,
     parameter_names: Vec<(String, TensorId)>,
     /// Checkpoint names of the trainable parameters, for optimizer state files.
@@ -54,7 +55,7 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     optimizer: FusedAdamW<R>,
     /// The no-decay set the optimizer's parameter group holds.
     decay_plan: DecayPlan,
-    client: R::Client,
+    pub(crate) client: R::Client,
     /// Training device. Loaded optimizer state goes here.
     device: R::Device,
     global_step: usize,
@@ -83,6 +84,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     last_loss: Option<f64>,
     /// Dynamic loss scaling. `Some` exactly when the model trains in f16.
     loss_scaler: Option<LossScaler>,
+    /// Validation evals and early stopping. `None` without `trainer.eval`.
+    pub(crate) eval: Option<Evaluator<R>>,
 }
 
 impl<'a, R> LitTrainer<'a, R>
@@ -175,6 +178,7 @@ where
             mask_stats_logged: false,
             last_loss: None,
             loss_scaler,
+            eval: None,
         })
     }
 
@@ -760,7 +764,7 @@ where
     }
 
     /// Writes optimizer state, weights, then the meta that marks the set complete.
-    fn write_set(
+    pub(crate) fn write_set(
         &self,
         model: &crate::model::LitGPT<R>,
         label: CheckpointLabel,
@@ -780,6 +784,7 @@ where
             name_maps: &self.name_maps,
             weight_decay: self.decay_plan.spec(),
             loss_scale: self.loss_scale_state(),
+            eval: self.eval_checkpoint(),
         })
     }
 

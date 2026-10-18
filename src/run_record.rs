@@ -2,7 +2,10 @@
 //!
 //! - `run.json`: one [`RunRecord`], written once the run ends, in both output modes.
 //! - `steps.json`: one [`StepRecord`] JSON object per line, appended at each log interval.
+//! - `evals.json`: one [`EvalRecord`] JSON object per line, appended at each eval.
+//!   Absent for a run without `trainer.eval`.
 
+use crate::eval::EvalOutcome;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -12,6 +15,8 @@ use std::path::{Path, PathBuf};
 pub const RUN_RECORD_FILE: &str = "run.json";
 /// File name of the per-step log inside the run directory.
 pub const STEPS_FILE: &str = "steps.json";
+/// File name of the per-eval log inside the run directory.
+pub const EVALS_FILE: &str = "evals.json";
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +47,22 @@ pub struct RunRecord {
     pub dataset_size: Option<usize>,
     /// Model and trainer summary. `None` when setup stopped before it was known.
     pub config: Option<serde_json::Value>,
+    /// Lowest eval loss of the run. Absent without `trainer.eval`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_eval_loss: Option<f64>,
+    /// Evals this run directory recorded. Absent without `trainer.eval`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evals: Option<usize>,
+    /// True when early stopping ended the run before its last step.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stopped_early: bool,
+    /// Why early stopping ended the run. Absent when it ran every step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl RunRecord {
@@ -86,6 +107,8 @@ pub struct RunProgress {
     pub config: Option<serde_json::Value>,
     pub final_step: usize,
     pub last_loss: Option<f64>,
+    /// What the evals reached. `None` without `trainer.eval`.
+    pub eval: Option<EvalOutcome>,
 }
 
 impl RunProgress {
@@ -99,6 +122,7 @@ impl RunProgress {
             config: None,
             final_step: 0,
             last_loss: None,
+            eval: None,
         }
     }
 
@@ -119,8 +143,49 @@ impl RunProgress {
             device: self.device.clone(),
             dataset_size: self.dataset_size,
             config: self.config.clone(),
+            best_eval_loss: self.eval.as_ref().and_then(|e| e.best_eval_loss),
+            evals: self.eval.as_ref().map(|e| e.evals),
+            stopped_early: self.eval.as_ref().is_some_and(|e| e.stop_reason.is_some()),
+            stop_reason: self.eval.as_ref().and_then(|e| e.stop_reason.clone()),
         }
     }
+}
+
+/// One line of `evals.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalRecord {
+    /// Completed optimizer steps when the eval ran.
+    pub step: usize,
+    /// Cross-entropy per scored eval token.
+    pub loss: f64,
+    pub perplexity: f64,
+    pub batches: usize,
+    /// Scored eval tokens.
+    pub tokens: usize,
+    /// Lowest eval loss so far, this one included.
+    pub best_loss: Option<f64>,
+    /// Evals since the best loss.
+    pub since_best: usize,
+}
+
+impl EvalRecord {
+    /// Appends this record as one JSON line to `path`, creating the file when absent.
+    pub fn append_to(&self, path: &Path) -> anyhow::Result<()> {
+        append_line(self, path, "eval log")
+    }
+}
+
+/// Appends `value` as one JSON line to the `what` file at `path`.
+fn append_line<T: Serialize>(value: &T, path: &Path, what: &str) -> anyhow::Result<()> {
+    let line = serde_json::to_string(value)
+        .with_context(|| format!("failed to serialize a {what} line"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open {what} '{}'", path.display()))?;
+    writeln!(file, "{line}")
+        .with_context(|| format!("failed to append to {what} '{}'", path.display()))
 }
 
 /// One line of `steps.json`.
@@ -136,14 +201,7 @@ pub struct StepRecord {
 impl StepRecord {
     /// Appends this record as one JSON line to `path`, creating the file when absent.
     pub fn append_to(&self, path: &Path) -> anyhow::Result<()> {
-        let line = serde_json::to_string(self).context("failed to serialize a steps.json line")?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("failed to open step log '{}'", path.display()))?;
-        writeln!(file, "{line}")
-            .with_context(|| format!("failed to append to step log '{}'", path.display()))
+        append_line(self, path, "step log")
     }
 }
 
@@ -188,6 +246,28 @@ mod tests {
         assert_eq!(record.error, None);
         let json = serde_json::to_value(&record).expect("serialize");
         assert_eq!(json["status"], "completed");
+        assert_eq!(exit_code(&result), 0);
+        for key in ["best_eval_loss", "evals", "stopped_early", "stop_reason"] {
+            assert!(json.get(key).is_none(), "{key} without an eval");
+        }
+    }
+
+    #[test]
+    fn an_early_stop_completes_with_its_reason_and_exit_code_zero() {
+        let mut progress = RunProgress::start("runs/x", "cpu");
+        progress.eval = Some(EvalOutcome {
+            best_eval_loss: Some(1.25),
+            evals: 4,
+            stop_reason: Some("patience spent".to_string()),
+        });
+        let result: anyhow::Result<()> = Ok(());
+        let json = serde_json::to_value(progress.finish(&result)).expect("serialize");
+
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["best_eval_loss"], 1.25);
+        assert_eq!(json["evals"], 4);
+        assert_eq!(json["stopped_early"], true);
+        assert_eq!(json["stop_reason"], "patience spent");
         assert_eq!(exit_code(&result), 0);
     }
 }

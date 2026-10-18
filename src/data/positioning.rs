@@ -46,7 +46,7 @@ where
         let mut window = Vec::with_capacity(self.batch_size * width);
         for slot in start.row..start.row + self.batch_size {
             let row = self.order.row(&layout, start.epoch, slot);
-            let offset = self.shard_start + row * width;
+            let offset = (self.first_row + row) * width;
             window.extend_from_slice(self.data_source.tokens(offset, width));
         }
 
@@ -200,6 +200,59 @@ pub(super) mod tests {
             err.to_string().contains("past this shard's 6 rows"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_row_range_reads_only_its_own_rows() {
+        let mut l = shuffled(offsets(12, 2), 2, 5)
+            .with_row_range(3, 9)
+            .expect("range inside the data");
+        assert_eq!(l.row_layout().expect("layout").num_rows(), 6);
+        assert_eq!(l.total_rows(), 12);
+        for epoch in 0..2 {
+            let mut rows = epoch_rows(&mut l, 3);
+            rows.sort_unstable();
+            assert_eq!(rows, (3..9).collect::<Vec<_>>(), "epoch {epoch}");
+        }
+    }
+
+    #[test]
+    fn a_full_row_range_reads_what_the_default_reads() {
+        let mut full = shuffled(offsets(10, 3), 2, 4);
+        let mut ranged = shuffled(offsets(10, 3), 2, 4)
+            .with_row_range(0, 10)
+            .expect("full range");
+        assert_eq!(epoch_rows(&mut ranged, 15), epoch_rows(&mut full, 15));
+    }
+
+    #[test]
+    fn split_ranges_are_disjoint_and_cover_the_rows() {
+        let mut train = shuffled(offsets(10, 0), 2, 8)
+            .with_row_range(0, 7)
+            .expect("train range");
+        let mut eval =
+            LitDataLoader::<CpuRuntime>::new(offsets(10, 0), 1, SEQ_LEN, CpuDevice::new())
+                .with_row_range(7, 10)
+                .expect("eval range");
+        let train_rows: HashSet<usize> = epoch_rows(&mut train, 9).into_iter().collect();
+        let eval_rows: HashSet<usize> = epoch_rows(&mut eval, 3).into_iter().collect();
+        assert!(
+            train_rows.is_disjoint(&eval_rows),
+            "{train_rows:?} {eval_rows:?}"
+        );
+        assert_eq!(eval_rows, (7..10).collect::<HashSet<usize>>());
+        assert!(train_rows.iter().all(|r| *r < 7));
+    }
+
+    #[test]
+    fn a_row_range_outside_the_data_is_an_error() {
+        let l = || LitDataLoader::<CpuRuntime>::new(offsets(6, 0), 2, SEQ_LEN, CpuDevice::new());
+        for (start, end) in [(0, 7), (4, 4), (5, 2)] {
+            let Err(err) = l().with_row_range(start, end) else {
+                panic!("range [{start}, {end}) of 6 rows must be refused");
+            };
+            assert!(err.to_string().contains("6 whole rows"), "{err}");
+        }
     }
 
     #[test]

@@ -67,16 +67,30 @@ Output:
 | `samples/s`     | Samples per second          |
 | `vram`          | Device memory in use (MiB), `"0"` when unknown |
 
+Other headless lines wrap their event in one key:
+
+| Line | When |
+| ---- | ---- |
+| `{"warmup": {"steps": 2, "base_lr": 3.000000e-3}}` | At start, when the run warms up |
+| `{"checkpoint": {"step": 500}}` | After an interval checkpoint |
+| `{"eval": {"step": 500, "loss": 2.3026, "perplexity": 10.0000, "batches": 50, "tokens": 51200, "best_loss": 2.3026, "since_best": 0}}` | After each eval under `trainer.eval` |
+| `{"checkpoint": {"step": 500, "label": "best"}}` | After an eval writes the best checkpoint |
+| `{"status": "complete"}` | When the run ends |
+| `{"status": "complete", "stopped_early": true, "reason": "..."}` | When early stopping ends the run |
+
+An eval line writes a non-finite `loss` or `perplexity` as `null`. `best_loss` is `null` before the first finite eval loss. The final-save line, `Saving final checkpoint to <path>`, is plain text. Interactive mode prints one line per eval above the progress bar.
+
 ## Run Directory Files
 
-Both modes write the same two files to the run directory. Set it with `--run-dir`. The default is `$OXIDIZED_RUN_DIR`, else `./runs/<timestamp>`.
+Both modes write the same files to the run directory. Set it with `--run-dir`. The default is `$OXIDIZED_RUN_DIR`, else `./runs/<timestamp>`.
 
 | File         | Content                                                                                       |
 | ------------ | --------------------------------------------------------------------------------------------- |
 | `steps.json` | One JSON line per log interval and for the first step of each session: `step`, `loss`, `grad_norm`, `learning_rate`, `epoch` |
-| `run.json`   | Written when the run ends: `status`, `error`, `final_step`, `last_loss`, `started_at`, `finished_at`, `device`, `dataset_size`, `config` |
+| `evals.json` | Under `trainer.eval` only. One JSON line per eval: `step`, `loss`, `perplexity`, `batches`, `tokens`, `best_loss`, `since_best` |
+| `run.json`   | Written when the run ends: `status`, `error`, `final_step`, `last_loss`, `started_at`, `finished_at`, `device`, `dataset_size`, `config`. Under `trainer.eval` also `best_eval_loss` and `evals`, the eval count of this run directory. After an early stop also `stopped_early: true` and `stop_reason` |
 
-`status` is `completed` or `failed`. A failed run, setup errors included, records the error text in `error`. The process then exits with code 1.
+`status` is `completed` or `failed`. A failed run, setup errors included, records the error text in `error`. The process then exits with code 1. An early stop is `completed` and exits with code 0. A run without `trainer.eval` writes no `evals.json` and none of the eval keys.
 
 ## Choosing the Right Mode
 
@@ -99,7 +113,12 @@ import json
 metrics = []
 with open("training.log") as f:
     for line in f:
-        metrics.append(json.loads(line))
+        try:
+            m = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # the final-save line is plain text
+        if "step" in m and "loss" in m:  # step lines only
+            metrics.append(m)
 
 # Plot loss curve
 import matplotlib.pyplot as plt

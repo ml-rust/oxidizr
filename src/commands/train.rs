@@ -17,12 +17,12 @@ use crate::checkpoint_set::{manual_resume_target, plan_optimizer_resume};
 use crate::commands::overrides::{
     resolve_checkpoint_dir, resolve_dtype, resolve_sync_backend, Source,
 };
+use crate::commands::train_data::{run_loaders, RunLoaders, TokenSource};
 use crate::config::{
     find_latest_checkpoint, CheckpointMeta, DTypePrecision, LitConfig, OxidizrModelConfig,
 };
-use crate::data::{
-    create_dummy_data, DataPosition, LitDataLoader, PrefetchDataLoader, RowLayout, RowOrder,
-};
+use crate::data::{DataPosition, PrefetchDataLoader, RowLayout, RowOrder};
+use crate::eval::read_eval_resume;
 use crate::loss_scale::{read_loss_scale_state, resolve_loss_scale};
 use crate::model::LitGPT;
 use crate::trainer::{LitTrainer, TrainerRunConfig};
@@ -96,7 +96,7 @@ pub struct TrainArgs {
     #[arg(long = "checkpoint-dir")]
     pub checkpoint_dir: Option<String>,
 
-    /// Run directory for run.json and steps.json. Default: $OXIDIZED_RUN_DIR,
+    /// Run directory for run.json, steps.json and evals.json. Default: $OXIDIZED_RUN_DIR,
     /// else ./runs/<timestamp>. The directory is created when absent.
     #[arg(long = "run-dir")]
     pub run_dir: Option<String>,
@@ -751,41 +751,28 @@ where
     }
 
     // Create base data loader
-    let base_loader = if let Some(data_path) = &args.data_file {
-        if !headless {
-            println!(
-                "Loading training data from memory-mapped file: {}",
-                data_path
-            );
+    if !headless {
+        match &args.data_file {
+            Some(path) => println!("Loading training data from memory-mapped file: {path}"),
+            None => println!("Creating dummy training data..."),
         }
-        LitDataLoader::<R>::from_file(data_path, batch_size, seq_len, device.clone())?
-    } else {
-        if !headless {
-            println!("Creating dummy training data...");
-        }
-        let total_tokens = 1_000_000; // 1M tokens for demo
-        let dummy_tokens = create_dummy_data(config.model.vocab_size, total_tokens);
-        LitDataLoader::<R>::new(dummy_tokens, batch_size, seq_len, device.clone())
-    };
-
-    // Masked loss scoring is opt-in: without either `speech_layout` or
-    // `target_mask` the loader emits no mask and every position is scored,
-    // exactly as before. `try_with_speech_layout` rejects a corpus whose
-    // layout sidecar disagrees with the configured layout, rather than
-    // training on ids that mean something else. `LitConfig::validate` already
-    // rejects a config that sets both, so the two arms below never overlap
-    // on a config that reached this point through `LitConfig::from_yaml`.
-    let base_loader = match (&config.model.speech_layout, &config.trainer.target_mask) {
-        (Some(spec), None) => base_loader.try_with_speech_layout(spec.layout())?,
-        (None, Some(spec)) => base_loader.with_target_mask(spec.target_mask()),
-        (None, None) => base_loader,
-        (Some(_), Some(_)) => {
-            anyhow::bail!(
-                "model.speech_layout and trainer.target_mask are mutually exclusive: both \
-                 configure the loader's loss mask"
-            );
-        }
-    };
+    }
+    let source = TokenSource::for_run(args.data_file.as_deref(), &config);
+    let RunLoaders {
+        train: base_loader,
+        evaluator,
+        holdout_rows,
+    } = run_loaders::<R>(&config, &source, &device)?;
+    // Before the seek: the held-out rows decide what the saved data position means.
+    let eval_resume = read_eval_resume(resume_meta_path.as_deref(), start_step, holdout_rows)?;
+    let evaluator = evaluator.map(|e| e.resumed(eval_resume));
+    if let (Some(eval), false) = (&evaluator, headless) {
+        println!(
+            "Eval: {} held-out rows, {} batches per eval",
+            eval.holdout_rows(),
+            eval.batches()
+        );
+    }
 
     let row_order = if config.trainer.shuffle_rows {
         RowOrder::Shuffled {
@@ -909,6 +896,9 @@ where
     )?;
     trainer.apply_optimizer_resume(&optimizer_resume)?;
     trainer.restore_loss_scale(loss_scale_state)?;
+    if let Some(evaluator) = evaluator {
+        trainer.attach_eval(evaluator);
+    }
     // Headless stdout carries JSON metrics only.
     let decay_summary = trainer.decay_plan().summary(config_trainer.weight_decay);
     if headless {
@@ -1016,9 +1006,13 @@ where
     };
     progress.final_step = trainer.global_step();
     progress.last_loss = trainer.last_loss();
+    progress.eval = trainer.eval_outcome();
 
     match training_result {
         Ok(_) => {
+            if let (Some(reason), false) = (trainer.early_stop_reason(), headless) {
+                println!("\nEarly stop at step {}: {reason}", trainer.global_step());
+            }
             if !headless {
                 println!(
                     "\nTraining complete! Checkpoints saved to: {}",

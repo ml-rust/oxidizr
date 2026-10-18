@@ -5,6 +5,7 @@ use super::names::NameMaps;
 use super::optimizer_io::write_optimizer_file;
 use crate::config::{CheckpointMeta, OxidizrModelConfig};
 use crate::data::DataPosition;
+use crate::eval::EvalCheckpoint;
 use crate::model::{save_checkpoint_from_params, LitGPT};
 use crate::prelude::{DType, FusedAdamW, Result, Tensor};
 use crate::weight_decay::WeightDecaySpec;
@@ -40,6 +41,8 @@ pub struct CheckpointSave<'a, R: Runtime<DType = DType>> {
     pub weight_decay: &'a WeightDecaySpec,
     /// Loss scaler state after `step` steps. `None` for a run without loss scaling.
     pub loss_scale: Option<GradScalerState>,
+    /// Held-out rows and eval stop counters after `step` steps. Default without an eval.
+    pub eval: EvalCheckpoint,
 }
 
 /// Write the optimizer state, then the weights, then the meta.
@@ -47,15 +50,24 @@ pub struct CheckpointSave<'a, R: Runtime<DType = DType>> {
 /// Each file is written atomically. The meta is the commit marker. A crash
 /// before it leaves a set that `--resume auto` skips. A meta write error is a
 /// warning: the weights stay usable through an explicit `--resume <path>`.
+/// A set written over an older one, such as `best`, loses the old meta first,
+/// so no meta ever names a half-replaced set.
 ///
 /// # Errors
-/// Returns an error when the directory, optimizer state, or weights write fails.
+/// Returns an error when the directory, the old meta removal, the optimizer
+/// state, or the weights write fails.
 pub fn write_checkpoint_set<R>(save: CheckpointSave<'_, R>) -> Result<()>
 where
     R: Runtime<DType = DType>,
     R::Client: RuntimeClient<R> + TensorOps<R> + TypeConversionOps<R>,
 {
     std::fs::create_dir_all(save.dir)?;
+    let meta_path = save.dir.join(save.label.meta_file_name());
+    if let Err(e) = std::fs::remove_file(&meta_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.into());
+        }
+    }
     let optimizer_name = save.label.optimizer_file_name(save.prefix);
     write_optimizer_file(
         &save.dir.join(&optimizer_name),
@@ -67,7 +79,6 @@ where
     let weights = weights_path.to_string_lossy().into_owned();
     save_checkpoint_from_params(&weights, save.model, save.params)?;
 
-    let meta_path = save.dir.join(save.label.meta_file_name());
     let written = CheckpointMeta::new(
         save.step,
         save.model_config,
@@ -80,6 +91,9 @@ where
         meta.weight_decay_rule = Some(save.weight_decay.rule);
         meta.no_decay_patterns = save.weight_decay.no_decay_patterns.clone();
         meta.loss_scale = save.loss_scale;
+        meta.holdout_rows = save.eval.holdout_rows;
+        meta.best_eval_loss = save.eval.best_eval_loss;
+        meta.evals_since_best = save.eval.evals_since_best;
         meta.save_to(&meta_path)
     });
     if let Err(e) = written {

@@ -2,7 +2,8 @@
 //! stream position a checkpoint records.
 //!
 //! A row is `seq_len + 1` consecutive tokens at a fixed offset: row `r` of a
-//! shard is tokens `[shard_start + r * (seq_len + 1), shard_start + (r + 1) * (seq_len + 1))`.
+//! loader whose row range starts at `first_row` is tokens
+//! `[(first_row + r) * (seq_len + 1), (first_row + r + 1) * (seq_len + 1))`.
 //! A batch is `batch_size` rows. Each epoch hands out every row once, in the
 //! order [`EpochOrder`] gives.
 

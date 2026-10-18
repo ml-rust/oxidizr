@@ -1,6 +1,6 @@
 //! Interactive output: a sticky progress bar with scrolling log lines above it.
 
-use super::sink::{CheckpointNote, FitStart, FitSummary, StepReport, StepSink};
+use super::sink::{CheckpointNote, EvalReport, FitStart, FitSummary, StepReport, StepSink};
 use crate::prelude::{Error, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
@@ -84,10 +84,24 @@ impl StepSink for TuiSink {
         Ok(())
     }
 
+    fn on_eval(&mut self, step: usize, report: &EvalReport) -> Result<()> {
+        let best = report
+            .best_loss
+            .map_or_else(|| "none".to_string(), |b| format!("{b:.4}"));
+        self.println(format!(
+            "📏 Eval at step {step}: loss {:.4} | ppl {:.2} | {} tokens | best {best} | {} since best",
+            report.loss, report.perplexity, report.tokens, report.since_best
+        ));
+        Ok(())
+    }
+
     fn on_checkpoint(&mut self, note: &CheckpointNote) -> Result<()> {
         match note {
             CheckpointNote::Saved { step } => {
                 self.println(format!("💾 Checkpoint saved: step {step}"));
+            }
+            CheckpointNote::Best { step } => {
+                self.println(format!("🏆 Best checkpoint saved: step {step}"));
             }
             CheckpointNote::Final { path } => {
                 if let Some(pb) = &self.pb {
@@ -122,6 +136,12 @@ impl StepSink for TuiSink {
     }
 
     fn on_finish(&mut self, summary: &FitSummary) -> Result<()> {
+        if let Some(reason) = &summary.stopped_early {
+            self.println(format!(
+                "⏹️  Early stop at step {}: {reason}",
+                summary.final_step
+            ));
+        }
         self.println(format!(
             "✅ Training complete | final loss: {:.4} | grad: {:.4}",
             summary.last_loss.unwrap_or(0.0),

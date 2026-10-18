@@ -161,6 +161,7 @@ Key `trainer` fields:
 | `weight_decay`, `weight_decay_rule`, `no_decay_patterns` | AdamW decay coefficient, and the parameters it applies to. `skip_1d` (fresh-run default) skips norms, biases and SSM `a_log`/`D`. `decay_all` decays everything. `skip_all` decays nothing. A resume keeps the checkpoint's rule |
 | `checkpoint_dir`, `save_interval`, `max_checkpoints` | Checkpoint location, frequency, and retention (`0` keeps all) |
 | `log_interval` | Steps between metric updates |
+| `eval` | Validation on `holdout_rows`, `holdout_fraction` or a `data_file`, every `interval` steps over `batches` batches. `early_stopping` (`patience`, `min_delta`) stops the run cleanly. A new best writes the `best` checkpoint. Absent, nothing changes |
 | `target_device` | `gpu` or `cpu`. The CLI `--target-device` overrides it |
 | `load_balance_alpha` | MoE load-balance loss weight |
 
@@ -219,7 +220,7 @@ Common `train` flags:
 | `--dtype <f32\|f16\|bf16>` | Config `model.dtype` (`f32`) | Model precision |
 | `--checkpoint-dir <DIR>` | Config `trainer.checkpoint_dir` | Checkpoint directory |
 | `--headless` | Off | Print JSON metrics only. Use in CI, pipes, and non-interactive shells |
-| `--run-dir <DIR>` | `$OXIDIZED_RUN_DIR`, else `./runs/<timestamp>` | Directory for `run.json` and `steps.json` |
+| `--run-dir <DIR>` | `$OXIDIZED_RUN_DIR`, else `./runs/<timestamp>` | Directory for `run.json`, `steps.json` and `evals.json` |
 
 Every run writes `run.json` to its run directory when it ends, in both output modes. It records `status` (`completed` or `failed`), the error text of a failed run, the final step, the last loss, and start and end times. `train` exits with code 1 when the run failed. `steps.json` holds one JSON line per log interval and one for the first step of each session.
 

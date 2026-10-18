@@ -15,6 +15,7 @@ pub mod pack;
 #[cfg(feature = "audio")]
 pub mod prep_corpus;
 pub mod train;
+pub mod train_data;
 
 #[cfg(feature = "huggingface")]
 pub mod push;

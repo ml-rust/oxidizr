@@ -50,6 +50,10 @@ where
     /// A log step is a multiple of `log_interval`, or the first step of this session.
     /// `log_interval: 0` logs the first step of the session only.
     /// A step error goes to [`StepSink::on_error`] and returns at once.
+    ///
+    /// With an attached eval, an eval runs after every multiple of
+    /// `trainer.eval.interval` and after the last step. When early stopping
+    /// fires, the loop stops at that step boundary and writes the final checkpoint.
     pub fn fit_with_sink<D: DataLoader<R>>(
         &mut self,
         model: &LitGPT<R>,
@@ -71,6 +75,10 @@ where
 
         let mut last = None;
         for index in self.start_step..total_steps {
+            // Early stopping ends the run at a step boundary, before the next step draws data.
+            if self.early_stop_reason().is_some() {
+                break;
+            }
             let (loss, grad_norm) = match self.training_step(model, data_loader) {
                 Ok(result) => result,
                 Err(e) => {
@@ -97,6 +105,8 @@ where
             sink.on_step(&report)?;
             last = Some((loss, grad_norm));
 
+            // Before the interval save, so its meta holds this eval's counters.
+            self.eval_if_due(model, completed, total_steps, sink)?;
             if self.is_save_step(completed) {
                 self.save_checkpoint(model, completed)?;
                 sink.on_checkpoint(&CheckpointNote::Saved { step: completed })?;
@@ -114,6 +124,7 @@ where
             final_step: self.global_step(),
             last_loss: last.map(|(loss, _)| loss),
             last_grad_norm: last.map(|(_, grad_norm)| grad_norm),
+            stopped_early: self.early_stop_reason().map(str::to_string),
         })
     }
 

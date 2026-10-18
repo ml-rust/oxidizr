@@ -151,6 +151,45 @@ trainer:
 
 The checkpoint meta records the scale, so a resume continues it exactly. See [Resume Behavior](training/checkpoints.md#resume-behavior).
 
+### Validation and Early Stopping
+
+`trainer.eval` scores held-out data at step boundaries. Without the key the run evaluates nothing and trains as before.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `eval.data_file` | Token file the eval reads in full. Training keeps every row of `--data` | none |
+| `eval.holdout_rows` | Whole rows split off the end of the training data | none |
+| `eval.holdout_fraction` | Fraction of the training rows split off the end, in `(0, 1)`. Rounds down | none |
+| `eval.interval` | Steps between evals. Positive | 500 |
+| `eval.batches` | Batches per eval. Positive. Capped at the whole batches the eval rows hold | 50 |
+| `eval.early_stopping.patience` | Evals in a row without an improvement that stop the run. Positive | 5 |
+| `eval.early_stopping.min_delta` | An eval improves only when its loss is below `best - min_delta`. Finite, 0 or more | 0.0 |
+
+Rules:
+
+- Without `data_file`, set exactly one of `holdout_rows` and `holdout_fraction`. With `data_file`, set neither.
+- Each error names the key it rejects. An unknown key inside `eval` is an error.
+- A holdout of `h` rows from `N`: training reads rows `[0, N - h)` and the eval reads `[N - h, N)`. A held-out row never reaches a training batch. Both sides must hold one batch of `batch_size` rows.
+- An eval reads its rows in stream order from the first row, with no shuffle, so every eval sees the same batches. It owns its own loader and never moves the training loader or its row order.
+- An eval runs when the completed step count is a multiple of `interval`, and once after the last step. It runs before the interval checkpoint of the same step.
+- The eval batches use `batch_size` rows and the training loss mask. The forward pass runs without a graph. The eval loss is the cross-entropy summed over every scored token of every eval batch, divided by the scored token count. MoE auxiliary and z-losses stay out. Perplexity is `exp(loss)`.
+- An eval loss below `best - min_delta` is the new best. Without `early_stopping` the run tracks the best and never stops. The first finite loss is always a best. A non-finite loss never is.
+- A new best writes the `best` checkpoint when `save_interval` is above 0. See [Checkpoints](training/checkpoints.md#best-checkpoint).
+- After `patience` evals in a row without a best, the run stops at that step boundary. It writes the final checkpoint and exits 0. `run.json` records `"status": "completed"`, `"stopped_early": true` and a `stop_reason`.
+
+```yaml
+trainer:
+  eval:
+    holdout_fraction: 0.02   # last 2% of the rows
+    interval: 500
+    batches: 50
+    early_stopping:
+      patience: 5
+      min_delta: 0.001
+```
+
+The checkpoint meta records the held-out row count and the stop counters. A resume continues the counters exactly. A resume with another held-out row count is an error, because the count decides which rows the saved data position counts.
+
 ### Learning Rate Schedule
 
 Warmup runs first. Step `s` of `W` warmup steps applies `learning_rate * (s + 1) / W`, at least `1e-7`. The schedule covers every later step up to the run's last step `T`. `T` is `max_steps`, capped by the steps in `num_epochs` epochs.

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 /// Keep the `keep` newest `*_step_N` sets in `dir` and remove the rest.
 ///
 /// Each removed set loses its meta first, so a crash mid-removal leaves no
-/// meta that names a removed file. `_final` sets stay. A removal error is a
+/// meta that names a removed file. `_final` and `_best` sets stay. A removal error is a
 /// warning, because the run itself is unaffected.
 pub fn remove_old_checkpoints(dir: &Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {

@@ -1,11 +1,11 @@
 //! Building a [`LitDataLoader`]: opening a source, and the builder methods
-//! that configure row order, target masking, and sharding before training
-//! starts.
+//! that configure row order, target masking, and the row range before
+//! training starts.
 
 use super::mask::TargetMask;
 use super::rows::{DataPosition, EpochOrder, RowLayout, RowOrder};
 use super::source::DataSource;
-use crate::prelude::{DType, Result};
+use crate::prelude::{DType, Error, Result};
 use boostr::model::SpeechLayout;
 use boostr::runtime::Runtime;
 use std::fs::File;
@@ -17,7 +17,12 @@ use std::path::{Path, PathBuf};
 /// The stream is cut into fixed rows of `seq_len + 1` tokens (see
 /// [`super::rows`]). A batch is `batch_size` rows: inputs are
 /// `row[0..seq_len]`, targets are `row[1..seq_len + 1]`. Tokens past the last
-/// whole row of the shard are never read.
+/// whole row of the source are never read.
+///
+/// # Row range
+/// A loader reads the stream rows `[first_row, end_row)`. The default is every
+/// whole row. [`with_row_range`](Self::with_row_range) narrows it, for
+/// example to split a held-out eval range off the end.
 ///
 /// # Row order
 /// Each epoch hands out every row once. The default is stream order;
@@ -38,9 +43,10 @@ where
     pub(super) batch_size: usize,
     pub(super) seq_len: usize,
     pub(super) device: R::Device,
-    // Token range this loader reads
-    pub(super) shard_start: usize,
-    shard_end: usize,
+    /// First stream row this loader reads.
+    pub(super) first_row: usize,
+    /// One past the last stream row this loader reads.
+    end_row: usize,
     /// Next batch's place in the row order.
     pub(super) position: DataPosition,
     /// Row at each slot of each epoch.
@@ -70,14 +76,14 @@ where
         seq_len: usize,
         device: R::Device,
     ) -> Self {
-        let len = data_source.len();
+        let end_row = data_source.len() / (seq_len + 1);
         Self {
             data_source,
             batch_size,
             seq_len,
             device,
-            shard_start: 0,
-            shard_end: len,
+            first_row: 0,
+            end_row,
             position: DataPosition::default(),
             order: EpochOrder::new(RowOrder::Stream),
             target_mask: None,
@@ -112,6 +118,29 @@ where
     pub fn with_row_order(mut self, order: RowOrder) -> Self {
         self.order = EpochOrder::new(order);
         self
+    }
+
+    /// Read only the stream rows `[start, end)`.
+    ///
+    /// Row indices count whole rows of `seq_len + 1` tokens from the stream
+    /// start. The position resets to the start of the range.
+    ///
+    /// # Errors
+    /// Returns an error when the range is empty or ends past the last whole row.
+    pub fn with_row_range(mut self, start: usize, end: usize) -> Result<Self> {
+        let total = self.total_rows();
+        if start >= end || end > total {
+            return Err(Error::DataError {
+                reason: format!(
+                    "row range [{start}, {end}) is not a non-empty range inside the {total} \
+                     whole rows of this data. Pick a range inside [0, {total})."
+                ),
+            });
+        }
+        self.first_row = start;
+        self.end_row = end;
+        self.position = DataPosition::default();
+        Ok(self)
     }
 
     /// Enable masked loss scoring with an arbitrary [`TargetMask`] rule.
@@ -169,20 +198,25 @@ where
         self.seq_len + 1
     }
 
-    /// Row and batch counts of this loader's shard.
-    pub fn row_layout(&self) -> Result<RowLayout> {
-        RowLayout::new(
-            (self.shard_end - self.shard_start) / self.row_width(),
-            self.batch_size,
-        )
+    /// Whole rows in the source, whatever the row range.
+    pub fn total_rows(&self) -> usize {
+        self.data_source.len() / self.row_width()
     }
 
-    /// Returns the shard size in tokens for this data loader
-    ///
-    /// This equals dataset_size.
+    /// The stream rows `(start, end)` this loader reads, end exclusive.
+    pub fn row_range(&self) -> (usize, usize) {
+        (self.first_row, self.end_row)
+    }
+
+    /// Row and batch counts of this loader's row range.
+    pub fn row_layout(&self) -> Result<RowLayout> {
+        RowLayout::new(self.end_row - self.first_row, self.batch_size)
+    }
+
+    /// Tokens in this loader's row range.
     #[allow(dead_code)]
     pub fn shard_size(&self) -> usize {
-        self.shard_end - self.shard_start
+        (self.end_row - self.first_row) * self.row_width()
     }
 }
 

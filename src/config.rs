@@ -1,6 +1,7 @@
 use crate::checkpoint_set::{optimizer_path_for, weights_step, CheckpointLabel};
 use crate::data::DataPosition;
 use crate::data_hash::{hash_json, legacy_file_hash, legacy_hash_str, HashAlgo};
+use crate::eval::EvalConfig;
 use crate::loss_scale::{resolve_loss_scale, LossScaleConfig};
 use crate::schedule::{LrDecayShape, LrSchedule};
 use crate::weight_decay::WeightDecayRule;
@@ -756,6 +757,13 @@ pub struct TrainerConfig {
     /// serialized configs while unset, so existing configs serialize as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_scale: Option<LossScaleConfig>,
+
+    /// Validation evals and early stopping. See [`EvalConfig`].
+    ///
+    /// Absent, the run evaluates nothing and trains as before.
+    /// `skip_serializing_if` keeps the key out of serialized configs while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval: Option<EvalConfig>,
     // Unknown keys are ignored, as serde does for every config struct here.
     // Older configs carry `group_size` and `beta_kl`, which no trainer reads.
 }
@@ -800,6 +808,14 @@ impl LitConfig {
                 &format!("trainer.checkpoint_sidecars[{i}]"),
             )?;
         }
+        if let Some(eval) = config.trainer.eval.as_mut() {
+            if let Some(raw) = eval.data_file.take() {
+                eval.data_file = Some(crate::config_paths::expand_env_vars(
+                    &raw,
+                    "trainer.eval.data_file",
+                )?);
+            }
+        }
         config.validate()?;
         Ok(config)
     }
@@ -814,6 +830,9 @@ impl LitConfig {
         resolve_loss_scale(self.trainer.loss_scale.as_ref(), self.model.dtype)?;
         // A fresh run's rule. A resume checks its inherited rule again in train.
         crate::weight_decay::resolve_weight_decay(&self.trainer, None, true)?;
+        if let Some(eval) = &self.trainer.eval {
+            eval.validate()?;
+        }
 
         // Mamba2 constraint: hidden_size * expand == num_heads * head_dim
         if let (Some(num_heads), Some(head_dim), Some(expand)) = (
@@ -974,6 +993,7 @@ impl LitConfig {
                 target_mask: None,
                 shuffle_rows: true,
                 loss_scale: None,
+                eval: None,
             },
         }
     }
@@ -1071,6 +1091,7 @@ impl LitConfig {
                 target_mask: None,
                 shuffle_rows: true,
                 loss_scale: None,
+                eval: None,
             },
         }
     }
@@ -1117,6 +1138,19 @@ pub struct CheckpointMeta {
     /// written before loss scaling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_scale: Option<GradScalerState>,
+    /// Rows the run held out of training for eval. A resume with another
+    /// count is an error: the count decides which rows `data_position`
+    /// counts. Absent when training read every row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holdout_rows: Option<usize>,
+    /// Lowest eval loss after `step` steps. Absent without `trainer.eval`,
+    /// and before the first finite eval loss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_eval_loss: Option<f64>,
+    /// Evals since `best_eval_loss` after `step` steps. A resume continues
+    /// the early-stop count from it. Absent without `trainer.eval`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evals_since_best: Option<usize>,
 }
 
 fn default_dtype_string() -> String {
@@ -1158,6 +1192,9 @@ impl CheckpointMeta {
             weight_decay_rule: None,
             no_decay_patterns: Vec::new(),
             loss_scale: None,
+            holdout_rows: None,
+            best_eval_loss: None,
+            evals_since_best: None,
         })
     }
 

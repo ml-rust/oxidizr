@@ -1,9 +1,11 @@
 //! File names of a checkpoint set, and the parser that reads a label back.
 //!
 //! One set holds three files in one directory:
-//! - `{prefix}_step_{N}.safetensors` or `{prefix}_final.safetensors`: the weights
+//! - `{prefix}_step_{N}.safetensors`, `{prefix}_final.safetensors` or
+//!   `{prefix}_best.safetensors`: the weights
 //! - the same stem with `.optimizer.safetensors`: the optimizer state
-//! - `checkpoint_step_{N}.meta.json` or `checkpoint_final.meta.json`: the meta
+//! - `checkpoint_step_{N}.meta.json`, `checkpoint_final.meta.json` or
+//!   `checkpoint_best.meta.json`: the meta
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +21,10 @@ pub enum CheckpointLabel {
     Step(usize),
     /// The checkpoint written when the run ends.
     Final,
+    /// The checkpoint at the lowest eval loss so far. Each new best overwrites it.
+    ///
+    /// Cleanup never removes it, and `--resume auto` never picks it.
+    Best,
 }
 
 impl CheckpointLabel {
@@ -26,6 +32,7 @@ impl CheckpointLabel {
         match self {
             Self::Step(step) => format!("{prefix}_step_{step}"),
             Self::Final => format!("{prefix}_final"),
+            Self::Best => format!("{prefix}_best"),
         }
     }
 
@@ -44,6 +51,7 @@ impl CheckpointLabel {
         match self {
             Self::Step(step) => format!("checkpoint_step_{step}.meta.json"),
             Self::Final => "checkpoint_final.meta.json".to_string(),
+            Self::Best => "checkpoint_best.meta.json".to_string(),
         }
     }
 
@@ -58,6 +66,9 @@ impl CheckpointLabel {
         if stem.ends_with("_final") {
             return Some(Self::Final);
         }
+        if stem.ends_with("_best") {
+            return Some(Self::Best);
+        }
         let (_, step) = stem.rsplit_once("_step_")?;
         if !step.bytes().all(|b| b.is_ascii_digit()) {
             return None;
@@ -70,7 +81,7 @@ impl CheckpointLabel {
 pub fn weights_step(file_name: &str) -> Option<usize> {
     match CheckpointLabel::of_weights_file(file_name)? {
         CheckpointLabel::Step(step) => Some(step),
-        CheckpointLabel::Final => None,
+        CheckpointLabel::Final | CheckpointLabel::Best => None,
     }
 }
 
@@ -117,8 +128,27 @@ mod tests {
     }
 
     #[test]
+    fn best_names_round_trip_and_have_no_step() {
+        let label = CheckpointLabel::Best;
+        let weights = label.weights_file_name(PREFIX);
+        assert_eq!(weights, "nano_512_117m_f32_best.safetensors");
+        assert_eq!(CheckpointLabel::of_weights_file(&weights), Some(label));
+        assert_eq!(weights_step(&weights), None);
+        assert_eq!(label.meta_file_name(), "checkpoint_best.meta.json");
+        assert_eq!(
+            label.optimizer_file_name(PREFIX),
+            "nano_512_117m_f32_best.optimizer.safetensors"
+        );
+    }
+
+    #[test]
     fn optimizer_file_is_never_a_weights_checkpoint() {
-        for label in [CheckpointLabel::Step(5), CheckpointLabel::Final] {
+        let labels = [
+            CheckpointLabel::Step(5),
+            CheckpointLabel::Final,
+            CheckpointLabel::Best,
+        ];
+        for label in labels {
             let name = label.optimizer_file_name(PREFIX);
             assert_eq!(CheckpointLabel::of_weights_file(&name), None, "{name}");
             assert_eq!(weights_step(&name), None, "{name}");

@@ -101,11 +101,11 @@ pub fn apply_optimizer_resume<R: Runtime<DType = DType>>(
 /// Start step and meta path of an explicit `--resume <path>`.
 ///
 /// - `*_step_N.safetensors` resumes at step `N`, with its meta when present.
-/// - `*_final.safetensors` resumes at the step its meta records.
-/// - Any other file, or a final checkpoint without a meta, resumes at step 0.
+/// - `*_final.safetensors` and `*_best.safetensors` resume at the step their meta records.
+/// - Any other file, or a final or best checkpoint without a meta, resumes at step 0.
 ///
 /// # Errors
-/// Returns an error when a final checkpoint's meta is unreadable.
+/// Returns an error when a final or best checkpoint's meta is unreadable.
 pub fn manual_resume_target(checkpoint: &str) -> Result<(usize, Option<String>)> {
     let path = Path::new(checkpoint);
     let label = path
@@ -120,11 +120,14 @@ pub fn manual_resume_target(checkpoint: &str) -> Result<(usize, Option<String>)>
     let meta = meta.exists().then(|| meta.to_string_lossy().into_owned());
     match (label, meta) {
         (CheckpointLabel::Step(step), meta) => Ok((step, meta)),
-        (CheckpointLabel::Final, Some(meta)) => Ok((read_meta(&meta)?.step, Some(meta))),
-        (CheckpointLabel::Final, None) => {
+        (CheckpointLabel::Final | CheckpointLabel::Best, Some(meta)) => {
+            Ok((read_meta(&meta)?.step, Some(meta)))
+        }
+        (label @ (CheckpointLabel::Final | CheckpointLabel::Best), None) => {
             eprintln!(
-                "WARNING: final checkpoint '{checkpoint}' has no checkpoint_final.meta.json. \
-                 The run restarts at step 0 and at the start of the data."
+                "WARNING: checkpoint '{checkpoint}' has no {}. The run restarts at step 0 and \
+                 at the start of the data.",
+                label.meta_file_name()
             );
             Ok((0, None))
         }

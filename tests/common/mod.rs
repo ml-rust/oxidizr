@@ -5,10 +5,12 @@
 
 use boostr::tensor::TensorId;
 use boostr::{CpuClient, CpuDevice, CpuRuntime, DType, Tensor, TypeConversionOps, VarMap};
+use oxidizr::commands::train_data::{run_loaders, TokenSource};
 use oxidizr::config::{
     DTypePrecision, DistributedConfig, LitConfig, OxidizrModelConfig, TargetDevice, TrainerConfig,
 };
 use oxidizr::data::{DataPosition, LitDataLoader, RowLayout, RowOrder};
+use oxidizr::eval::{EvalConfig, Evaluator};
 use oxidizr::model::LitGPT;
 use oxidizr::schedule::LrSchedule;
 use oxidizr::trainer::{LitTrainer, TrainerRunConfig};
@@ -98,6 +100,7 @@ pub fn tiny_config(checkpoint_dir: &Path, max_steps: usize) -> LitConfig {
             target_mask: None,
             shuffle_rows: true,
             loss_scale: None,
+            eval: None,
         },
     }
 }
@@ -169,6 +172,29 @@ pub fn data_loader(cfg: &LitConfig) -> LitDataLoader<CpuRuntime> {
         CpuDevice::new(),
     )
     .with_row_order(RowOrder::Shuffled { seed: 7 })
+}
+
+/// A held-out eval of `rows` rows every `interval` steps, `batches` batches each.
+pub fn holdout_eval(rows: usize, interval: usize, batches: usize) -> EvalConfig {
+    EvalConfig {
+        data_file: None,
+        holdout_rows: Some(rows),
+        holdout_fraction: None,
+        interval,
+        batches,
+        early_stopping: None,
+    }
+}
+
+/// The training loader and eval of `cfg`, split by the code `commands::train` runs.
+///
+/// The tokens are those of [`data_loader`], and training reads them in its
+/// shuffled row order. `cfg.trainer.eval` must be set.
+pub fn eval_loaders(cfg: &LitConfig) -> (LitDataLoader<CpuRuntime>, Evaluator<CpuRuntime>) {
+    let source = TokenSource::Generated(tokens(cfg, 4000));
+    let loaders = run_loaders::<CpuRuntime>(cfg, &source, &CpuDevice::new()).expect("loaders");
+    let train = loaders.train.with_row_order(RowOrder::Shuffled { seed: 7 });
+    (train, loaders.evaluator.expect("trainer.eval is set"))
 }
 
 /// A trainer over `params` that starts at `start_step` and `start_position`.

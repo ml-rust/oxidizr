@@ -34,11 +34,29 @@ pub struct StepReport {
     pub eta_secs: f64,
 }
 
+/// One eval at a step boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalReport {
+    /// Cross-entropy per scored eval token.
+    pub loss: f64,
+    /// `exp(loss)`.
+    pub perplexity: f64,
+    pub batches: usize,
+    /// Scored eval tokens.
+    pub tokens: usize,
+    /// Lowest eval loss so far, this one included. `None` before a finite loss.
+    pub best_loss: Option<f64>,
+    /// Evals since the best loss. 0 when this eval is the best.
+    pub since_best: usize,
+}
+
 /// A checkpoint event of the fit loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CheckpointNote {
     /// The interval checkpoint labelled `step` is on disk.
     Saved { step: usize },
+    /// The `best` checkpoint now holds the weights after step `step`.
+    Best { step: usize },
     /// The final checkpoint save starts. `path` names its weights file.
     Final { path: String },
 }
@@ -52,17 +70,23 @@ pub struct FitSummary {
     pub last_loss: Option<f64>,
     /// Gradient norm of the last step of this session. `None` when no step ran.
     pub last_grad_norm: Option<f64>,
+    /// Why early stopping ended the run. `None` when it ran every step.
+    pub stopped_early: Option<String>,
 }
 
 /// Receives the events of one fit loop, in order.
 ///
-/// The loop calls `on_start` once, then `on_step` for every step, with
-/// `on_checkpoint` after each interval save. It ends with
-/// `on_checkpoint(Final)` and `on_finish`, or with `on_error` when a step
-/// returns an error. An error from a hook stops the loop with that error.
+/// The loop calls `on_start` once, then `on_step` for every step. After a
+/// step it calls `on_eval` when an eval is due, `on_checkpoint(Best)` when
+/// that eval wrote the best checkpoint, and `on_checkpoint(Saved)` after an
+/// interval save. It ends with `on_checkpoint(Final)` and `on_finish`, or with
+/// `on_error` when a step returns an error. An error from a hook stops the
+/// loop with that error.
 pub trait StepSink {
     fn on_start(&mut self, start: &FitStart) -> Result<()>;
     fn on_step(&mut self, report: &StepReport) -> Result<()>;
+    /// The eval after `step` completed steps.
+    fn on_eval(&mut self, step: usize, report: &EvalReport) -> Result<()>;
     fn on_checkpoint(&mut self, note: &CheckpointNote) -> Result<()>;
     /// The training step with 1-based number `step` returned `error`.
     ///

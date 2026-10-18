@@ -1,6 +1,6 @@
 //! Headless output: one JSON line per event on stdout, the error line on stderr.
 
-use super::sink::{CheckpointNote, FitStart, FitSummary, StepReport, StepSink};
+use super::sink::{CheckpointNote, EvalReport, FitStart, FitSummary, StepReport, StepSink};
 use crate::prelude::{Error, Result};
 use std::io::{self, Stderr, Stdout, Write};
 
@@ -59,11 +59,30 @@ impl<O: Write, E: Write> StepSink for JsonSink<O, E> {
         Ok(())
     }
 
+    fn on_eval(&mut self, step: usize, report: &EvalReport) -> Result<()> {
+        let best = report.best_loss.map_or_else(|| "null".to_string(), fixed4);
+        writeln!(
+            self.out,
+            "{{\"eval\": {{\"step\": {step}, \"loss\": {}, \"perplexity\": {}, \"batches\": {}, \
+             \"tokens\": {}, \"best_loss\": {best}, \"since_best\": {}}}}}",
+            fixed4(report.loss),
+            fixed4(report.perplexity),
+            report.batches,
+            report.tokens,
+            report.since_best
+        )?;
+        Ok(())
+    }
+
     fn on_checkpoint(&mut self, note: &CheckpointNote) -> Result<()> {
         match note {
             CheckpointNote::Saved { step } => {
                 writeln!(self.out, "{{\"checkpoint\": {{\"step\": {step}}}}}")?
             }
+            CheckpointNote::Best { step } => writeln!(
+                self.out,
+                "{{\"checkpoint\": {{\"step\": {step}, \"label\": \"best\"}}}}"
+            )?,
             CheckpointNote::Final { path } => {
                 writeln!(self.out, "Saving final checkpoint to {path}")?
             }
@@ -80,9 +99,25 @@ impl<O: Write, E: Write> StepSink for JsonSink<O, E> {
         let _ = writeln!(self.err, "{line}");
     }
 
-    fn on_finish(&mut self, _summary: &FitSummary) -> Result<()> {
-        writeln!(self.out, "{{\"status\": \"complete\"}}")?;
+    fn on_finish(&mut self, summary: &FitSummary) -> Result<()> {
+        match &summary.stopped_early {
+            None => writeln!(self.out, "{{\"status\": \"complete\"}}")?,
+            Some(reason) => writeln!(
+                self.out,
+                "{{\"status\": \"complete\", \"stopped_early\": true, \"reason\": {}}}",
+                serde_json::Value::from(reason.as_str())
+            )?,
+        }
         Ok(())
+    }
+}
+
+/// `value` with four decimals, or `null` when it is not finite, so the line stays JSON.
+fn fixed4(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.4}")
+    } else {
+        "null".to_string()
     }
 }
 
@@ -152,6 +187,7 @@ mod tests {
             final_step: 30,
             last_loss: Some(1.0),
             last_grad_norm: Some(1.0),
+            stopped_early: None,
         };
         sink.on_finish(&summary).expect("finish");
 
@@ -184,6 +220,49 @@ mod tests {
                 r#"{"error":"Training error at step 4","message":"training error: NaN loss detected"}"#
             ]
         );
+    }
+
+    #[test]
+    fn eval_best_and_early_stop_events_write_json_lines() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut sink = JsonSink::new(&mut out, &mut err, zero_vram);
+        let mut report = EvalReport {
+            loss: 2.3125,
+            perplexity: 10.0625,
+            batches: 50,
+            tokens: 51200,
+            best_loss: Some(2.3125),
+            since_best: 0,
+        };
+        sink.on_eval(500, &report).expect("eval");
+        sink.on_checkpoint(&CheckpointNote::Best { step: 500 })
+            .expect("best");
+        report.loss = f64::INFINITY;
+        report.perplexity = f64::INFINITY;
+        report.since_best = 1;
+        sink.on_eval(1000, &report).expect("non-finite eval");
+        let summary = FitSummary {
+            final_step: 1000,
+            last_loss: Some(1.0),
+            last_grad_norm: Some(1.0),
+            stopped_early: Some("no \"gain\" in 5 evals".to_string()),
+        };
+        sink.on_finish(&summary).expect("finish");
+
+        let lines = lines(&out);
+        assert_eq!(
+            lines,
+            [
+                r#"{"eval": {"step": 500, "loss": 2.3125, "perplexity": 10.0625, "batches": 50, "tokens": 51200, "best_loss": 2.3125, "since_best": 0}}"#,
+                r#"{"checkpoint": {"step": 500, "label": "best"}}"#,
+                r#"{"eval": {"step": 1000, "loss": null, "perplexity": null, "batches": 50, "tokens": 51200, "best_loss": 2.3125, "since_best": 1}}"#,
+                r#"{"status": "complete", "stopped_early": true, "reason": "no \"gain\" in 5 evals"}"#,
+            ]
+        );
+        for line in &lines {
+            serde_json::from_str::<serde_json::Value>(line).expect("every line is JSON");
+        }
+        assert!(err.is_empty());
     }
 
     #[test]

@@ -82,10 +82,32 @@ Each checkpoint is a set of three files in `checkpoint_dir`:
 |------|---------|
 | `<prefix>_step_N.safetensors` | Model weights after N completed optimizer steps |
 | `<prefix>_step_N.optimizer.safetensors` | AdamW state: `exp_avg`, `exp_avg_sq`, `master` per trainable tensor, and `__step` |
-| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, `no_decay_patterns` when set, and `loss_scale` for an f16 run |
+| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, `no_decay_patterns` when set, `loss_scale` for an f16 run, and the eval keys under `trainer.eval` |
 
 The end of a run writes the same set as `<prefix>_final.safetensors`,
 `<prefix>_final.optimizer.safetensors` and `checkpoint_final.meta.json`.
+
+Under `trainer.eval` the meta also records:
+
+| Key | Content |
+|-----|---------|
+| `holdout_rows` | Rows held out of training. Absent when training reads every row |
+| `best_eval_loss` | Lowest eval loss after step N |
+| `evals_since_best` | Evals since that loss |
+
+A run without `trainer.eval` writes none of these keys.
+
+### Best Checkpoint
+
+Under `trainer.eval` with `save_interval` above 0, each new best eval loss
+writes `<prefix>_best.safetensors`, `<prefix>_best.optimizer.safetensors` and
+`checkpoint_best.meta.json`. Each new best overwrites the set. The old meta
+goes first, so no meta names a half-written set. The meta records the step of
+that eval.
+
+`--max-checkpoints` never removes the best set. `--resume auto` never picks
+it. `--resume <dir>/<prefix>_best.safetensors` resumes at the step that
+`checkpoint_best.meta.json` records.
 
 The optimizer file uses the weights file's tensor names. Frozen parameters
 have no optimizer state. A tied `lm_head.weight` has no entry of its own.
@@ -110,6 +132,9 @@ When resuming:
    `no_decay_patterns`, unless the config sets them.
 6. An f16 run continues the loss scale from the meta's `loss_scale`: the
    `scale` and the `consecutive_ok` clean-step count.
+7. A run with `trainer.eval` continues the early-stop counters from
+   `best_eval_loss` and `evals_since_best`. A meta whose counters already
+   spent the patience stops the run before its first step.
 
 With all three files, the resumed run matches an uninterrupted run exactly.
 The training step uses no random state, so no RNG state is saved.
@@ -129,6 +154,13 @@ under an f16 run restarts the scale at `loss_scale.initial` with a warning.
 That resume is not exact. A meta with `loss_scale` under a bf16 or f32 run
 drops the state with a warning. See
 [Loss Scaling](../configuration.md#loss-scaling-f16).
+
+The held-out row count decides which rows training reads, and so what
+`data_position` counts. A resume whose held-out row count differs from the
+meta's `holdout_rows` stops with an error. A meta without the key counts as 0.
+The eval at step N runs before the step-N save, so the meta holds its
+counters, and a resumed run writes the same `evals.json` lines as an
+uninterrupted one.
 
 `--resume <dir>/<prefix>_final.safetensors` resumes at the step that
 `checkpoint_final.meta.json` records.
