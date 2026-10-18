@@ -12,7 +12,3 @@ pub use boostr::nn::loss::cross_entropy_loss_masked as cross_entropy_masked;
 pub use boostr::nn::{Embedding, Linear, RmsNorm};
 pub use boostr::optimizer::clip_grad_norm as compute_grad_norm;
 pub use boostr::optimizer::AdamW as FusedAdamW;
-// Only the NCCL synchronizer names this trait, and that module is feature-gated;
-// re-exporting it unconditionally leaves it unused in a default build.
-#[cfg(feature = "nccl")]
-pub use boostr::runtime::Device;

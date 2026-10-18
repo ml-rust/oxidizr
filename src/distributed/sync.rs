@@ -1,26 +1,22 @@
-//! Core trait and types for gradient synchronization
+//! Distributed config types and the multi-GPU check.
 //!
-//! This module defines the `GradientSynchronizer` trait that all backends must implement,
-//! as well as configuration types for distributed training.
+//! One GPU is the only supported world size. Any config or CLI input that
+//! names more than one GPU is an error.
 
-use crate::prelude::{DType, Result, Tensor};
-use boostr::autograd::GradStore;
-use boostr::runtime::Runtime;
-use boostr::tensor::TensorId;
+use crate::prelude::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
-/// Synchronization backend selection
+/// Gradient synchronization backend name, as parsed from config and CLI.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum SyncBackend {
-    /// No synchronization (single GPU mode)
+    /// No synchronization (one GPU)
     #[default]
     Single,
-    /// CPU-based gradient staging and averaging
+    /// CPU gradient staging
     #[serde(alias = "cpu")]
     CpuStaging,
-    /// NCCL-based all-reduce (requires 'nccl' feature)
+    /// NCCL all-reduce
     Nccl,
 }
 
@@ -40,7 +36,7 @@ impl std::str::FromStr for SyncBackend {
     }
 }
 
-/// Configuration for distributed training
+/// Distributed training config. Only one GPU is supported.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DistributedConfig {
     /// Enable distributed training
@@ -51,100 +47,79 @@ pub struct DistributedConfig {
     #[serde(default)]
     pub backend: SyncBackend,
 
-    /// GPU IDs to use (empty = auto-detect all available)
+    /// GPU IDs to use
     #[serde(default)]
     pub gpu_ids: Vec<usize>,
 }
 
-#[allow(dead_code)]
 impl DistributedConfig {
-    /// Create a single-GPU configuration (no synchronization)
-    pub fn single_gpu(gpu_id: usize) -> Self {
-        Self {
-            enabled: false,
-            backend: SyncBackend::Single,
-            gpu_ids: vec![gpu_id],
-        }
-    }
-
-    /// Create a multi-GPU configuration
-    pub fn multi_gpu(gpu_ids: Vec<usize>, backend: SyncBackend) -> Self {
-        Self {
-            enabled: gpu_ids.len() > 1,
-            backend,
-            gpu_ids,
-        }
-    }
-
-    /// Get the number of GPUs
+    /// Number of GPUs named by `gpu_ids`. An empty list counts as one.
     pub fn world_size(&self) -> usize {
         self.gpu_ids.len().max(1)
     }
 
-    /// Get the effective batch size multiplier
-    pub fn effective_batch_multiplier(&self) -> usize {
-        if self.enabled {
-            self.gpu_ids.len().max(1)
-        } else {
-            1
-        }
+    /// Returns an error when `gpu_ids` names more than one GPU.
+    pub fn validate(&self) -> Result<()> {
+        reject_multi_gpu("trainer.distributed.gpu_ids", &self.gpu_ids)
     }
 }
 
-/// Synchronized gradient entry keyed by the stable parameter `TensorId`.
-#[allow(dead_code)]
-pub type SyncedGradient<R> = (TensorId, Tensor<R>);
-
-/// Trait for gradient synchronization across multiple GPUs
+/// Returns an error when `gpu_ids` names more than one GPU.
 ///
-/// Implementations of this trait handle the communication between GPUs
-/// to average gradients during distributed data parallel training.
-///
-/// # Thread Safety
-///
-/// This trait requires `Send + Sync` because it may be used across threads
-/// in the training loop.
-#[allow(dead_code)]
-pub trait GradientSynchronizer<R>: Send + Sync
-where
-    R: Runtime<DType = DType>,
-{
-    /// Synchronize gradients across all GPUs.
-    ///
-    /// Takes the gradient store from the backward pass and the optimizer-owned
-    /// parameter map. Implementations must return gradients keyed by the same
-    /// stable `TensorId`s from `params`; changing keys would orphan AdamW state.
-    ///
-    /// # Arguments
-    ///
-    /// * `grads` - GradStore from `backward()`
-    /// * `params` - Optimizer-owned parameter map keyed by stable TensorId
-    ///
-    /// # Returns
-    ///
-    /// A `GradStore` containing averaged gradients under the original TensorId keys.
-    fn synchronize_gradients(
-        &self,
-        grads: &GradStore<R>,
-        params: &HashMap<TensorId, Tensor<R>>,
-    ) -> Result<GradStore<R>>;
+/// `input` is the exact user input to quote, for example `--gpus 0,1`.
+pub fn reject_multi_gpu(input: &str, gpu_ids: &[usize]) -> Result<()> {
+    if gpu_ids.len() <= 1 {
+        return Ok(());
+    }
+    Err(Error::DistributedError {
+        reason: format!(
+            "`{input}` names {} GPUs. Multi-GPU data parallelism is not implemented in this build. \
+             Pass a single GPU, for example `--gpus 0`.",
+            gpu_ids.len()
+        ),
+    })
+}
 
-    /// Get the local rank (GPU index within this process)
-    fn local_rank(&self) -> usize;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Get total number of GPUs participating
-    fn world_size(&self) -> usize;
-
-    /// Check if this is the primary GPU (rank 0)
-    fn is_primary(&self) -> bool {
-        self.local_rank() == 0
+    #[test]
+    fn sync_backend_parses_known_names() {
+        assert_eq!("cpu".parse::<SyncBackend>(), Ok(SyncBackend::CpuStaging));
+        assert_eq!("nccl".parse::<SyncBackend>(), Ok(SyncBackend::Nccl));
+        assert_eq!("single".parse::<SyncBackend>(), Ok(SyncBackend::Single));
+        assert!("mpi".parse::<SyncBackend>().is_err());
     }
 
-    /// Synchronization barrier - wait for all GPUs
-    fn barrier(&self) -> Result<()>;
+    #[test]
+    fn world_size_above_one_is_an_error_naming_the_input() {
+        let err = reject_multi_gpu("--gpus 0,1", &[0, 1]).expect_err("two GPUs");
+        let text = err.to_string();
+        assert!(text.contains("`--gpus 0,1`"), "{text}");
+        assert!(text.contains("not implemented in this build"), "{text}");
+        assert!(text.contains("single GPU"), "{text}");
+    }
 
-    /// Check if distributed training is actually active
-    fn is_distributed(&self) -> bool {
-        self.world_size() > 1
+    #[test]
+    fn config_with_two_gpu_ids_fails_validation() {
+        let config = DistributedConfig {
+            enabled: true,
+            backend: SyncBackend::Nccl,
+            gpu_ids: vec![0, 1],
+        };
+        assert_eq!(config.world_size(), 2);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn zero_or_one_gpu_passes_validation() {
+        assert!(DistributedConfig::default().validate().is_ok());
+        assert_eq!(DistributedConfig::default().world_size(), 1);
+        let one = DistributedConfig {
+            gpu_ids: vec![3],
+            ..Default::default()
+        };
+        assert!(one.validate().is_ok());
     }
 }

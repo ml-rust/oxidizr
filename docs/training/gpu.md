@@ -87,7 +87,7 @@ CUDA_VISIBLE_DEVICES=1 cargo run --release --features cuda -- -f models/nano.yam
 
 ## Multi-GPU
 
-See [Multi-GPU Training](multi-gpu.md) for training across multiple GPUs.
+Multi-GPU training is not available. Oxidizr trains on one GPU. Pass `--gpus 0` or use `CUDA_VISIBLE_DEVICES`.
 
 ## Troubleshooting
 

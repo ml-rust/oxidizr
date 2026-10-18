@@ -29,10 +29,6 @@ use std::path::{Path, PathBuf};
 ///
 /// # Memory Mapping
 /// Files are memory-mapped, so the OS pages the dataset in on demand.
-///
-/// # Data Sharding
-/// For multi-GPU training, use `with_sharding()` to give each GPU a disjoint
-/// set of rows.
 pub struct LitDataLoader<R>
 where
     R: Runtime<DType = DType>,
@@ -42,7 +38,7 @@ where
     pub(super) batch_size: usize,
     pub(super) seq_len: usize,
     pub(super) device: R::Device,
-    // Sharding support for multi-GPU training
+    // Token range this loader reads
     pub(super) shard_start: usize,
     shard_end: usize,
     /// Next batch's place in the row order.
@@ -163,43 +159,6 @@ where
         Ok(self.with_speech_layout(layout))
     }
 
-    /// Configure data sharding for multi-GPU training
-    ///
-    /// Splits the dataset's whole rows into `world_size` disjoint, contiguous
-    /// row ranges. The last rank takes the leftover rows. Each rank orders
-    /// and shuffles only its own rows. The position resets to the stream
-    /// start.
-    ///
-    /// # Arguments
-    ///
-    /// * `rank` - This GPU's rank (0-indexed)
-    /// * `world_size` - Total number of GPUs
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // For 4 GPUs, each GPU processes 1/4 of the rows
-    /// let loader = LitDataLoader::from_file(path, batch_size, seq_len, device)?
-    ///     .with_sharding(rank, 4);
-    /// ```
-    #[allow(dead_code)]
-    pub fn with_sharding(mut self, rank: usize, world_size: usize) -> Self {
-        let width = self.row_width();
-        let total_rows = self.dataset_size() / width;
-        let shard_rows = total_rows / world_size;
-
-        let first_row = rank * shard_rows;
-        let end_row = if rank == world_size - 1 {
-            total_rows
-        } else {
-            (rank + 1) * shard_rows
-        };
-        self.shard_start = first_row * width;
-        self.shard_end = end_row * width;
-        self.position = DataPosition::default();
-        self
-    }
-
     /// Returns the total number of tokens in the dataset
     pub fn dataset_size(&self) -> usize {
         self.data_source.len()
@@ -220,8 +179,7 @@ where
 
     /// Returns the shard size in tokens for this data loader
     ///
-    /// For single-GPU training, this equals dataset_size.
-    /// For multi-GPU, this is the size of this GPU's shard.
+    /// This equals dataset_size.
     #[allow(dead_code)]
     pub fn shard_size(&self) -> usize {
         self.shard_end - self.shard_start
@@ -261,25 +219,4 @@ pub fn write_tokens_to_file<P: AsRef<Path>>(tokens: &[u32], path: P) -> std::io:
     file.sync_all()?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::positioning::tests::{epoch_rows, offsets, shuffled};
-    use std::collections::HashSet;
-
-    #[test]
-    fn sharding_splits_rows_disjointly() {
-        let tokens = offsets(10, 2);
-        let mut seen = HashSet::new();
-        for rank in 0..3 {
-            let mut l = shuffled(tokens.clone(), 1, 3).with_sharding(rank, 3);
-            let rows_here = l.row_layout().expect("layout").num_rows();
-            assert_eq!(rows_here, if rank == 2 { 4 } else { 3 });
-            for row in epoch_rows(&mut l, rows_here) {
-                assert!(seen.insert(row), "row {row} handed to two ranks");
-            }
-        }
-        assert_eq!(seen, (0..10).collect::<HashSet<_>>());
-    }
 }

@@ -6,7 +6,6 @@ use crate::checkpoint_set::{
 use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
 use crate::config::{OxidizrModelConfig, TrainerConfig};
 use crate::data::{DataLoader, DataPosition, RowLayout};
-use crate::distributed::{create_synchronizer, GradientSynchronizer};
 use crate::prelude::{
     cross_entropy, cross_entropy_masked, DType, Error, FusedAdamW, Result, Tensor,
 };
@@ -71,8 +70,6 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     // Checkpoint metadata
     model_config: OxidizrModelConfig,
     data_file_path: Option<String>,
-    // Distributed training support
-    synchronizer: Option<Box<dyn GradientSynchronizer<R>>>,
     // Learning rate warmup (critical for Mamba SSM parameter alignment)
     warmup_steps: usize,     // Effective warmup steps (0 = disabled)
     base_learning_rate: f64, // Base LR to warmup towards
@@ -89,7 +86,7 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
 
 impl<'a, R> LitTrainer<'a, R>
 where
-    R: Runtime<DType = DType> + crate::distributed::RuntimeDeviceFromOrdinal,
+    R: Runtime<DType = DType>,
     R::Client: RuntimeClient<R>
         + TensorOps<R>
         + FusedOptimizerOps<R>
@@ -140,13 +137,7 @@ where
         // Whole batches of `num_epochs` epochs, `gradient_accumulation` per step.
         let total_steps = row_layout.total_steps(config.gradient_accumulation, config.num_epochs);
 
-        // A distributed run adds a gradient synchronizer. It steps the same
-        // optimizer as a single-device run.
-        let synchronizer = if config.distributed.enabled {
-            Some(create_synchronizer(&config.distributed)?)
-        } else {
-            None
-        };
+        config.distributed.validate()?;
         let name_maps = NameMaps::new(&parameter_names, &parameter_ids)?;
 
         // Calculate effective warmup steps (explicit steps OR ratio * total_steps)
@@ -190,7 +181,6 @@ where
             start_position,
             model_config,
             data_file_path,
-            synchronizer,
             warmup_steps,
             base_learning_rate,
             effective_total_steps,
@@ -580,7 +570,7 @@ where
         // ===== AFTER ACCUMULATION LOOP =====
         // Every micro-batch has already run its own backward and folded its
         // parameter gradients into `accumulated_grads`.
-        let grads = accumulated_grads;
+        let mut grads = accumulated_grads;
 
         // Check parameter/gradient matching at step 1.
         // Gradients must be keyed by the same stable TensorIds used in self.params.
@@ -620,14 +610,6 @@ where
                 }
             }
         }
-
-        // A distributed run averages gradients across ranks first. Both paths then
-        // clip, skip a non-finite step, and step the one optimizer, so the LR
-        // schedule and the saved optimizer state are the same in both.
-        let mut grads = match &self.synchronizer {
-            Some(sync) => sync.synchronize_gradients(&grads, self.params)?,
-            None => grads,
-        };
 
         // 1. Clip each element to `max_grad_value` (when set), then by global norm.
         // The returned norm is the one the norm clip measured.

@@ -55,8 +55,7 @@ cargo run --release --features cuda -- train -f <config.yaml> [OPTIONS]
 | Argument                     | Description                                                           |
 | ---------------------------- | --------------------------------------------------------------------- |
 | `--target-device <cpu\|gpu>` | Override target device. Default: gpu if CUDA available, otherwise cpu |
-| `--gpus <IDS>`               | GPU IDs for multi-GPU training (e.g., `0,1,2,3`)                      |
-| `--sync-backend <cpu\|nccl>` | Gradient sync backend for multi-GPU. Default: cpu                     |
+| `--gpus <ID>`                | One GPU ID. More than one ID is an error                             |
 
 #### CPU Training
 
@@ -78,12 +77,10 @@ cargo run --release --features cuda -- train -f models/nano.yaml
 
 #### Multi-GPU Training
 
-```bash
-# 4 GPUs with CPU sync (simple, works everywhere)
-cargo run --release --features cuda -- train -f models/nano.yaml --gpus 0,1,2,3 --sync-backend cpu
+Multi-GPU training is not available. `--gpus 0,1` exits with an error. Pass one GPU:
 
-# 4 GPUs with NCCL sync (faster, requires NCCL)
-cargo run --release --features cuda,nccl -- train -f models/nano.yaml --gpus 0,1,2,3 --sync-backend nccl
+```bash
+cargo run --release --features cuda -- train -f models/nano.yaml --gpus 0
 ```
 
 ### Training Overrides

@@ -194,30 +194,19 @@ Use exact same config and data as original run.
 
 ## Multi-GPU Issues
 
+### Error: multi-GPU data parallelism is not implemented
+
+```
+distributed error: `--gpus 0,1` names 2 GPUs. Multi-GPU data parallelism is not implemented in this build.
+```
+
+Pass a single GPU, for example `--gpus 0`. Check `trainer.distributed.gpu_ids` in the config for more than one ID.
+
 ### GPUs not detected
 
 ```bash
-# Check visible GPUs
-nvidia-smi
-
-# Verify GPU IDs
 nvidia-smi -L
 ```
-
-### NCCL errors
-
-```
-NCCL error: ...
-```
-
-**Solutions:**
-- Ensure NCCL is installed
-- Build with `--features cuda,nccl`
-- Try CPU backend first: `--sync-backend cpu`
-
-### Uneven GPU utilization
-
-Normal for small datasets. Data sharding may not be perfectly even.
 
 ## Performance Issues
 

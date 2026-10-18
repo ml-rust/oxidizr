@@ -55,11 +55,11 @@ struct Cli {
     #[arg(long = "resume", global = true)]
     resume: Option<String>,
 
-    /// GPU IDs for multi-GPU training (shortcut for 'oxidizr train --gpus')
+    /// One GPU ID; more than one is an error (shortcut for 'oxidizr train --gpus')
     #[arg(long = "gpus", global = true)]
     gpus: Option<String>,
 
-    /// Gradient sync backend override (shortcut for 'oxidizr train --sync-backend')
+    /// Sync backend name; multi-GPU is not implemented (shortcut for 'oxidizr train --sync-backend')
     #[arg(long = "sync-backend", global = true)]
     sync_backend: Option<String>,
 

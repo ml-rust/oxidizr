@@ -32,8 +32,7 @@ default = ["f16"]
 f16 = ["boostr/f16"]
 # CUDA GPU acceleration (via boostr CubeCL backend)
 cuda = ["boostr/cuda"]
-# NCCL backend for high-performance multi-GPU gradient synchronization
-# Requires NCCL library installed on the system
+# Enables boostr/nccl. Training uses one GPU.
 nccl = ["cuda", "boostr/nccl"]
 # HuggingFace Hub integration for model publishing
 huggingface = ["dep:hf-hub"]

@@ -19,7 +19,6 @@ Welcome to the Oxidizr documentation. Oxidizr is a production-grade LLM training
 
 - [CPU Training](training/cpu.md) - Training without GPU
 - [GPU Training](training/gpu.md) - CUDA acceleration
-- [Multi-GPU Training](training/multi-gpu.md) - Data parallelism across GPUs
 - [Checkpoints](training/checkpoints.md) - Saving and resuming training
 
 ## Data

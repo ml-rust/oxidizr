@@ -211,8 +211,7 @@ Common `train` flags:
 | `--target-device <gpu\|cpu>` | Config `trainer.target_device` | Device. A build without `cuda` runs on CPU |
 | `--batch-size`, `--seq-len`, `--grad-accum`, `--max-steps` | Config | Override the config value |
 | `--resume <PATH\|auto>` | None | Resume from a `.safetensors` checkpoint, or the latest one. Restores weights, optimizer state and data position |
-| `--gpus <IDS>` | None | Comma-separated GPU IDs, for example `0,1,2,3` |
-| `--sync-backend <single\|cpu\|nccl>` | `single` | Gradient sync for multi-GPU runs |
+| `--gpus <ID>` | `0` | One GPU ID. More than one ID is an error. `CUDA_VISIBLE_DEVICES` selects the device |
 | `--prefetch <N>` | `0` | Batches to prefetch on a background thread |
 | `--max-checkpoints <N>` | `10` | Checkpoints to keep. `0` keeps all |
 | `--dtype <f32\|f16\|bf16>` | Config `model.dtype` (`f32`) | Model precision |
@@ -250,19 +249,13 @@ Get a token from the [HuggingFace token page](https://huggingface.co/settings/to
 
 ## Multi-GPU Training
 
-Build with `cuda` and pass the GPU IDs:
+Multi-GPU training is not available. Pass a single GPU:
 
 ```bash
-# Four GPUs, CPU-staged gradient sync
-cargo run --release --features cuda -- train -f models/nano.yaml --gpus 0,1,2,3 --sync-backend cpu
-
-# Two GPUs, NCCL sync
-cargo run --release --features cuda,nccl -- train -f models/nano.yaml --gpus 0,1 --sync-backend nccl
+cargo run --release --features cuda -- train -f models/nano.yaml --gpus 0
 ```
 
-Each GPU runs forward and backward on its own data shard. oxidizr synchronizes the gradients before the optimizer step.
-
-The `nccl` feature requires the NCCL library installed on the system.
+`--gpus 0,1` exits with an error. Use `CUDA_VISIBLE_DEVICES` to pick which GPU runs.
 
 ## Features
 
@@ -270,7 +263,7 @@ The `nccl` feature requires the NCCL library installed on the system.
 |---------|---------|---------|
 | `f16` | On | F16 and BF16 dtypes |
 | `cuda` | Off | CUDA backend (boostr CubeCL) |
-| `nccl` | Off | NCCL sync backend. Implies `cuda` |
+| `nccl` | Off | Enables `boostr/nccl`. Implies `cuda`. Adds no training feature |
 | `huggingface` | Off | `push` command |
 | `audio` | Off | `prep-corpus` command, with the voxr corpus pipeline and the Whisper, NeuCodec, and Silero VAD models |
 | `vocab-<name>` | Off | Bundled tokenizer vocabulary for `prep-corpus --tokenizer <name>` |

@@ -80,3 +80,24 @@ fn a_data_file_too_small_for_one_batch_records_a_failed_run() {
     assert_eq!(record.last_loss, None);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn two_gpus_are_rejected_with_a_single_gpu_instruction() {
+    let dir = scratch_dir("headless-run-two-gpus");
+    let data = dir.join("tokens.bin");
+    write_token_file(&data, &tokens(&tiny_config(&dir, 2), 4000));
+    let mut args = headless_args(&dir, &data, 2);
+    args.gpus = Some("0,1".to_string());
+
+    let result = run_train(args);
+
+    assert_ne!(exit_code(&result), 0);
+    let record = RunRecord::load(&dir.join("run")).expect("run.json exists after a failed run");
+    assert_eq!(record.status, RunStatus::Failed);
+    let error = record.error.expect("a failed run records its error");
+    assert!(error.contains("`--gpus 0,1`"), "{error}");
+    assert!(error.contains("not implemented in this build"), "{error}");
+    assert!(error.contains("single GPU"), "{error}");
+    assert_eq!(record.final_step, 0);
+    let _ = std::fs::remove_dir_all(dir);
+}

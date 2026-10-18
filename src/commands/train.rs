@@ -65,13 +65,12 @@ pub struct TrainArgs {
     #[arg(long = "resume")]
     pub resume: Option<String>,
 
-    /// GPU IDs for multi-GPU training (e.g., "0,1,2,3")
+    /// One GPU ID. More than one ID is an error.
     #[arg(long = "gpus")]
     pub gpus: Option<String>,
 
-    /// Gradient synchronization backend override: "single", "cpu", or "nccl".
-    /// Overrides `trainer.distributed.backend` only when given; the config
-    /// value applies otherwise.
+    /// Sync backend name: "single", "cpu", or "nccl". Overrides
+    /// `trainer.distributed.backend` only when given. Multi-GPU is not implemented.
     #[arg(long = "sync-backend")]
     pub sync_backend: Option<String>,
 
@@ -101,15 +100,15 @@ pub struct TrainArgs {
     pub run_dir: Option<String>,
 }
 
-/// Parse GPU IDs from comma-separated string (e.g., "0,1,2,3")
-fn parse_gpu_ids(gpus_str: &Option<String>) -> Vec<usize> {
-    match gpus_str {
-        Some(s) => s
-            .split(',')
-            .filter_map(|id| id.trim().parse::<usize>().ok())
-            .collect(),
-        None => vec![0], // Default to GPU 0
-    }
+/// Parse GPU IDs from a comma-separated string (for example `0,1`).
+fn parse_gpu_ids(raw: &str) -> Result<Vec<usize>> {
+    raw.split(',')
+        .map(|id| {
+            id.trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid GPU id '{}' in `--gpus {raw}`", id.trim()))
+        })
+        .collect()
 }
 
 /// Prompt user for yes/no confirmation
@@ -344,7 +343,7 @@ fn resolve_run_dir(args: &TrainArgs) -> Result<String> {
 /// exits only after it is on disk.
 fn run_train_with_runtime<R>(args: TrainArgs, config: LitConfig) -> Result<()>
 where
-    R: Runtime<DType = DType> + crate::distributed::RuntimeDeviceFromOrdinal,
+    R: Runtime<DType = DType>,
     R::Client: RuntimeClient<R>
         + TensorOps<R>
         + FusedOptimizerOps<R>
@@ -384,7 +383,7 @@ fn train_in_run_dir<R>(
     progress: &mut RunProgress,
 ) -> Result<()>
 where
-    R: Runtime<DType = DType> + crate::distributed::RuntimeDeviceFromOrdinal,
+    R: Runtime<DType = DType>,
     R::Client: RuntimeClient<R>
         + TensorOps<R>
         + FusedOptimizerOps<R>
@@ -452,44 +451,18 @@ where
         config.trainer.max_steps = max_steps;
     }
 
-    // Apply distributed training config from CLI
-    let gpu_ids = parse_gpu_ids(&args.gpus);
-    if gpu_ids.len() > 1 {
-        config.trainer.distributed.enabled = true;
-        config.trainer.distributed.gpu_ids = gpu_ids.clone();
-        let current_backend = config.trainer.distributed.backend.clone();
-        match resolve_sync_backend(args.sync_backend.as_deref(), current_backend) {
-            Ok((backend, source)) => {
-                if !headless {
-                    println!(
-                        "CLI override: distributed training enabled with {} GPUs: {:?}",
-                        gpu_ids.len(),
-                        gpu_ids
-                    );
-                    match source {
-                        Source::Cli => println!(
-                            "sync_backend = {:?} (source: --sync-backend CLI flag)",
-                            backend
-                        ),
-                        Source::Config => println!(
-                            "sync_backend = {:?} (source: trainer.distributed.backend in config)",
-                            backend
-                        ),
-                    }
-                }
-                config.trainer.distributed.backend = backend;
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: {} — using config default ({:?})",
-                    e, config.trainer.distributed.backend
-                );
-            }
-        }
-    } else if args.gpus.is_some() {
-        // Single GPU explicitly specified
-        config.trainer.distributed.gpu_ids = gpu_ids.clone();
+    // Multi-GPU data parallelism is not implemented: reject it before any work.
+    if let Some(raw) = &args.gpus {
+        let gpu_ids = parse_gpu_ids(raw)?;
+        crate::distributed::reject_multi_gpu(&format!("--gpus {raw}"), &gpu_ids)?;
+        config.trainer.distributed.gpu_ids = gpu_ids;
     }
+    let current_backend = config.trainer.distributed.backend.clone();
+    match resolve_sync_backend(args.sync_backend.as_deref(), current_backend) {
+        Ok((backend, _)) => config.trainer.distributed.backend = backend,
+        Err(e) => anyhow::bail!("invalid --sync-backend: {e}"),
+    }
+    config.trainer.distributed.validate()?;
 
     // Apply max_checkpoints override
     if let Some(max_ckpt) = args.max_checkpoints {
