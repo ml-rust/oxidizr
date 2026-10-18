@@ -17,6 +17,8 @@ where
     }
 
     /// Continue from `position`, as saved by an earlier run over the same data.
+    ///
+    /// The position is global: every rank of a run seeks the same one.
     pub fn seek(&mut self, position: DataPosition) -> Result<()> {
         let layout = self.row_layout()?;
         if position.row > layout.num_rows() {
@@ -36,15 +38,18 @@ where
         Ok(())
     }
 
-    /// Draws the next batch's rows as one `[batch_size, seq_len + 1]` window
-    /// and advances the position.
+    /// Draws this rank's rows of the next global batch as one
+    /// `[batch_size, seq_len + 1]` window, and advances the position past the
+    /// whole global batch.
     pub(super) fn next_window(&mut self) -> Result<Vec<u32>> {
         let layout = self.row_layout()?;
         let start = layout.batch_start(self.position);
         let width = self.row_width();
 
+        // `rank < world_size`, so these slots lie inside the global batch.
+        let first_slot = start.row + self.rank * self.batch_size;
         let mut window = Vec::with_capacity(self.batch_size * width);
-        for slot in start.row..start.row + self.batch_size {
+        for slot in first_slot..first_slot + self.batch_size {
             let row = self.order.row(&layout, start.epoch, slot);
             let offset = (self.first_row + row) * width;
             window.extend_from_slice(self.data_source.tokens(offset, width));
@@ -52,7 +57,7 @@ where
 
         self.position = DataPosition {
             epoch: start.epoch,
-            row: start.row + self.batch_size,
+            row: start.row + layout.batch_size(),
         };
         Ok(window)
     }

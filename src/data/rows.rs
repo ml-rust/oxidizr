@@ -6,6 +6,11 @@
 //! `[(first_row + r) * (seq_len + 1), (first_row + r + 1) * (seq_len + 1))`.
 //! A batch is `batch_size` rows. Each epoch hands out every row once, in the
 //! order [`EpochOrder`] gives.
+//!
+//! Under data parallelism every rank reads the same row range in the same
+//! order. One global batch is `batch_size` rows per rank times the world
+//! size. Rank `k` reads slots `[k * batch_size, (k + 1) * batch_size)` of
+//! each global batch.
 
 use crate::prelude::{Error, Result};
 use rand::rngs::StdRng;
@@ -16,8 +21,9 @@ use serde::{Deserialize, Serialize};
 /// Where a row loader stands in its stream.
 ///
 /// `row` counts the slots of epoch `epoch`'s row order already handed out.
-/// When fewer than `batch_size` slots remain, the next batch starts at slot 0
-/// of epoch `epoch + 1`. `DataPosition::default()` is the stream start.
+/// When fewer than one global batch of slots remain, the next batch starts
+/// at slot 0 of epoch `epoch + 1`. `DataPosition::default()` is the stream
+/// start. Every rank of a run holds the same position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DataPosition {
     /// Zero-based epoch index.
@@ -26,36 +32,76 @@ pub struct DataPosition {
     pub row: usize,
 }
 
-/// Row and batch counts of one loader shard.
+/// The error for a world of zero ranks.
+pub(super) fn zero_world_error() -> Error {
+    Error::DataError {
+        reason: "world size is 0: a run needs at least one rank. Pass a world \
+                 size of 1 or more."
+            .to_string(),
+    }
+}
+
+/// Row and batch counts of one loader's row range.
 ///
-/// Each epoch yields `num_rows / batch_size` batches. The last
-/// `num_rows % batch_size` slots of an epoch's order are dropped. Under
-/// shuffling those are different rows each epoch.
+/// All position arithmetic counts global batches: [`batch_size`](Self::batch_size)
+/// rows, every rank's batch together. Each epoch yields
+/// `num_rows / batch_size()` batches. The last `num_rows % batch_size()` slots
+/// of an epoch's order are dropped for every rank. Under shuffling those are
+/// different rows each epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowLayout {
     num_rows: usize,
-    batch_size: usize,
+    rank_batch_size: usize,
+    world_size: usize,
 }
 
 impl RowLayout {
-    /// Checks that at least one whole batch fits in `num_rows`.
+    /// A single-rank layout: [`for_world`](Self::for_world) at world size 1.
+    pub fn new(num_rows: usize, batch_size: usize) -> Result<Self> {
+        Self::for_world(num_rows, batch_size, 1)
+    }
+
+    /// Checks that one global batch of `rank_batch_size * world_size` rows
+    /// fits in `num_rows`.
     ///
     /// Row indices are stored as `u32` in the shuffled order, so `num_rows`
     /// must fit in a `u32`.
-    pub fn new(num_rows: usize, batch_size: usize) -> Result<Self> {
-        if batch_size == 0 {
+    pub fn for_world(num_rows: usize, rank_batch_size: usize, world_size: usize) -> Result<Self> {
+        if rank_batch_size == 0 {
             return Err(Error::DataError {
                 reason: "trainer.batch_size is 0: a batch needs at least one row. \
                          Set trainer.batch_size to a positive number."
                     .to_string(),
             });
         }
-        if num_rows < batch_size {
+        if world_size == 0 {
+            return Err(zero_world_error());
+        }
+        let Some(global) = rank_batch_size.checked_mul(world_size) else {
             return Err(Error::DataError {
                 reason: format!(
-                    "data shard holds {num_rows} whole rows, fewer than batch_size \
-                     {batch_size}, so no batch fits. Use more data, a smaller \
-                     trainer.batch_size, or a smaller model.max_seq_len."
+                    "batch_size {rank_batch_size} x {world_size} ranks overflows a row \
+                     count. Use a smaller trainer.batch_size or fewer ranks."
+                ),
+            });
+        };
+        if num_rows < global {
+            let (batch, ranks_hint) = if world_size == 1 {
+                (format!("batch_size {rank_batch_size}"), "")
+            } else {
+                (
+                    format!(
+                        "one global batch of {global} rows (batch_size {rank_batch_size} x \
+                         {world_size} ranks)"
+                    ),
+                    " fewer ranks,",
+                )
+            };
+            return Err(Error::DataError {
+                reason: format!(
+                    "data shard holds {num_rows} whole rows, fewer than {batch}, so no \
+                     batch fits. Use more data, a smaller trainer.batch_size,{ranks_hint} \
+                     or a smaller model.max_seq_len."
                 ),
             });
         }
@@ -63,14 +109,15 @@ impl RowLayout {
             return Err(Error::DataError {
                 reason: format!(
                     "data shard holds {num_rows} rows, more than the {} a row order can \
-                     index. Split the data file, or shard it across more ranks.",
+                     index. Split the data file.",
                     u32::MAX
                 ),
             });
         }
         Ok(Self {
             num_rows,
-            batch_size,
+            rank_batch_size,
+            world_size,
         })
     }
 
@@ -79,19 +126,31 @@ impl RowLayout {
         self.num_rows
     }
 
-    /// Rows per batch.
+    /// Rows per global batch: the rank batch size times the world size.
+    ///
+    /// Equal to [`rank_batch_size`](Self::rank_batch_size) at world size 1.
     pub fn batch_size(&self) -> usize {
-        self.batch_size
+        self.rank_batch_size * self.world_size
+    }
+
+    /// Rows per batch of one rank.
+    pub fn rank_batch_size(&self) -> usize {
+        self.rank_batch_size
+    }
+
+    /// Ranks that split each global batch.
+    pub fn world_size(&self) -> usize {
+        self.world_size
     }
 
     /// Whole batches per epoch. The partial batch at an epoch's end is dropped.
     pub fn batches_per_epoch(&self) -> usize {
-        self.num_rows / self.batch_size
+        self.num_rows / self.batch_size()
     }
 
     /// Where the next batch drawn at `pos` starts.
     pub fn batch_start(&self, pos: DataPosition) -> DataPosition {
-        if pos.row + self.batch_size > self.num_rows {
+        if pos.row + self.batch_size() > self.num_rows {
             DataPosition {
                 epoch: pos.epoch + 1,
                 row: 0,
@@ -101,19 +160,19 @@ impl RowLayout {
         }
     }
 
-    /// The position after drawing `batches` batches from `pos`.
+    /// The position after drawing `batches` global batches from `pos`.
     ///
-    /// Equal to the loader's position after `batches` calls to `next_batch`.
+    /// Equal to each rank loader's position after `batches` calls to `next_batch`.
     pub fn advance(&self, pos: DataPosition, batches: usize) -> DataPosition {
         if batches == 0 {
             return pos;
         }
         let start = self.batch_start(pos);
-        let left_in_epoch = (self.num_rows - start.row) / self.batch_size;
+        let left_in_epoch = (self.num_rows - start.row) / self.batch_size();
         if batches <= left_in_epoch {
             return DataPosition {
                 epoch: start.epoch,
-                row: start.row + batches * self.batch_size,
+                row: start.row + batches * self.batch_size(),
             };
         }
         // Past this epoch: `rest >= 1` batches start at the next epoch's slot 0.
@@ -123,12 +182,14 @@ impl RowLayout {
         let into_last = (rest - 1) % per_epoch + 1;
         DataPosition {
             epoch: start.epoch + 1 + full_epochs,
-            row: into_last * self.batch_size,
+            row: into_last * self.batch_size(),
         }
     }
 
     /// Optimizer steps in `num_epochs` epochs at `grad_accum` batches per step.
     ///
+    /// One step draws `grad_accum` global batches, so every rank runs the
+    /// same steps.
     /// A final step that would need batches past the last epoch is not run.
     pub fn total_steps(&self, grad_accum: usize, num_epochs: usize) -> usize {
         self.batches_per_epoch() * num_epochs / grad_accum.max(1)
@@ -266,6 +327,44 @@ mod tests {
         let err = RowLayout::new(3, 4).expect_err("3 rows cannot fill a batch of 4");
         assert!(err.to_string().contains("fewer than batch_size 4"), "{err}");
         assert!(RowLayout::new(3, 0).is_err());
+    }
+
+    #[test]
+    fn world_layout_counts_global_batches() {
+        let l = RowLayout::for_world(22, 3, 2).expect("valid layout");
+        assert_eq!(l.batch_size(), 6);
+        assert_eq!(l.rank_batch_size(), 3);
+        assert_eq!(l.world_size(), 2);
+        assert_eq!(l.batches_per_epoch(), 3);
+        assert_eq!(l.total_steps(1, 2), 6);
+        let single = layout(22, 6);
+        for n in 0..10 {
+            let pos = l.advance(DataPosition::default(), n);
+            assert_eq!(pos, single.advance(DataPosition::default(), n), "n={n}");
+        }
+        assert_eq!(
+            l.advance(DataPosition::default(), 4),
+            DataPosition { epoch: 1, row: 6 }
+        );
+    }
+
+    #[test]
+    fn world_size_one_is_the_single_rank_layout() {
+        assert_eq!(
+            RowLayout::for_world(10, 3, 1).expect("valid layout"),
+            layout(10, 3)
+        );
+    }
+
+    #[test]
+    fn world_layout_errors_name_the_global_batch() {
+        let err = RowLayout::for_world(5, 3, 2).expect_err("5 rows cannot fill 2 x 3");
+        let text = err.to_string();
+        assert!(text.contains("one global batch of 6 rows"), "{text}");
+        assert!(text.contains("batch_size 3 x 2 ranks"), "{text}");
+        let err = RowLayout::for_world(5, 3, 0).expect_err("world size 0");
+        assert!(err.to_string().contains("world size is 0"), "{err}");
+        assert!(RowLayout::for_world(5, usize::MAX, 2).is_err());
     }
 
     #[test]

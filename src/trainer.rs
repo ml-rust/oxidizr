@@ -29,7 +29,9 @@ use std::time::Instant;
 /// clippy's argument-count lint; the fields themselves are unrelated to each
 /// other beyond all describing "this particular training run".
 pub struct TrainerRunConfig {
-    /// Row and batch counts of the loader's shard.
+    /// Row and global batch counts of the training rows, from the loader's
+    /// [`row_layout`](crate::data::LitDataLoader::row_layout). Steps and
+    /// positions count global batches of every rank.
     pub row_layout: RowLayout,
     /// Loader position at `start_step`.
     pub start_position: DataPosition,

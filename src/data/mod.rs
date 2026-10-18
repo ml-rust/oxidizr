@@ -1,11 +1,12 @@
-//! Token-stream data loading: row layout, loss masks, and the synchronous
-//! and prefetching loaders.
+//! Token-stream data loading: row layout, data-parallel ranks, loss masks,
+//! and the synchronous and prefetching loaders.
 
 mod batch;
 mod construction;
 mod mask;
 mod positioning;
 mod prefetch;
+mod ranks;
 mod rows;
 mod source;
 

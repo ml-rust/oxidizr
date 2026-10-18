@@ -826,8 +826,8 @@ where
         config_trainer.num_epochs,
     );
 
-    // Effective batch size is the number of samples per optimizer step
-    let effective_batch_size = batch_size * config_trainer.gradient_accumulation;
+    // Rows per optimizer step across every rank: global batch x accumulation.
+    let effective_batch_size = row_layout.batch_size() * config_trainer.gradient_accumulation;
 
     progress.config = Some(serde_json::json!({
         "model": {
@@ -980,10 +980,11 @@ where
             "  Batch size per device = {} | Gradient accumulation = {}",
             batch_size, config_trainer.gradient_accumulation
         );
-        let actual_batch = batch_size * config_trainer.gradient_accumulation;
         println!(
             "  Total batch size ({} x {}) = {}",
-            batch_size, config_trainer.gradient_accumulation, actual_batch
+            row_layout.batch_size(),
+            config_trainer.gradient_accumulation,
+            effective_batch_size
         );
         println!();
 

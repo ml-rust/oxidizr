@@ -28,6 +28,12 @@ use std::path::{Path, PathBuf};
 /// Each epoch hands out every row once. The default is stream order;
 /// [`with_row_order`](Self::with_row_order) selects a seeded shuffle.
 ///
+/// # Ranks
+/// The default is rank 0 of a world of 1. [`with_rank`](Self::with_rank)
+/// makes the loader one rank of a data-parallel run. Every rank keeps the
+/// whole row range and the same order. Each rank reads its own `batch_size`
+/// slots of every global batch.
+///
 /// # Supported Formats
 /// - `.bin` files: Raw binary token arrays (u32)
 /// - In-memory: Vec<u32> for small datasets or testing
@@ -47,8 +53,12 @@ where
     pub(super) first_row: usize,
     /// One past the last stream row this loader reads.
     end_row: usize,
-    /// Next batch's place in the row order.
+    /// Next batch's place in the row order. Every rank holds the same one.
     pub(super) position: DataPosition,
+    /// This loader's data-parallel rank, below `world_size`.
+    pub(super) rank: usize,
+    /// Ranks that split each global batch.
+    pub(super) world_size: usize,
     /// Row at each slot of each epoch.
     pub(super) order: EpochOrder,
     /// Target mask rule. `Some` turns on masked loss scoring (audio-only for
@@ -85,6 +95,8 @@ where
             first_row: 0,
             end_row,
             position: DataPosition::default(),
+            rank: 0,
+            world_size: 1,
             order: EpochOrder::new(RowOrder::Stream),
             target_mask: None,
             source_path: None,
@@ -208,9 +220,15 @@ where
         (self.first_row, self.end_row)
     }
 
-    /// Row and batch counts of this loader's row range.
+    /// Row and global batch counts of this loader's row range.
+    ///
+    /// One global batch is `batch_size` rows from each of `world_size` ranks.
     pub fn row_layout(&self) -> Result<RowLayout> {
-        RowLayout::new(self.end_row - self.first_row, self.batch_size)
+        RowLayout::for_world(
+            self.end_row - self.first_row,
+            self.batch_size,
+            self.world_size,
+        )
     }
 
     /// Tokens in this loader's row range.

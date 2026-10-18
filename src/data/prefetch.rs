@@ -38,22 +38,11 @@ type Prefetched = std::result::Result<PrefetchedBatch, String>;
 /// is training on the current batch. This overlaps CPU I/O with GPU compute.
 ///
 /// The worker draws batches from the wrapped loader in order, so the batch
-/// sequence equals the wrapped loader's. Seek the wrapped loader before
-/// wrapping it to resume mid-stream.
+/// sequence equals the wrapped loader's. Set the wrapped loader's rank and
+/// seek it before wrapping it. Each rank of a data-parallel run wraps its
+/// own loader.
 ///
-/// # Performance
-///
-/// Without prefetching:
-/// ```text
-/// GPU: [Forward/Backward on batch N] → [Wait for CPU] → [Forward/Backward on batch N+1]
-/// CPU:                                  [Load batch N+1]
-/// ```
-///
-/// With prefetching:
-/// ```text
-/// GPU: [Forward/Backward on batch N] → [Forward/Backward on batch N+1] → ...
-/// CPU: [Load batch N+1]               → [Load batch N+2]                → ...
-/// ```
+/// The worker loads batch `N + 1` while the device trains on batch `N`.
 ///
 /// # Usage
 ///
@@ -92,17 +81,9 @@ impl<R> PrefetchDataLoader<R>
 where
     R: Runtime<DType = DType>,
 {
-    /// Create a new prefetching data loader
+    /// Wraps `base_loader` and keeps up to `prefetch_count` batches ready.
     ///
-    /// # Arguments
-    ///
-    /// * `base_loader` - The underlying LitDataLoader to wrap
-    /// * `prefetch_count` - Number of batches to prefetch (default: 2)
-    ///
-    /// # Notes
-    ///
-    /// Higher prefetch_count uses more CPU memory but provides better overlap.
-    /// Typically 2-3 is sufficient for most workloads.
+    /// A higher `prefetch_count` holds more batches in host memory.
     pub fn new(base_loader: LitDataLoader<R>, prefetch_count: usize) -> Result<Self> {
         let device = base_loader.device.clone();
         let batch_size = base_loader.batch_size;
