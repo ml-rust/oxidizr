@@ -45,7 +45,7 @@ pub(crate) fn oom_guard<T>(
 }
 
 /// The text of a panic payload, or `Unknown panic` for a payload of another type.
-fn panic_message(payload: &(dyn Any + Send)) -> String {
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {

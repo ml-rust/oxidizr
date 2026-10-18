@@ -35,7 +35,7 @@ struct Cli {
     #[arg(long = "seq-len", global = true)]
     seq_length: Option<usize>,
 
-    /// Override batch size (shortcut for 'oxidizr train --batch-size')
+    /// Override the per-rank batch size (shortcut for 'oxidizr train --batch-size')
     #[arg(long = "batch-size", global = true)]
     batch_size: Option<usize>,
 
@@ -55,11 +55,11 @@ struct Cli {
     #[arg(long = "resume", global = true)]
     resume: Option<String>,
 
-    /// One GPU ID; more than one is an error (shortcut for 'oxidizr train --gpus')
+    /// GPU ids, one rank per id (shortcut for 'oxidizr train --gpus')
     #[arg(long = "gpus", global = true)]
     gpus: Option<String>,
 
-    /// Sync backend name; multi-GPU is not implemented (shortcut for 'oxidizr train --sync-backend')
+    /// Sync backend name; nccl for multi-GPU (shortcut for 'oxidizr train --sync-backend')
     #[arg(long = "sync-backend", global = true)]
     sync_backend: Option<String>,
 

@@ -218,23 +218,46 @@ fn a_data_file_too_small_for_one_batch_records_a_failed_run() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[test]
-fn two_gpus_are_rejected_with_a_single_gpu_instruction() {
-    let dir = scratch_dir("headless-run-two-gpus");
+/// The `run.json` error of a headless CPU run with `--gpus <gpus>`.
+fn gpus_error(tag: &str, gpus: &str) -> String {
+    let dir = scratch_dir(tag);
     let data = dir.join("tokens.bin");
     write_token_file(&data, &tokens(&tiny_config(&dir, 2), 4000));
     let mut args = headless_args(&dir, &data, 2);
-    args.gpus = Some("0,1".to_string());
+    args.gpus = Some(gpus.to_string());
 
     let result = run_train(args);
 
     assert_ne!(exit_code(&result), 0);
     let record = RunRecord::load(&dir.join("run")).expect("run.json exists after a failed run");
     assert_eq!(record.status, RunStatus::Failed);
-    let error = record.error.expect("a failed run records its error");
-    assert!(error.contains("`--gpus 0,1`"), "{error}");
-    assert!(error.contains("not implemented in this build"), "{error}");
-    assert!(error.contains("single GPU"), "{error}");
     assert_eq!(record.final_step, 0);
     let _ = std::fs::remove_dir_all(dir);
+    record.error.expect("a failed run records its error")
+}
+
+/// A CPU run cannot take two GPUs. The message names what this build lacks.
+#[test]
+fn two_gpus_on_a_cpu_run_name_the_missing_support() {
+    let error = gpus_error("headless-run-two-gpus", "0,1");
+    assert!(error.contains("`--gpus 0,1`"), "{error}");
+    assert!(error.contains("--features cuda,nccl"), "{error}");
+    assert!(error.contains("--target-device gpu"), "{error}");
+    #[cfg(not(feature = "cuda"))]
+    assert!(error.contains("no CUDA support"), "{error}");
+    #[cfg(feature = "cuda")]
+    assert!(error.contains("trains on the CPU"), "{error}");
+}
+
+#[test]
+fn a_duplicate_gpu_id_is_rejected_on_every_build() {
+    let error = gpus_error("headless-run-duplicate-gpus", "0,0");
+    assert!(error.contains("`--gpus 0,0`"), "{error}");
+    assert!(error.contains("GPU 0 twice"), "{error}");
+}
+
+#[test]
+fn a_bad_gpu_id_is_rejected() {
+    let error = gpus_error("headless-run-bad-gpu", "0,one");
+    assert!(error.contains("invalid GPU id 'one'"), "{error}");
 }

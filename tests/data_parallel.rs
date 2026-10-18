@@ -508,7 +508,7 @@ fn the_initial_broadcast_gives_every_rank_rank_zeros_tensors() {
 }
 
 /// Rank 1 fails before any collective. Its abort hook wakes rank 0, which
-/// waits in the gradient sum, so rank 0 returns an error instead of hanging.
+/// waits in the step-count sum, so rank 0 returns an error instead of hanging.
 #[test]
 fn a_failed_rank_aborts_its_peers() {
     let (cfg, dir) = dp_config("dp-failed-rank", 1, 1);
@@ -569,10 +569,10 @@ fn a_collective_timeout_is_the_step_error() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Rank 0 masks and rank 1 does not, so rank 0 sums its scored count while
-/// rank 1 sums its gradients. Both collectives fail with an error, and no rank hangs.
+/// Rank 0 masks and rank 1 does not. Both join the same step-count sum, so
+/// both return the mask error before any forward pass, and no rank hangs.
 #[test]
-fn a_mismatched_collective_fails_on_every_rank() {
+fn mixed_mask_presence_fails_on_every_rank() {
     let (cfg, dir) = dp_config("dp-mismatch", 1, 1);
     let masked = Data {
         target_base: Some(SCORED_BASE),
@@ -585,9 +585,17 @@ fn a_mismatched_collective_fails_on_every_rank() {
         let data = if rank == 0 { &masked } else { &unmasked };
         let mut loader = data.rank_loader(&cfg, rank);
         let mut t = rank_trainer(&cfg, &mut parts, &loader, comm, abort);
-        t.training_step(&model, &mut loader).is_err()
+        t.training_step(&model, &mut loader)
+            .err()
+            .map(|e| e.to_string())
     });
-    assert_eq!(results, vec![true; WORLD]);
+    for (rank, result) in results.iter().enumerate() {
+        let text = result.as_deref().expect("every rank must fail");
+        assert!(
+            text.contains("1 of 2 data-parallel ranks"),
+            "rank {rank}: {text}"
+        );
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 

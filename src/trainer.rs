@@ -791,6 +791,8 @@ where
             weight_decay: self.decay_plan.spec(),
             loss_scale: self.loss_scale_state(),
             eval: self.eval_checkpoint(),
+            world_size: self.world_size(),
+            global_batch_rows: self.row_layout.batch_size(),
         })
     }
 

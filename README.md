@@ -212,9 +212,10 @@ Common `train` flags:
 | `-f, --config <FILE>` | `models/nano.yaml` | YAML config |
 | `-d, --data <FILE>` | 1,000,000 random tokens | Memory-mapped `u32` token file |
 | `--target-device <gpu\|cpu>` | Config `trainer.target_device` | Device. A build without `cuda` runs on CPU |
-| `--batch-size`, `--seq-len`, `--grad-accum`, `--max-steps` | Config | Override the config value |
+| `--batch-size`, `--seq-len`, `--grad-accum`, `--max-steps` | Config | Override the config value. `--batch-size` is the batch of one GPU |
 | `--resume <PATH\|auto>` | None | Resume from a `.safetensors` checkpoint, or the latest one. Restores weights, optimizer state and data position |
-| `--gpus <ID>` | `0` | One GPU ID. More than one ID is an error. `CUDA_VISIBLE_DEVICES` selects the device |
+| `--gpus <IDS>` | Config `trainer.distributed.gpu_ids`, else the default GPU | GPU ids, one data-parallel rank per id, for example `0,1`. More than one id needs `--features cuda,nccl` |
+| `--sync-backend <single\|cpu\|nccl>` | Config `trainer.distributed.backend` | Gradient sync. NCCL is the only multi-GPU backend. `cpu` and an explicit `single` refuse more than one GPU |
 | `--prefetch <N>` | `0` | Batches to prefetch on a background thread |
 | `--max-checkpoints <N>` | `10` | Checkpoints to keep. `0` keeps all |
 | `--dtype <f32\|f16\|bf16>` | Config `model.dtype` (`f32`) | Model precision |
@@ -252,13 +253,24 @@ Get a token from the [HuggingFace token page](https://huggingface.co/settings/to
 
 ## Multi-GPU Training
 
-Multi-GPU training is not available. Pass a single GPU:
+A build with `--features cuda,nccl` trains one model on several GPUs of one machine. This is data parallelism: every GPU holds a full replica.
 
 ```bash
-cargo run --release --features cuda -- train -f models/nano.yaml --gpus 0
+cargo build --release --features cuda,nccl
+./target/release/oxidizr train -f models/nano.yaml --gpus 0,1
 ```
 
-`--gpus 0,1` exits with an error. Use `CUDA_VISIBLE_DEVICES` to pick which GPU runs.
+- `--gpus 0,1` starts one rank per GPU, in one process. Rank `i` uses the i-th id. An id named twice is an error.
+- `batch_size` is the batch of one GPU. One optimizer step reads `batch_size x GPUs x gradient_accumulation` rows. Two GPUs at `batch_size: 4` match one GPU at `batch_size: 8` up to float rounding.
+- Each step sums the gradients of every GPU with one NCCL all-reduce. Every replica stays bit-equal.
+- Rank 0 alone prints, evaluates, and writes `run.json`, `steps.json`, `evals.json` and the checkpoints. Its early-stop decision reaches every rank.
+- A failure or panic on one GPU aborts the others. The run fails with the error of the rank that failed first.
+- The checkpoint meta records `world_size`. A resume needs the same GPU count. A checkpoint of another count is an error that names both counts.
+- `--target-device cpu` with more than one id is an error. A build without `nccl` refuses more than one id with the feature to add.
+
+Not supported: FSDP, ZeRO sharding, tensor parallelism, pipeline parallelism, and more than one machine.
+
+The CPU test suite runs every data-parallel path on in-process CPU ranks. The NCCL communicator, the NCCL abort, and the multi-GPU device setup are untested on real GPUs.
 
 ## Features
 
@@ -266,7 +278,7 @@ cargo run --release --features cuda -- train -f models/nano.yaml --gpus 0
 |---------|---------|---------|
 | `f16` | On | F16 and BF16 dtypes |
 | `cuda` | Off | CUDA backend (boostr CubeCL) |
-| `nccl` | Off | Enables `boostr/nccl`. Implies `cuda`. Adds no training feature |
+| `nccl` | Off | Multi-GPU data parallelism over NCCL. Implies `cuda` |
 | `huggingface` | Off | `push` command |
 | `audio` | Off | `prep-corpus` command, with the voxr corpus pipeline and the Whisper, NeuCodec, and Silero VAD models |
 | `vocab-<name>` | Off | Bundled tokenizer vocabulary for `prep-corpus --tokenizer <name>` |

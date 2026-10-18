@@ -3229,7 +3229,7 @@ where
     }
 
     /// Build a fresh model with `config.trainer.seed` applied to the
-    /// `VarBuilder`, exactly as `commands::train::run_train_with_runtime`
+    /// `VarBuilder`, exactly as each rank of `commands::train`
     /// does before calling `LitGPT::new`.
     ///
     /// `commands::train` and integration tests both go through this instead

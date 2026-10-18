@@ -55,7 +55,8 @@ cargo run --release --features cuda -- train -f <config.yaml> [OPTIONS]
 | Argument                     | Description                                                           |
 | ---------------------------- | --------------------------------------------------------------------- |
 | `--target-device <cpu\|gpu>` | Override target device. Default: gpu if CUDA available, otherwise cpu |
-| `--gpus <ID>`                | One GPU ID. More than one ID is an error                             |
+| `--gpus <IDS>`               | GPU ids, one data-parallel rank per id, for example `0,1`. Overrides `trainer.distributed.gpu_ids` |
+| `--sync-backend <NAME>`      | `single`, `cpu` or `nccl`. NCCL is the only multi-GPU backend        |
 
 #### CPU Training
 
@@ -77,11 +78,19 @@ cargo run --release --features cuda -- train -f models/nano.yaml
 
 #### Multi-GPU Training
 
-Multi-GPU training is not available. `--gpus 0,1` exits with an error. Pass one GPU:
+Requires `--features cuda,nccl`. One rank runs per GPU id, in one process:
 
 ```bash
-cargo run --release --features cuda -- train -f models/nano.yaml --gpus 0
+cargo build --release --features cuda,nccl
+./target/release/oxidizr train -f models/nano.yaml --gpus 0,1
 ```
+
+- `--batch-size` and `batch_size` are the batch of one GPU. One step reads `batch_size x GPUs x gradient_accumulation` rows.
+- Rank 0 alone prints and writes `run.json`, `steps.json`, `evals.json` and the checkpoints.
+- A resume needs the same GPU count as the run that wrote the checkpoint.
+- These inputs are errors: an id named twice, more than one id with `--target-device cpu`, more than one id on a build without `cuda` or `nccl`, and `--sync-backend cpu` or an explicit `--sync-backend single` with more than one id.
+
+See [the Multi-GPU section of the GPU guide](training/gpu.md#multi-gpu).
 
 ### Training Overrides
 
@@ -90,7 +99,7 @@ Override config values from command line:
 | Argument           | Description                          |
 | ------------------ | ------------------------------------ |
 | `--seq-len <N>`    | Override sequence length             |
-| `--batch-size <N>` | Override batch size                  |
+| `--batch-size <N>` | Override the batch of one GPU        |
 | `--grad-accum <N>` | Override gradient accumulation steps |
 | `--max-steps <N>`  | Override maximum training steps      |
 

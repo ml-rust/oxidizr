@@ -43,6 +43,10 @@ pub struct CheckpointSave<'a, R: Runtime<DType = DType>> {
     pub loss_scale: Option<GradScalerState>,
     /// Held-out rows and eval stop counters after `step` steps. Default without an eval.
     pub eval: EvalCheckpoint,
+    /// Data-parallel ranks of the run. 1 without data parallelism.
+    pub world_size: usize,
+    /// Rows of one global batch over every rank, the batch `position` counts.
+    pub global_batch_rows: usize,
 }
 
 /// Write the optimizer state, then the weights, then the meta.
@@ -94,6 +98,8 @@ where
         meta.holdout_rows = save.eval.holdout_rows;
         meta.best_eval_loss = save.eval.best_eval_loss;
         meta.evals_since_best = save.eval.evals_since_best;
+        meta.world_size = Some(save.world_size);
+        meta.global_batch_rows = Some(save.global_batch_rows);
         meta.save_to(&meta_path)
     });
     if let Err(e) = written {

@@ -82,7 +82,7 @@ Enable Mixture of Experts:
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `learning_rate` | Learning rate | 0.0003 |
-| `batch_size` | Batch size | 2 |
+| `batch_size` | Batch of one GPU. A step reads `batch_size x GPUs x gradient_accumulation` rows | 2 |
 | `max_steps` | Maximum training steps | 5000 |
 | `num_epochs` | Number of epochs | 2 |
 | `gradient_accumulation` | Gradient accumulation steps | 1 |

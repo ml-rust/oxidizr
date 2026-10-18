@@ -32,7 +32,7 @@ default = ["f16"]
 f16 = ["boostr/f16"]
 # CUDA GPU acceleration (via boostr CubeCL backend)
 cuda = ["boostr/cuda"]
-# Enables boostr/nccl. Training uses one GPU.
+# Multi-GPU data parallelism over NCCL (boostr/nccl).
 nccl = ["cuda", "boostr/nccl"]
 # HuggingFace Hub integration for model publishing
 huggingface = ["dep:hf-hub"]

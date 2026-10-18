@@ -1,5 +1,5 @@
 //! `TrainerConfig::seed` must produce reproducible initial weights through
-//! the exact model-construction path `commands::train::run_train_with_runtime`
+//! the exact model-construction path each rank of `commands::train`
 //! uses: a fresh `VarMap` handed to `LitGPT::new_seeded`, which applies
 //! `VarBuilder::with_seed` before calling `LitGPT::new`. Every test here
 //! builds through `LitGPT::new_seeded` (never a hand-rolled `VarBuilder`), so

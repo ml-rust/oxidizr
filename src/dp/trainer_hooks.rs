@@ -13,7 +13,8 @@ use std::sync::Arc;
 /// Aborts the communicator group of one rank, so peers blocked in a collective return.
 ///
 /// `Communicator` has no abort call, so the launcher passes the backend's own.
-/// For `LocalCommunicator` it calls `LocalCommunicator::abort`.
+/// For `LocalCommunicator` it calls `LocalCommunicator::abort`. For NCCL it
+/// calls `NcclCommunicator::abort` on every rank. See [`super::RankGroup`].
 pub type AbortHook = Arc<dyn Fn() + Send + Sync>;
 
 /// The early-stop reason of a rank other than 0, set by the step-boundary broadcast.
@@ -173,8 +174,9 @@ where
     ///
     /// # Data Parallelism
     /// With `W` ranks the step has `M = gradient_accumulation * W` micro-batches.
-    /// Each micro-batch loss is scaled by `1 / M`. A masked step first sums its
-    /// scored count over every rank, so `total` is the global count. After the
+    /// Each micro-batch loss is scaled by `1 / M`. Every step first sums its
+    /// scored count and its mask flag over every rank, so `total` is the global
+    /// count, and a mask on some ranks only is an error on every rank. After the
     /// local backward passes, one flat sum adds every gradient and the logged
     /// loss over all ranks. Unscale, clips, the overflow decision and the
     /// optimizer step then run on the summed gradients, which are bit-identical

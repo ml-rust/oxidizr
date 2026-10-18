@@ -194,13 +194,35 @@ Use exact same config and data as original run.
 
 ## Multi-GPU Issues
 
-### Error: multi-GPU data parallelism is not implemented
+### Error: `--gpus 0,1` names 2 GPUs, and this build has no NCCL support
 
-```
-distributed error: `--gpus 0,1` names 2 GPUs. Multi-GPU data parallelism is not implemented in this build.
+Multi-GPU training needs a build with both features:
+
+```bash
+cargo build --release --features cuda,nccl
 ```
 
-Pass a single GPU, for example `--gpus 0`. Check `trainer.distributed.gpu_ids` in the config for more than one ID.
+The message says "no CUDA support" for a build without `cuda`. It says "trains on the CPU" for `--target-device cpu`. Pass `--target-device gpu`, or remove `--gpus`. Check `trainer.distributed.gpu_ids` in the config too: it applies without `--gpus`.
+
+### Error: names GPU 0 twice
+
+Each rank needs its own GPU. Name each id once in `--gpus` or `trainer.distributed.gpu_ids`.
+
+### Error: checkpoint meta records world size 2, and this run has world size 1
+
+A data-parallel checkpoint resumes only on the same GPU count. Resume with `--gpus` naming that many GPUs, or start a fresh run.
+
+### Error: sync backend `cpu` cannot run 2 ranks
+
+NCCL is the only multi-GPU backend. Pass `--sync-backend nccl`, or remove the flag.
+
+### Error: rank 1 of 2 failed first
+
+One rank failed, and the launcher aborted the others. The text after this line is that rank's error. Fix it as for a one-GPU run. An out-of-memory error on one GPU fails the whole run.
+
+### Error: NCCL init of 2 ranks failed
+
+Check that every id in `--gpus` names a different GPU that `nvidia-smi` lists. `CUDA_VISIBLE_DEVICES` renumbers the visible GPUs from 0.
 
 ### GPUs not detected
 

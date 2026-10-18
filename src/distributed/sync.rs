@@ -1,22 +1,20 @@
-//! Distributed config types and the multi-GPU check.
-//!
-//! One GPU is the only supported world size. Any config or CLI input that
-//! names more than one GPU is an error.
+//! Distributed config types: the sync backend and the GPU id list.
 
-use crate::prelude::{Error, Result};
+use super::gpus::reject_duplicate_gpus;
+use crate::prelude::Result;
 use serde::{Deserialize, Serialize};
 
 /// Gradient synchronization backend name, as parsed from config and CLI.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum SyncBackend {
-    /// No synchronization (one GPU)
+    /// No synchronization (one GPU). The default: more than one GPU runs NCCL.
     #[default]
     Single,
-    /// CPU gradient staging
+    /// CPU gradient staging. No multi-rank implementation.
     #[serde(alias = "cpu")]
     CpuStaging,
-    /// NCCL all-reduce
+    /// NCCL all-reduce, the only multi-rank backend.
     Nccl,
 }
 
@@ -36,7 +34,9 @@ impl std::str::FromStr for SyncBackend {
     }
 }
 
-/// Distributed training config. Only one GPU is supported.
+/// Distributed training config.
+///
+/// `gpu_ids` names one GPU per data-parallel rank. `--gpus` overrides it.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DistributedConfig {
     /// Enable distributed training
@@ -47,7 +47,7 @@ pub struct DistributedConfig {
     #[serde(default)]
     pub backend: SyncBackend,
 
-    /// GPU IDs to use
+    /// GPU IDs to use, one per rank
     #[serde(default)]
     pub gpu_ids: Vec<usize>,
 }
@@ -58,26 +58,13 @@ impl DistributedConfig {
         self.gpu_ids.len().max(1)
     }
 
-    /// Returns an error when `gpu_ids` names more than one GPU.
+    /// Returns an error when `gpu_ids` names one GPU twice.
+    ///
+    /// Whether this build can run more than one GPU is checked by
+    /// [`check_gpu_ids`](super::gpus::check_gpu_ids) at launch.
     pub fn validate(&self) -> Result<()> {
-        reject_multi_gpu("trainer.distributed.gpu_ids", &self.gpu_ids)
+        reject_duplicate_gpus("trainer.distributed.gpu_ids", &self.gpu_ids)
     }
-}
-
-/// Returns an error when `gpu_ids` names more than one GPU.
-///
-/// `input` is the exact user input to quote, for example `--gpus 0,1`.
-pub fn reject_multi_gpu(input: &str, gpu_ids: &[usize]) -> Result<()> {
-    if gpu_ids.len() <= 1 {
-        return Ok(());
-    }
-    Err(Error::DistributedError {
-        reason: format!(
-            "`{input}` names {} GPUs. Multi-GPU data parallelism is not implemented in this build. \
-             Pass a single GPU, for example `--gpus 0`.",
-            gpu_ids.len()
-        ),
-    })
 }
 
 #[cfg(test)]
@@ -93,23 +80,24 @@ mod tests {
     }
 
     #[test]
-    fn world_size_above_one_is_an_error_naming_the_input() {
-        let err = reject_multi_gpu("--gpus 0,1", &[0, 1]).expect_err("two GPUs");
-        let text = err.to_string();
-        assert!(text.contains("`--gpus 0,1`"), "{text}");
-        assert!(text.contains("not implemented in this build"), "{text}");
-        assert!(text.contains("single GPU"), "{text}");
-    }
-
-    #[test]
-    fn config_with_two_gpu_ids_fails_validation() {
+    fn config_with_two_gpu_ids_passes_validation() {
         let config = DistributedConfig {
             enabled: true,
             backend: SyncBackend::Nccl,
             gpu_ids: vec![0, 1],
         };
         assert_eq!(config.world_size(), 2);
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_with_a_duplicate_gpu_id_fails_validation() {
+        let config = DistributedConfig {
+            gpu_ids: vec![1, 0, 1],
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("duplicate");
+        assert!(err.to_string().contains("GPU 1 twice"), "{err}");
     }
 
     #[test]

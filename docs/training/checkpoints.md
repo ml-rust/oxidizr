@@ -82,7 +82,7 @@ Each checkpoint is a set of three files in `checkpoint_dir`:
 |------|---------|
 | `<prefix>_step_N.safetensors` | Model weights after N completed optimizer steps |
 | `<prefix>_step_N.optimizer.safetensors` | AdamW state: `exp_avg`, `exp_avg_sq`, `master` per trainable tensor, and `__step` |
-| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, `no_decay_patterns` when set, `loss_scale` for an f16 run, and the eval keys under `trainer.eval` |
+| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, `no_decay_patterns` when set, `loss_scale` for an f16 run, `world_size`, `global_batch_rows`, and the eval keys under `trainer.eval` |
 
 The end of a run writes the same set as `<prefix>_final.safetensors`,
 `<prefix>_final.optimizer.safetensors` and `checkpoint_final.meta.json`.
@@ -186,8 +186,28 @@ without a data check. A legacy model hash that differs reports a mismatch,
 as before.
 
 Metadata written before `data_position` existed has none. The loader
-position then derives from N and the current `batch_size` and
+position then derives from N and the current global batch and
 `gradient_accumulation`, and a stderr line reports it.
+
+## Multi-GPU Checkpoints
+
+Rank 0 writes every checkpoint of a multi-GPU run. Every replica is
+bit-equal, so one set holds the whole run. The meta records two keys:
+
+| Key | Meaning |
+|-----|---------|
+| `world_size` | GPUs of the run. Absent in older metas: 1 |
+| `global_batch_rows` | Rows of one global batch: `batch_size` times `world_size`. `data_position` counts batches of this size. Absent in older metas: `batch_size` |
+
+A resume reads the same files on every rank. Each rank loads the weights
+and the optimizer state, and seeks to the same global `data_position`.
+
+- A resume with another GPU count stops with an error that names both
+  counts. Resume with `--gpus` naming the original count.
+- A resume with another `global_batch_rows` prints a warning. The data
+  stream continues at the saved row, but the batches start on other rows,
+  so the run does not match an uninterrupted one.
+- A meta without `world_size` resumes on one GPU unchanged.
 
 ## Best Practices
 

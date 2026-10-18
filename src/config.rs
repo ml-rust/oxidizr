@@ -1151,6 +1151,16 @@ pub struct CheckpointMeta {
     /// the early-stop count from it. Absent without `trainer.eval`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evals_since_best: Option<usize>,
+    /// Data-parallel ranks of the run. A resume with another count is an
+    /// error. Absent in metadata written before data parallelism: such a run
+    /// had 1 rank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_size: Option<usize>,
+    /// Rows of one global batch: the per-rank `batch_size` times
+    /// `world_size`. `data_position` counts batches of this size. Absent in
+    /// metadata written before data parallelism: there it is `batch_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_batch_rows: Option<usize>,
 }
 
 fn default_dtype_string() -> String {
@@ -1195,6 +1205,8 @@ impl CheckpointMeta {
             holdout_rows: None,
             best_eval_loss: None,
             evals_since_best: None,
+            world_size: None,
+            global_batch_rows: None,
         })
     }
 
