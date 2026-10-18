@@ -65,7 +65,8 @@ where
         + boostr::QuantMatmulOps<R>
         + boostr::RoPEOps<R>
         + boostr::TypeConversionOps<R>
-        + boostr::DequantOps<R>,
+        + boostr::DequantOps<R>
+        + boostr::GatedDeltaNetOps<R>,
 {
     loader.seek(DataPosition::default())?;
     let totals = no_grad(|| -> Result<EvalTotals> {

@@ -1,0 +1,44 @@
+# Nano Gated DeltaNet Hybrid Configuration
+# Gated DeltaNet (Qwen3.5 / Qwen3-Next linear attention) layers with dense GQA attention layers.
+#
+# Architecture: 6 GDN + 2 GQA attention (3:1 pattern), each with a SwiGLU MLP.
+# Layers 0,1,2 = GDN, layer 3 = attention, layers 4,5,6 = GDN, layer 7 = attention.
+#
+# blazr cannot serve this model yet: training writes no config.json for it.
+# GPU training is unconfirmed: the tests run GDN on CPU only.
+
+model:
+  name: nano-gdn
+  hidden_size: 384
+  num_layers: 8
+  num_heads: 6
+  kv_heads: 2 # Grouped-query attention on layers 3 and 7
+  intermediate_size: 1024 # SwiGLU width of every layer's MLP
+
+  # Gated DeltaNet layers. Every other layer is an attention layer.
+  gdn_layers: [0, 1, 2, 4, 5, 6]
+  gdn:
+    state_size: 64 # Head width of q, k and v; each value head keeps a 64x64 state
+    key_heads: 2 # Query/key heads
+    value_heads: 4 # Value heads, a multiple of key_heads
+    conv_kernel: 4 # Causal conv width over the qkv projection
+    chunk_size: 64 # Chunk length of the delta-rule recurrence
+
+  vocab_size: 128354 # Llama 3 + splintr agent tokens
+  # REQUIRED: Tokenizer vocabulary name - must match the vocab used to tokenize training data
+  # Options: cl100k_base, o200k_base, llama3, deepseek_v3, custom
+  tokenizer_vocab: llama3
+  max_seq_len: 512
+  rope_theta: 10000.0
+
+trainer:
+  target_device: gpu
+  learning_rate: 0.0003
+  max_steps: 0
+  num_epochs: 2
+  batch_size: 4
+  gradient_accumulation: 1
+  checkpoint_dir: "./checkpoints/nano-gdn-hybrid"
+  log_interval: 10
+  save_interval: 500
+  load_balance_alpha: 0.0 # No MoE

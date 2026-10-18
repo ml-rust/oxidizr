@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::checkpoint_config::write_checkpoint_config;
+use crate::checkpoint_config::{blazr_export_refusal, write_checkpoint_config};
 use crate::checkpoint_sidecars::copy_checkpoint_sidecars;
 use crate::config::{LitConfig, LoraConfig};
 use crate::model::{load_checkpoint_into_model, save_checkpoint_from_params, LitGPT};
@@ -152,9 +152,15 @@ where
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let sidecar_dir = sidecar_dir.to_string_lossy().into_owned();
-    println!("  Writing config.json for blazr inference compatibility...");
-    write_checkpoint_config(&merged_config, &sidecar_dir)
-        .with_context(|| format!("Failed to write config.json in '{}'", sidecar_dir))?;
+    let refusal = blazr_export_refusal(&merged_config);
+    match &refusal {
+        Some(reason) => println!("  Skipping config.json: {reason}"),
+        None => {
+            println!("  Writing config.json for blazr inference compatibility...");
+            write_checkpoint_config(&merged_config, &sidecar_dir)
+                .with_context(|| format!("Failed to write config.json in '{}'", sidecar_dir))?;
+        }
+    }
     copy_checkpoint_sidecars(&config.trainer.checkpoint_sidecars, &sidecar_dir).with_context(
         || {
             format!(
@@ -167,7 +173,9 @@ where
     println!("\n✅ Merge complete!");
     println!("\nOutput files:");
     println!("  - {}", args.output);
-    println!("  - {}/config.json", sidecar_dir);
+    if refusal.is_none() {
+        println!("  - {}/config.json", sidecar_dir);
+    }
     println!("\nNext steps:");
     println!("  Load it with the same config minus its 'lora' block, or serve it with blazr.");
 

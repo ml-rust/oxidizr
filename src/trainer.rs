@@ -114,7 +114,8 @@ where
         + boostr::QuantMatmulOps<R>
         + boostr::RoPEOps<R>
         + boostr::TypeConversionOps<R>
-        + boostr::DequantOps<R>,
+        + boostr::DequantOps<R>
+        + boostr::GatedDeltaNetOps<R>,
 {
     pub fn new(
         config: TrainerConfig,

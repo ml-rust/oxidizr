@@ -31,7 +31,8 @@ where
         + boostr::QuantMatmulOps<R>
         + boostr::RoPEOps<R>
         + boostr::TypeConversionOps<R>
-        + boostr::DequantOps<R>,
+        + boostr::DequantOps<R>
+        + boostr::GatedDeltaNetOps<R>,
 {
     /// Turns on the evals of `evaluator` for this trainer's fit loop.
     ///

@@ -7,6 +7,8 @@ use boostr::tensor::TensorId;
 use boostr::TypeConversionOps;
 use std::collections::HashMap;
 
+mod gdn;
+
 /// A weight tensor paired with the stable parameter id it was registered
 /// under. Used throughout the `*_weights_with_ids`/`with_ids` rebuild path
 /// so a checkpoint's tensors can be re-associated with boostr's `TensorId`
@@ -2195,6 +2197,94 @@ enum BlockType<R: boostr::Runtime> {
         input_layernorm: RmsNorm<R>,
         post_attention_layernorm: RmsNorm<R>,
     },
+    /// Gated DeltaNet mixer with the attention arms' norms, residuals and
+    /// FFN. See `gdn::GdnLayer`.
+    Gdn(Box<gdn::GdnLayer<R>>),
+}
+
+/// The per-model choices `Block::new` reads beyond boostr's `ModelConfig`.
+///
+/// boostr's `ModelConfig` carries no `qk_norm` flag, no LoRA block, and no
+/// GDN layer list, so each comes from `OxidizrModelConfig` here.
+struct BlockOptions<'a> {
+    lora: Option<&'a LoraConfig>,
+    qk_norm: bool,
+    /// `Some` exactly when this layer is a GDN layer.
+    gdn: Option<&'a boostr::model::config::GdnConfig>,
+}
+
+/// Every tensor of one layer with its stable id, for `Block::with_ids`.
+/// The variant names the `BlockType` arm to rebuild.
+enum BlockWeights<R: boostr::Runtime> {
+    Mamba1(Box<Mamba1BlockWeights<R>>),
+    Mamba2(Box<Mamba2BlockWeights<R>>),
+    Mamba3(Box<Mamba3BlockWeights<R>>),
+    Mla(Box<MlaBlockWeights<R>>),
+    Legacy(Box<LegacyBlockWeights<R>>),
+    Gdn(Box<gdn::GdnLayerWithIds<R>>),
+}
+
+/// Mixer weights and the RmsNorm pre-norm.
+type Mamba1BlockWeights<R> = (
+    boostr::model::mamba::Mamba1WeightsWithIds<R>,
+    WeightWithId<R>,
+);
+
+/// Mixer weights and the RmsNorm pre-norm.
+type Mamba2BlockWeights<R> = (
+    boostr::model::mamba::Mamba2WeightsWithIds<R>,
+    WeightWithId<R>,
+);
+
+/// Mixer weights and the LayerNorm pre-norm weight and bias.
+type Mamba3BlockWeights<R> = (
+    boostr::model::mamba::Mamba3WeightsWithIds<R>,
+    WeightWithId<R>,
+    WeightWithId<R>,
+);
+
+/// `q_a_proj`, `q_b_proj`, `q_a_layernorm`, `kv_a_proj_with_mqa`,
+/// `kv_a_layernorm`, `kv_b_proj`, `o_proj`, the FFN as `(mlp, moe)`, then
+/// `input_layernorm` and `post_attention_layernorm`.
+type MlaBlockWeights<R> = (
+    WeightWithId<R>,
+    WeightWithId<R>,
+    WeightWithId<R>,
+    WeightWithId<R>,
+    WeightWithId<R>,
+    WeightWithId<R>,
+    WeightWithId<R>,
+    Option<MlpWeightsWithIds<R>>,
+    Option<MoeWeightsWithIds<R>>,
+    WeightWithId<R>,
+    WeightWithId<R>,
+);
+
+/// `q_proj`, `k_proj`, `v_proj`, `o_proj`, the RoPE cos and sin, the Q/K
+/// norms (present exactly when `qk_norm` is on: boostr's `ModelConfig` has
+/// no flag to read), the FFN as `(mlp, moe)`, then `input_layernorm` and
+/// `post_attention_layernorm`.
+type LegacyBlockWeights<R> = (
+    AttnProjWithIds<R>,
+    AttnProjWithIds<R>,
+    AttnProjWithIds<R>,
+    AttnProjWithIds<R>,
+    WeightWithId<R>,
+    WeightWithId<R>,
+    Option<QkNormsWithIds<R>>,
+    Option<MlpWeightsWithIds<R>>,
+    Option<MoeWeightsWithIds<R>>,
+    WeightWithId<R>,
+    WeightWithId<R>,
+);
+
+/// The arguments of `Block::with_ids`.
+struct BlockWithIds<'a, R: boostr::Runtime> {
+    cfg: &'a ModelConfig,
+    layer_idx: usize,
+    weights: BlockWeights<R>,
+    device: &'a R::Device,
+    frozen: &'a FrozenParams,
 }
 
 struct Block<R: boostr::Runtime> {
@@ -2207,17 +2297,15 @@ where
 {
     // Create appropriate block type based on configuration
     //
-    // `qk_norm` comes straight from `OxidizrModelConfig`: boostr's
-    // `AttentionConfig` carries no such flag, so there is nowhere in `cfg` to
-    // read it from.
+    // `opts` carries what boostr's `ModelConfig` cannot: `qk_norm`, the LoRA
+    // block, and whether this layer is a GDN layer.
     fn new<C>(
         cfg: &ModelConfig,
         layer_idx: usize,
         mut vb: VarBuilder<'_, R>,
         client: &C,
         dtype: DType,
-        lora: Option<&LoraConfig>,
-        qk_norm: bool,
+        opts: BlockOptions<'_>,
     ) -> Result<Self>
     where
         C: boostr::RuntimeClient<R>
@@ -2227,6 +2315,18 @@ where
             + boostr::CompareOps<R>
             + boostr::TensorOps<R>,
     {
+        let BlockOptions {
+            lora,
+            qk_norm,
+            gdn: gdn_cfg,
+        } = opts;
+        if let Some(gdn_cfg) = gdn_cfg {
+            let layer = gdn::GdnLayer::new(cfg, gdn_cfg, layer_idx, vb, client, dtype, lora)?;
+            return Ok(Self {
+                block_type: BlockType::Gdn(Box::new(layer)),
+            });
+        }
+
         // The config's value, not a literal: boostr's `ModelConfig` carries
         // `rms_norm_eps`, and hardcoding it here would silently ignore a
         // config that asks for anything else. (Mamba pre-norms deliberately
@@ -2376,59 +2476,28 @@ where
         Ok(Self { block_type })
     }
 
-    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn with_ids(
-        cfg: &ModelConfig,
-        layer_idx: usize,
-        mamba1: Option<(
-            boostr::model::mamba::Mamba1WeightsWithIds<R>,
-            (Tensor<R>, boostr::autograd::TensorId),
-        )>,
-        // Each carries the block-input pre-norm alongside the mixer weights:
-        // RmsNorm weight for Mamba2, LayerNorm weight+bias for Mamba3.
-        mamba2: Option<(
-            boostr::model::mamba::Mamba2WeightsWithIds<R>,
-            (Tensor<R>, boostr::autograd::TensorId),
-        )>,
-        mamba3: Option<(
-            boostr::model::mamba::Mamba3WeightsWithIds<R>,
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-        )>,
-        attention: Option<(
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            Option<(AttnProjWithIds<R>, AttnProjWithIds<R>, AttnProjWithIds<R>)>,
-            Option<MoeWeightsWithIds<R>>,
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-        )>,
-        legacy_attention: Option<(
-            AttnProjWithIds<R>,
-            AttnProjWithIds<R>,
-            AttnProjWithIds<R>,
-            AttnProjWithIds<R>,
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-            // The per-head Q/K norms, present exactly when the model config's
-            // `qk_norm` is on. Carried here rather than re-derived from `cfg`:
-            // boostr's `ModelConfig` has no `qk_norm` flag to read.
-            Option<QkNormsWithIds<R>>,
-            // Exactly one of these is populated, chosen by `cfg.moe`, the same
-            // way the MLA arm above carries its FFN.
-            Option<MlpWeightsWithIds<R>>,
-            Option<MoeWeightsWithIds<R>>,
-            (Tensor<R>, boostr::autograd::TensorId),
-            (Tensor<R>, boostr::autograd::TensorId),
-        )>,
-        device: &R::Device,
-        frozen: &FrozenParams,
-    ) -> Result<Self> {
+    /// Rebuild one layer over `args.weights`, keeping every id.
+    ///
+    /// boostr's `ModelConfig` decides the Mamba, MLA and legacy arms, and a
+    /// weights variant for another arm is an error. A GDN layer is absent
+    /// from `ModelConfig`, so the `Gdn` variant decides that arm itself.
+    fn with_ids(args: BlockWithIds<'_, R>) -> Result<Self>
+    where
+        R::Client: boostr::UnaryOps<R>,
+    {
+        let BlockWithIds {
+            cfg,
+            layer_idx,
+            weights,
+            device,
+            frozen,
+        } = args;
+        if let BlockWeights::Gdn(weights) = weights {
+            let layer = gdn::GdnLayer::with_ids(cfg, *weights, device, frozen, layer_idx)?;
+            return Ok(Self {
+                block_type: BlockType::Gdn(Box::new(layer)),
+            });
+        }
         // The config's value, not a literal: boostr's `ModelConfig` carries
         // `rms_norm_eps`, and hardcoding it here would silently ignore a
         // config that asks for anything else. (Mamba pre-norms deliberately
@@ -2459,13 +2528,14 @@ where
             .and_then(|a| a.kv_latent_dim)
             .is_some();
 
+        let mismatch = |reason: &str| boostr::error::Error::ModelError {
+            reason: format!("Block::with_ids requires {reason} (layer {layer_idx})"),
+        };
         let block_type = if is_mamba && use_mamba3 && use_mamba2 {
-            let (weights, norm_weight, norm_bias) =
-                mamba3.ok_or_else(|| boostr::error::Error::ModelError {
-                    reason:
-                        "Block::with_ids requires Mamba3 weights and pre-norm for a Mamba3 layer"
-                            .into(),
-                })?;
+            let BlockWeights::Mamba3(mamba3) = weights else {
+                return Err(mismatch("Mamba3 weights and pre-norm for a Mamba3 layer"));
+            };
+            let (weights, norm_weight, norm_bias) = *mamba3;
             // boostr's Mamba3 applies one `trainable` flag to every raw
             // parameter it wraps, so the whole group must agree.
             let mut raw = vec![
@@ -2497,10 +2567,10 @@ where
                 )?,
             }
         } else if is_mamba && use_mamba2 {
-            let (weights, norm) = mamba2.ok_or_else(|| boostr::error::Error::ModelError {
-                reason: "Block::with_ids requires Mamba2 weights and pre-norm for a Mamba2 layer"
-                    .into(),
-            })?;
+            let BlockWeights::Mamba2(mamba2) = weights else {
+                return Err(mismatch("Mamba2 weights and pre-norm for a Mamba2 layer"));
+            };
+            let (weights, norm) = *mamba2;
             // boostr's Mamba2 applies one `trainable` flag to every raw
             // parameter it wraps, so the whole group must agree.
             let mut raw = vec![("a_log", weights.a_log.1)];
@@ -2528,10 +2598,10 @@ where
                 )?,
             }
         } else if is_mamba {
-            let (weights, norm) = mamba1.ok_or_else(|| boostr::error::Error::ModelError {
-                reason: "Block::with_ids requires Mamba1 weights and norm for a Mamba1 layer"
-                    .into(),
-            })?;
+            let BlockWeights::Mamba1(mamba1) = weights else {
+                return Err(mismatch("Mamba1 weights and norm for a Mamba1 layer"));
+            };
+            let (weights, norm) = *mamba1;
             // boostr's Mamba1 applies one `trainable` flag to every raw
             // parameter it wraps, so the whole group must agree.
             let mut raw = vec![("a_log", weights.a_log.1)];
@@ -2568,10 +2638,10 @@ where
                 moe,
                 input_layernorm,
                 post_attention_layernorm,
-            ) = attention.ok_or_else(|| boostr::error::Error::ModelError {
-                reason: "Block::with_ids requires MLA attention weights for an attention layer"
-                    .into(),
-            })?;
+            ) = match weights {
+                BlockWeights::Mla(mla) => *mla,
+                _ => return Err(mismatch("MLA attention weights for an attention layer")),
+            };
 
             BlockType::Attention {
                 attn: Box::new(MultiHeadLatentAttention::with_ids(
@@ -2617,10 +2687,10 @@ where
                 moe,
                 input_layernorm,
                 post_attention_layernorm,
-            ) = legacy_attention.ok_or_else(|| boostr::error::Error::ModelError {
-                reason: "Block::with_ids requires legacy attention weights for a legacy layer"
-                    .into(),
-            })?;
+            ) = match weights {
+                BlockWeights::Legacy(legacy) => *legacy,
+                _ => return Err(mismatch("legacy attention weights for a legacy layer")),
+            };
 
             BlockType::LegacyAttention {
                 attn: Box::new(CausalSelfAttention::with_ids(
@@ -2662,7 +2732,8 @@ where
     fn forward<C>(&self, client: &C, x: &boostr::autograd::Var<R>) -> Result<BlockOutput<R>>
     where
         // `BinaryOps` is carried for `CausalSelfAttention::forward`, whose
-        // projections may be LoRA-adapted.
+        // projections may be LoRA-adapted. `GatedDeltaNetOps` is the GDN
+        // mixer's recurrence.
         C: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
@@ -2672,7 +2743,8 @@ where
             + boostr::QuantMatmulOps<R>
             + boostr::RoPEOps<R>
             + boostr::NormalizationOps<R>
-            + boostr::TypeConversionOps<R>,
+            + boostr::TypeConversionOps<R>
+            + boostr::GatedDeltaNetOps<R>,
         R::Client: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
@@ -2681,9 +2753,11 @@ where
             + boostr::ConvOps<R>
             + boostr::FlashAttentionOps<R>
             + boostr::TypeConversionOps<R>
-            + boostr::DequantOps<R>,
+            + boostr::DequantOps<R>
+            + boostr::GatedDeltaNetOps<R>,
     {
         match &self.block_type {
+            BlockType::Gdn(layer) => layer.forward(client, x),
             BlockType::Mamba { block, norm } => {
                 // Mamba1: single layer with normalization and residual
                 let residual = x;
@@ -2844,6 +2918,7 @@ where
                 params.extend(post_attention_layernorm.trainable_parameters());
                 params.extend(ffn.trainable_parameters());
             }
+            BlockType::Gdn(layer) => params.extend(layer.trainable_parameters()),
         }
         params
     }
@@ -3138,8 +3213,11 @@ where
             + boostr::BinaryOps<R>
             + boostr::CompareOps<R>
             + boostr::TensorOps<R>,
+        // A GDN layer's rebuild computes `-exp(A_log)` on the default client.
+        R::Client: boostr::UnaryOps<R>,
     {
         let bcfg = cfg.to_boostr()?;
+        let gdn_config = cfg.gdn_config()?;
         let compute_dtype = cfg.dtype.to_dtype();
         let embed = Self::take_embedding(
             vb.pp("embed_tokens"),
@@ -3171,14 +3249,18 @@ where
 
         let mut layers = Vec::new();
         for i in 0..cfg.num_layers {
+            let opts = BlockOptions {
+                lora: cfg.lora.as_ref(),
+                qk_norm: cfg.qk_norm,
+                gdn: gdn_config.as_ref().filter(|_| cfg.is_gdn_layer(i)),
+            };
             layers.push(Block::new(
                 &bcfg,
                 i,
                 vb.pp(&format!("layers.{}", i)),
                 client,
                 compute_dtype,
-                cfg.lora.as_ref(),
-                cfg.qk_norm,
+                opts,
             )?);
         }
 
@@ -3248,6 +3330,7 @@ where
             + boostr::BinaryOps<R>
             + boostr::CompareOps<R>
             + boostr::TensorOps<R>,
+        R::Client: boostr::UnaryOps<R>,
     {
         let mut vb = VarBuilder::new(varmap, device);
         if let Some(seed) = config.trainer.seed {
@@ -3347,6 +3430,7 @@ where
     /// the whole frozen set under `freeze_base: false`.
     fn adapted_base_ids(&self) -> Result<FrozenParams> {
         let mut frozen = FrozenParams::new();
+        let mut mixer_bases = Vec::new();
         let mut freeze_adapted = |proj: &MaybeLora<R>| -> Result<()> {
             if proj.adapters().is_some() {
                 let weight = proj
@@ -3378,8 +3462,20 @@ where
                         freeze_adapted(proj)?;
                     }
                 }
-                _ => {}
+                // The mixer's projections live inside boostr's `GdnBlock`,
+                // so their base ids come back as a list. The FFN is shared.
+                BlockType::Gdn(layer) => {
+                    mixer_bases.extend(layer.adapted_mixer_base_ids()?);
+                    for proj in Self::ffn_projections(&layer.ffn) {
+                        freeze_adapted(proj)?;
+                    }
+                }
+                // No Mamba projection takes an adapter.
+                BlockType::Mamba { .. } | BlockType::Mamba2 { .. } | BlockType::Mamba3 { .. } => {}
             }
+        }
+        for id in mixer_bases {
+            frozen.freeze(id);
         }
         Ok(frozen)
     }
@@ -3474,7 +3570,10 @@ where
     pub fn rebuild_with_parameters(
         &self,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        R::Client: boostr::UnaryOps<R>,
+    {
         // `self.frozen`, never a fresh set: this is the call the training loop
         // makes every step, and re-deriving trainability here is exactly how a
         // frozen parameter would silently come back trainable.
@@ -3495,7 +3594,10 @@ where
     /// construction. The returned model keeps `frozen`, so every subsequent
     /// `rebuild_with_parameters` honours it too.
     #[allow(dead_code)]
-    pub fn with_frozen_parameters(&self, frozen: FrozenParams) -> Result<Self> {
+    pub fn with_frozen_parameters(&self, frozen: FrozenParams) -> Result<Self>
+    where
+        R::Client: boostr::UnaryOps<R>,
+    {
         // Every currently trainable parameter must appear in the map:
         // `tensor_with_stable_id` treats a missing trainable parameter as the
         // optimizer having lost it, and that check stays in force here.
@@ -3511,7 +3613,10 @@ where
         &self,
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
         frozen: FrozenParams,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        R::Client: boostr::UnaryOps<R>,
+    {
         let device = self.embed_tokens.weight().tensor().device();
         let mut layers = Vec::with_capacity(self.layers.len());
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -3544,7 +3649,8 @@ where
             + boostr::RoPEOps<R>
             + boostr::IndexingOps<R>
             + boostr::NormalizationOps<R>
-            + boostr::TypeConversionOps<R>,
+            + boostr::TypeConversionOps<R>
+            + boostr::GatedDeltaNetOps<R>,
         R::Client: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
@@ -3554,7 +3660,8 @@ where
             + boostr::FlashAttentionOps<R>
             + boostr::IndexingOps<R>
             + boostr::TypeConversionOps<R>
-            + boostr::DequantOps<R>,
+            + boostr::DequantOps<R>
+            + boostr::GatedDeltaNetOps<R>,
     {
         // Token IDs are integer indices, not differentiable inputs. The graph
         // starts at boostr's Embedding output and stays Var-based thereafter.
@@ -3700,13 +3807,27 @@ where
             + boostr::DequantOps<R>,
     {
         let mut merged = 0usize;
-        for layer in &mut self.layers {
+        let lora = self.cfg.lora.as_ref();
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // The dense-attention block and the SwiGLU MLP hold their
             // `MaybeLora` projections directly; a MoE layer holds one per
             // expert and merges them through `MoeLayer::merge_adapters`. MLA
-            // and the SSM blocks carry plain `Linear` fields that never had an
-            // adapter to merge.
+            // and the Mamba blocks carry plain `Linear` fields that never had
+            // an adapter to merge. A GDN mixer merges inside its `GdnBlock`.
             let projections: Vec<&mut MaybeLora<R>> = match &mut layer.block_type {
+                BlockType::Gdn(gdn_layer) => {
+                    merged += gdn_layer.merge_mixer_adapters(client, lora, layer_idx)?;
+                    match &mut gdn_layer.ffn {
+                        FfnLayer::Mlp(mlp) => {
+                            let mlp: &mut Mlp<R> = mlp;
+                            vec![&mut mlp.gate_proj, &mut mlp.up_proj, &mut mlp.down_proj]
+                        }
+                        FfnLayer::Moe(moe) => {
+                            merged += moe.merge_adapters(client)?;
+                            Vec::new()
+                        }
+                    }
+                }
                 BlockType::LegacyAttention { attn, ffn, .. } => {
                     let attn: &mut CausalSelfAttention<R> = attn;
                     let mut projections: Vec<&mut MaybeLora<R>> = vec![
@@ -3742,7 +3863,9 @@ where
                     merged += moe.merge_adapters(client)?;
                     Vec::new()
                 }
-                _ => Vec::new(),
+                BlockType::Mamba { .. } | BlockType::Mamba2 { .. } | BlockType::Mamba3 { .. } => {
+                    Vec::new()
+                }
             };
             for projection in projections {
                 if merge_projection(projection, client)? {
@@ -3819,52 +3942,25 @@ where
         params: &std::collections::HashMap<boostr::autograd::TensorId, Tensor<R>>,
         device: &R::Device,
         frozen: &FrozenParams,
-    ) -> Result<Block<R>> {
+    ) -> Result<Block<R>>
+    where
+        R::Client: boostr::UnaryOps<R>,
+    {
         let bcfg = cfg.to_boostr()?;
-        match &layer.block_type {
-            BlockType::Mamba { block, norm } => Block::with_ids(
-                &bcfg,
-                layer_idx,
-                Some((
-                    Self::mamba1_weights_with_ids(block, params, frozen)?,
-                    Self::tensor_with_stable_id(norm.weight(), params)?,
-                )),
-                None,
-                None,
-                None,
-                None,
-                device,
-                frozen,
-            ),
-            BlockType::Mamba2 { block, norm } => Block::with_ids(
-                &bcfg,
-                layer_idx,
-                None,
-                Some((
-                    Self::mamba2_weights_with_ids(block, params, frozen)?,
-                    Self::tensor_with_stable_id(norm.weight(), params)?,
-                )),
-                None,
-                None,
-                None,
-                device,
-                frozen,
-            ),
-            BlockType::Mamba3 { block, norm } => Block::with_ids(
-                &bcfg,
-                layer_idx,
-                None,
-                None,
-                Some((
-                    Self::mamba3_weights_with_ids(block, params, frozen)?,
-                    Self::tensor_with_stable_id(norm.weight(), params)?,
-                    Self::tensor_with_stable_id(norm.bias(), params)?,
-                )),
-                None,
-                None,
-                device,
-                frozen,
-            ),
+        let weights = match &layer.block_type {
+            BlockType::Mamba { block, norm } => BlockWeights::Mamba1(Box::new((
+                Self::mamba1_weights_with_ids(block, params, frozen)?,
+                Self::tensor_with_stable_id(norm.weight(), params)?,
+            ))),
+            BlockType::Mamba2 { block, norm } => BlockWeights::Mamba2(Box::new((
+                Self::mamba2_weights_with_ids(block, params, frozen)?,
+                Self::tensor_with_stable_id(norm.weight(), params)?,
+            ))),
+            BlockType::Mamba3 { block, norm } => BlockWeights::Mamba3(Box::new((
+                Self::mamba3_weights_with_ids(block, params, frozen)?,
+                Self::tensor_with_stable_id(norm.weight(), params)?,
+                Self::tensor_with_stable_id(norm.bias(), params)?,
+            ))),
             BlockType::Attention {
                 attn,
                 ffn,
@@ -3873,29 +3969,19 @@ where
             } => {
                 let (mlp, moe) = Self::ffn_weights_with_ids(cfg, ffn, params)?;
                 let attn_named = attn.mla.named_parameters();
-                Block::with_ids(
-                    &bcfg,
-                    layer_idx,
-                    None,
-                    None,
-                    None,
-                    Some((
-                        Self::pair_from_named(&attn_named, params, "q_down.weight")?,
-                        Self::pair_from_named(&attn_named, params, "q_up.weight")?,
-                        Self::pair_from_named(&attn_named, params, "q_norm.weight")?,
-                        Self::pair_from_named(&attn_named, params, "kv_compress.weight")?,
-                        Self::pair_from_named(&attn_named, params, "kv_norm.weight")?,
-                        Self::pair_from_named(&attn_named, params, "kv_decompress.weight")?,
-                        Self::pair_from_named(&attn_named, params, "o_proj.weight")?,
-                        mlp,
-                        moe,
-                        Self::tensor_with_stable_id(input_layernorm.weight(), params)?,
-                        Self::tensor_with_stable_id(post_attention_layernorm.weight(), params)?,
-                    )),
-                    None,
-                    device,
-                    frozen,
-                )
+                BlockWeights::Mla(Box::new((
+                    Self::pair_from_named(&attn_named, params, "q_down.weight")?,
+                    Self::pair_from_named(&attn_named, params, "q_up.weight")?,
+                    Self::pair_from_named(&attn_named, params, "q_norm.weight")?,
+                    Self::pair_from_named(&attn_named, params, "kv_compress.weight")?,
+                    Self::pair_from_named(&attn_named, params, "kv_norm.weight")?,
+                    Self::pair_from_named(&attn_named, params, "kv_decompress.weight")?,
+                    Self::pair_from_named(&attn_named, params, "o_proj.weight")?,
+                    mlp,
+                    moe,
+                    Self::tensor_with_stable_id(input_layernorm.weight(), params)?,
+                    Self::tensor_with_stable_id(post_attention_layernorm.weight(), params)?,
+                )))
             }
             BlockType::LegacyAttention {
                 attn,
@@ -3904,31 +3990,31 @@ where
                 post_attention_layernorm,
             } => {
                 let (mlp, moe) = Self::ffn_weights_with_ids(cfg, ffn, params)?;
-                Block::with_ids(
-                    &bcfg,
-                    layer_idx,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some((
-                        Self::attn_proj_with_ids(cfg, "q_proj", &attn.q_proj, params)?,
-                        Self::attn_proj_with_ids(cfg, "k_proj", &attn.k_proj, params)?,
-                        Self::attn_proj_with_ids(cfg, "v_proj", &attn.v_proj, params)?,
-                        Self::attn_proj_with_ids(cfg, "o_proj", &attn.o_proj, params)?,
-                        Self::tensor_with_stable_id(&attn.rope.cos, params)?,
-                        Self::tensor_with_stable_id(&attn.rope.sin, params)?,
-                        Self::qk_norms_with_ids(cfg, attn, params)?,
-                        mlp,
-                        moe,
-                        Self::tensor_with_stable_id(input_layernorm.weight(), params)?,
-                        Self::tensor_with_stable_id(post_attention_layernorm.weight(), params)?,
-                    )),
-                    device,
-                    frozen,
-                )
+                BlockWeights::Legacy(Box::new((
+                    Self::attn_proj_with_ids(cfg, "q_proj", &attn.q_proj, params)?,
+                    Self::attn_proj_with_ids(cfg, "k_proj", &attn.k_proj, params)?,
+                    Self::attn_proj_with_ids(cfg, "v_proj", &attn.v_proj, params)?,
+                    Self::attn_proj_with_ids(cfg, "o_proj", &attn.o_proj, params)?,
+                    Self::tensor_with_stable_id(&attn.rope.cos, params)?,
+                    Self::tensor_with_stable_id(&attn.rope.sin, params)?,
+                    Self::qk_norms_with_ids(cfg, attn, params)?,
+                    mlp,
+                    moe,
+                    Self::tensor_with_stable_id(input_layernorm.weight(), params)?,
+                    Self::tensor_with_stable_id(post_attention_layernorm.weight(), params)?,
+                )))
             }
-        }
+            BlockType::Gdn(gdn_layer) => {
+                BlockWeights::Gdn(Box::new(gdn_layer.snapshot(cfg, params, layer_idx)?))
+            }
+        };
+        Block::with_ids(BlockWithIds {
+            cfg: &bcfg,
+            layer_idx,
+            weights,
+            device,
+            frozen,
+        })
     }
 
     /// The dense block's Q/K norms with their stable ids, or `None` when
@@ -4755,6 +4841,8 @@ where
                 );
                 Self::extend_ffn_named_trainable(params, &prefix, ffn)?;
             }
+            // `layers.N.linear_attn.*` plus the norms and FFN. See `gdn::names`.
+            BlockType::Gdn(gdn_layer) => gdn_layer.extend_named(params, &prefix)?,
         }
         Ok(())
     }
@@ -5198,6 +5286,8 @@ mod tie_word_embeddings_tests {
             mamba3_complex_rope: None,
             mamba3_mimo_rank: None,
             mamba3_use_conv: None,
+            gdn_layers: None,
+            gdn: None,
             vocab_size: 12,
             grow_vocab: false,
             tie_word_embeddings,
@@ -5529,6 +5619,8 @@ mod head_dim_tests {
             mamba3_complex_rope: None,
             mamba3_mimo_rank: None,
             mamba3_use_conv: None,
+            gdn_layers: None,
+            gdn: None,
             vocab_size: 32,
             grow_vocab: false,
             tie_word_embeddings: false,
@@ -5787,6 +5879,8 @@ mod frozen_parameter_tests {
             mamba3_complex_rope: None,
             mamba3_mimo_rank: None,
             mamba3_use_conv: None,
+            gdn_layers: None,
+            gdn: None,
             vocab_size: 12,
             grow_vocab: false,
             tie_word_embeddings: false,
@@ -6070,6 +6164,8 @@ mod lora_tests {
             mamba3_complex_rope: None,
             mamba3_mimo_rank: None,
             mamba3_use_conv: None,
+            gdn_layers: None,
+            gdn: None,
             vocab_size: 12,
             grow_vocab: false,
             tie_word_embeddings: false,
@@ -6813,6 +6909,8 @@ mod lora_freeze_base_tests {
             mamba3_complex_rope: None,
             mamba3_mimo_rank: None,
             mamba3_use_conv: None,
+            gdn_layers: None,
+            gdn: None,
             vocab_size: 12,
             grow_vocab: false,
             // Untied, so `lm_head.weight` is an independent parameter the
@@ -7111,6 +7209,8 @@ mod moe_lora_tests {
             mamba3_complex_rope: None,
             mamba3_mimo_rank: None,
             mamba3_use_conv: None,
+            gdn_layers: None,
+            gdn: None,
             vocab_size: 12,
             grow_vocab: false,
             tie_word_embeddings: false,
@@ -7572,6 +7672,8 @@ mod checkpoint_completeness_tests {
             mamba3_complex_rope: None,
             mamba3_mimo_rank: None,
             mamba3_use_conv: None,
+            gdn_layers: None,
+            gdn: None,
             vocab_size: 12,
             grow_vocab: false,
             tie_word_embeddings: false,
@@ -8199,6 +8301,8 @@ mod legacy_moe_tests {
             mamba3_complex_rope: None,
             mamba3_mimo_rank: None,
             mamba3_use_conv: None,
+            gdn_layers: None,
+            gdn: None,
             vocab_size: 12,
             grow_vocab: false,
             tie_word_embeddings: false,

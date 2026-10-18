@@ -75,6 +75,42 @@ Enable Mixture of Experts:
 | `experts_per_tok` | Experts per token (top-K) | 2 |
 | `shared_expert_enabled` | Enable shared expert | true |
 
+### Gated DeltaNet Parameters
+
+Gated DeltaNet (GDN) is the linear-attention layer of Qwen3.5 and Qwen3-Next. `gdn_layers` picks the GDN layers. Every layer in neither `gdn_layers` nor `mamba_layers` is an attention layer. See [architecture/gdn.md](architecture/gdn.md).
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `gdn_layers` | Layer indexes that are GDN layers | none |
+| `gdn.state_size` | Head width `S` of q, k and v. Each value head keeps an `[S, S]` state | required |
+| `gdn.key_heads` | Query/key heads | required |
+| `gdn.value_heads` | Value heads. Must be a multiple of `gdn.key_heads` | required |
+| `gdn.conv_kernel` | Causal conv width over the qkv projection | 4 |
+| `gdn.chunk_size` | Chunk length of the delta-rule recurrence | 64 |
+| `gdn.rms_eps` | Epsilon of the q/k L2 norm and the gated output norm | 1e-6 |
+
+```yaml
+model:
+  gdn_layers: [0, 1, 2, 4, 5, 6]
+  gdn:
+    state_size: 64
+    key_heads: 2
+    value_heads: 4
+```
+
+Checks, each a config error that names the key:
+
+- `gdn_layers` needs `gdn`, and `gdn` needs a non-empty `gdn_layers`.
+- Each index is below `num_layers`, listed once, and absent from `mamba_layers`.
+- Every `gdn` count is above 0, and `rms_eps` is finite and above 0.
+- `rope_scaling`, `sliding_window` and `qk_norm` need at least one attention layer.
+
+Each GDN layer also holds `input_layernorm`, `post_attention_layernorm` and the FFN: an MLP, or MoE when `num_experts` is set.
+
+LoRA reaches the mixer through `lora.target_modules`: `in_proj_qkv`, `in_proj_z`, `alpha_proj`, `beta_proj` and `out_proj`. A GDN target without `gdn_layers` is a config error. The MLP targets also adapt the GDN layers' MLP.
+
+Both keys are omitted from the hashed config while absent, so existing checkpoints keep their config hash.
+
 ## Trainer Parameters
 
 ### Basic Training

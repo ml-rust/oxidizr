@@ -7,7 +7,8 @@ use boostr::tensor::TensorId;
 use boostr::{CpuClient, CpuDevice, CpuRuntime, DType, Tensor, TypeConversionOps, VarMap};
 use oxidizr::commands::train_data::{run_loaders, TokenSource};
 use oxidizr::config::{
-    DTypePrecision, DistributedConfig, LitConfig, OxidizrModelConfig, TargetDevice, TrainerConfig,
+    DTypePrecision, DistributedConfig, GdnSpec, LitConfig, OxidizrModelConfig, TargetDevice,
+    TrainerConfig,
 };
 use oxidizr::data::{DataPosition, LitDataLoader, RowLayout, RowOrder};
 use oxidizr::eval::{EvalConfig, Evaluator};
@@ -46,6 +47,8 @@ pub fn tiny_model_config(tie_word_embeddings: bool) -> OxidizrModelConfig {
         mamba3_complex_rope: None,
         mamba3_mimo_rank: None,
         mamba3_use_conv: None,
+        gdn_layers: None,
+        gdn: None,
         vocab_size: 24,
         grow_vocab: false,
         tie_word_embeddings,
@@ -58,6 +61,26 @@ pub fn tiny_model_config(tie_word_embeddings: bool) -> OxidizrModelConfig {
         speech_layout: None,
         lora: None,
         dtype: DTypePrecision::F32,
+    }
+}
+
+/// [`tiny_model_config`] with Gated DeltaNet layer 0 and attention layer 1.
+///
+/// Chunks of 4 over 8 tokens run the chunked recurrence with two chunks.
+pub fn tiny_gdn_model_config() -> OxidizrModelConfig {
+    OxidizrModelConfig {
+        name: "gdn-test".to_string(),
+        kv_heads: Some(2),
+        gdn_layers: Some(vec![0]),
+        gdn: Some(GdnSpec {
+            state_size: 4,
+            key_heads: 2,
+            value_heads: 4,
+            conv_kernel: 4,
+            chunk_size: 4,
+            rms_eps: 1e-6,
+        }),
+        ..tiny_model_config(false)
     }
 }
 

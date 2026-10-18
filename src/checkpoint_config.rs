@@ -22,12 +22,44 @@ pub fn checkpoint_config_exists(checkpoint_dir: &str) -> bool {
     config_path(checkpoint_dir).exists()
 }
 
+/// Why `model_config` gets no blazr `config.json`, or `None` when it gets one.
+///
+/// A model with GDN layers gets none. blazr serves GDN through boostr's
+/// `qwen35` model, and that model reads layers oxidizr does not train:
+/// - gated full attention (`q_proj` rows `[query | gate]`) with partial rotary
+/// - the decay as `a_neg_exp`, value heads in the GGUF tiled layout
+///
+/// oxidizr's GDN hybrid trains its own attention block. A `qwen35` config
+/// for it loads the wrong layers, and any other model type has no GDN layer.
+pub fn blazr_export_refusal(model_config: &OxidizrModelConfig) -> Option<String> {
+    model_config.has_gdn_layers().then(|| {
+        "model.gdn_layers is set: blazr cannot load an oxidizr GDN hybrid yet. Its GDN \
+         model (qwen35) expects Qwen3.5 gated attention layers, which oxidizr does not \
+         train. No config.json is written for this checkpoint."
+            .to_string()
+    })
+}
+
 /// Derives boostr's `UniversalConfig` from `model_config` and writes it as
 /// `checkpoint_dir/config.json`.
+///
+/// # Errors
+///
+/// [`blazr_export_refusal`] names the reason for a GDN model. Any
+/// `config.json` already in `checkpoint_dir` is removed first, so no stale
+/// file describes these weights.
 pub fn write_checkpoint_config(
     model_config: &OxidizrModelConfig,
     checkpoint_dir: &str,
 ) -> anyhow::Result<()> {
+    if let Some(reason) = blazr_export_refusal(model_config) {
+        let path = config_path(checkpoint_dir);
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove stale '{}'", path.display()))?;
+        }
+        anyhow::bail!(reason);
+    }
     let universal = model_config
         .to_boostr()
         .context("failed to derive boostr UniversalConfig for checkpoint config.json")?;
@@ -179,6 +211,25 @@ mod tests {
         let model_config = load_model_config("models/g2p-char/g2p-char.yaml");
         write_checkpoint_config(&model_config, dir.to_str().unwrap()).expect("write must succeed");
         assert!(checkpoint_config_exists(dir.to_str().unwrap()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A GDN hybrid gets no config.json, and a stale one leaves the directory.
+    #[test]
+    fn a_gdn_model_writes_no_config_and_removes_a_stale_one() {
+        let dir = scratch_checkpoint_dir("gdn-refusal");
+        std::fs::create_dir_all(&dir).expect("create scratch checkpoint dir");
+        let dense = load_model_config("models/g2p-char/g2p-char.yaml");
+        assert!(blazr_export_refusal(&dense).is_none());
+        write_checkpoint_config(&dense, dir.to_str().unwrap()).expect("dense writes");
+        assert!(checkpoint_config_exists(dir.to_str().unwrap()));
+
+        let gdn = load_model_config("models/nano_gdn_hybrid.yaml");
+        let err = write_checkpoint_config(&gdn, dir.to_str().unwrap())
+            .expect_err("a GDN hybrid must not get a blazr config");
+        assert!(err.to_string().contains("model.gdn_layers"), "{err}");
+        assert!(!checkpoint_config_exists(dir.to_str().unwrap()));
 
         std::fs::remove_dir_all(&dir).ok();
     }

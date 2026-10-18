@@ -14,6 +14,7 @@ Welcome to the Oxidizr documentation. Oxidizr is a production-grade LLM training
 - [Mamba Guide](architecture/mamba.md) - Mamba1, Mamba2, and Mamba3 state space models
 - [MLA Guide](architecture/mla.md) - Multi-Head Latent Attention
 - [MoE Guide](architecture/moe.md) - Mixture of Experts
+- [GDN Guide](architecture/gdn.md) - Gated DeltaNet (Qwen3.5 / Qwen3-Next linear attention)
 
 ## Training
 

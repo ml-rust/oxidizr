@@ -12,6 +12,9 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+mod gdn;
+pub use gdn::GdnSpec;
+
 // Default value functions for serde
 fn default_max_checkpoints() -> usize {
     10
@@ -130,6 +133,20 @@ pub struct OxidizrModelConfig {
     pub mamba3_complex_rope: Option<bool>, // Enable complex-valued RoPE for state tracking
     pub mamba3_mimo_rank: Option<usize>, // MIMO rank (0 = SISO, >0 = MIMO)
     pub mamba3_use_conv: Option<bool>, // Optional conv (default: false, trapezoidal replaces it)
+
+    /// Layers that are Gated DeltaNet (Qwen3.5 / Qwen3-Next linear
+    /// attention) layers. Each index must be below `num_layers` and absent
+    /// from `mamba_layers`. A layer in neither list is an attention layer.
+    /// Every GDN layer takes its shape from [`Self::gdn`].
+    ///
+    /// Omitted from the hashed JSON while absent, so existing checkpoints
+    /// keep their config hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gdn_layers: Option<Vec<usize>>,
+    /// Shape of every layer in [`Self::gdn_layers`]. Required when that
+    /// list is non-empty, and refused without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gdn: Option<GdnSpec>,
 
     pub vocab_size: usize,
     /// Grow a smaller checkpoint's `embed_tokens` / `lm_head` tables to
@@ -257,16 +274,20 @@ pub struct RopeScalingSpec {
 }
 
 /// Projections that can carry a LoRA adapter: the dense attention block, the
-/// SwiGLU MLP that follows it, and every MoE expert's SwiGLU projections.
+/// SwiGLU MLP that follows it, every MoE expert's SwiGLU projections, and
+/// the Gated DeltaNet mixer's projections.
 ///
-/// Everything else (MLA's `q_a_proj`/`kv_b_proj`, the SSM projections) is NOT
+/// Everything else (MLA's `q_a_proj`/`kv_b_proj`, the Mamba projections) is NOT
 /// wrapped, so naming one is rejected rather than silently dropped — a config
 /// asking for seven adapters must never yield four.
 ///
 /// `gate_proj`/`up_proj`/`down_proj` name the MLP projections, and a MoE model
 /// reuses those same names inside every expert (routed and shared alike), so
 /// on a MoE model they adapt each expert instead.
-pub const SUPPORTED_LORA_TARGETS: [&str; 7] = [
+///
+/// `out_proj` names the GDN output projection only. The Mamba `out_proj`
+/// takes no adapter.
+pub const SUPPORTED_LORA_TARGETS: [&str; 12] = [
     "q_proj",
     "k_proj",
     "v_proj",
@@ -274,7 +295,27 @@ pub const SUPPORTED_LORA_TARGETS: [&str; 7] = [
     "gate_proj",
     "up_proj",
     "down_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "alpha_proj",
+    "beta_proj",
+    "out_proj",
 ];
+
+/// The subset of [`SUPPORTED_LORA_TARGETS`] that names a projection of the
+/// Gated DeltaNet mixer (`layers.N.linear_attn.*`). Only a model with
+/// `gdn_layers` carries them. The order is boostr's `GdnBlock` parameter order.
+pub const GDN_LORA_TARGETS: [&str; 5] = [
+    "in_proj_qkv",
+    "in_proj_z",
+    "alpha_proj",
+    "beta_proj",
+    "out_proj",
+];
+
+/// The subset of [`SUPPORTED_LORA_TARGETS`] that names a dense attention
+/// projection. Only a non-MLA attention layer carries them.
+pub const ATTENTION_LORA_TARGETS: [&str; 4] = ["q_proj", "k_proj", "v_proj", "o_proj"];
 
 /// The subset of [`SUPPORTED_LORA_TARGETS`] that names a SwiGLU projection —
 /// the MLP's, and every MoE expert's.
@@ -943,6 +984,8 @@ impl LitConfig {
                 mamba3_complex_rope: None,
                 mamba3_mimo_rank: None,
                 mamba3_use_conv: None,
+                gdn_layers: None,
+                gdn: None,
                 vocab_size: 128354, // Llama 3 + splintr agent tokens
                 grow_vocab: false,
                 tie_word_embeddings: false,
@@ -1040,6 +1083,8 @@ impl LitConfig {
                 mamba3_complex_rope: None,
                 mamba3_mimo_rank: None,
                 mamba3_use_conv: None,
+                gdn_layers: None,
+                gdn: None,
 
                 vocab_size: 128354, // Llama 3 + splintr agent tokens
                 grow_vocab: false,

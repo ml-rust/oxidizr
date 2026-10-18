@@ -149,6 +149,23 @@ model:
   # Layers 3, 7 use MLA + MoE
 ```
 
+### Gated DeltaNet + Attention
+
+Gated DeltaNet (Qwen3.5 / Qwen3-Next linear attention) layers with attention layers:
+
+```yaml
+model:
+  num_layers: 8
+  gdn_layers: [0, 1, 2, 4, 5, 6]  # These use Gated DeltaNet
+  # Layers 3, 7 use attention
+  gdn:
+    state_size: 64
+    key_heads: 2
+    value_heads: 4
+```
+
+`gdn_layers` and `mamba_layers` can share one model. They must not share an index. See [GDN Guide](gdn.md) for details.
+
 ### Pure Architectures
 
 You can also use pure architectures:
@@ -187,6 +204,7 @@ Check the `models/` directory for working examples:
 | `nano_mamba2.yaml` | Mamba2 + MLA | Hybrid architecture |
 | `nano_mamba3.yaml` | Mamba3 | Trapezoidal discretization |
 | `nano_mamba3_hybrid.yaml` | Mamba3 + MLA + MoE | Hybrid architecture |
+| `nano_gdn_hybrid.yaml` | Gated DeltaNet + GQA | Hybrid architecture |
 
 ## Implementation Details
 
@@ -195,6 +213,7 @@ Check the `models/` directory for working examples:
 | File | Component |
 |------|-----------|
 | `src/model.rs` | Transformer, attention, FFN, MoE, and the Mamba1/2/3 blocks over boostr's `Mamba1`/`Mamba2`/`Mamba3` |
+| `src/model/gdn/` | Gated DeltaNet layers over boostr's `GdnBlock` |
 | `src/config.rs` | Config parsing |
 | `src/config_convert.rs` | Conversion to boostr's model config |
 
@@ -211,4 +230,5 @@ Check the `models/` directory for working examples:
 
 3. **Hybrid layers:**
    - `mamba_layers` is a list of layer indices (0-indexed)
+   - `gdn_layers` is a list of layer indices, disjoint from `mamba_layers`
    - Unlisted layers use attention (MLA if configured, else standard)

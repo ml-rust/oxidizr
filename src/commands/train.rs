@@ -142,7 +142,8 @@ where
         + boostr::QuantMatmulOps<R>
         + boostr::RoPEOps<R>
         + boostr::TypeConversionOps<R>
-        + boostr::DequantOps<R>,
+        + boostr::DequantOps<R>
+        + boostr::GatedDeltaNetOps<R>,
 {
     let config = LitConfig::from_yaml(&args.config_file)?;
     let launch = Launch::Group {
@@ -189,7 +190,8 @@ where
         + boostr::QuantMatmulOps<R>
         + boostr::RoPEOps<R>
         + boostr::TypeConversionOps<R>
-        + boostr::DequantOps<R>,
+        + boostr::DequantOps<R>
+        + boostr::GatedDeltaNetOps<R>,
 {
     let run_dir = resolve_run_dir(&args)?;
     let progress = Mutex::new(RunProgress::start(&run_dir, R::name()));
@@ -234,7 +236,8 @@ where
         + boostr::QuantMatmulOps<R>
         + boostr::RoPEOps<R>
         + boostr::TypeConversionOps<R>
-        + boostr::DequantOps<R>,
+        + boostr::DequantOps<R>
+        + boostr::GatedDeltaNetOps<R>,
 {
     let plan = RunPlan::build(args, config, run_dir, launch)?;
     progress

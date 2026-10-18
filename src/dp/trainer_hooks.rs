@@ -123,7 +123,8 @@ where
         + boostr::QuantMatmulOps<R>
         + boostr::RoPEOps<R>
         + boostr::TypeConversionOps<R>
-        + boostr::DequantOps<R>,
+        + boostr::DequantOps<R>
+        + boostr::GatedDeltaNetOps<R>,
 {
     /// Performs one training step (including gradient accumulation)
     /// Returns (loss, grad_norm)

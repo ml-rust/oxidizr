@@ -12,6 +12,7 @@ Example YAML configs for different architectures.
 | `nano_mamba3.yaml` | Pure Mamba3 | All Mamba3 layers |
 | `nano_mamba3_hybrid.yaml` | Hybrid Mamba3 + MLA + MoE | Mamba3 with attention layers |
 | `nano_mamba3_mimo.yaml` | Pure Mamba3 MIMO | Mamba3 with multi-input/output |
+| `nano_gdn_hybrid.yaml` | Hybrid Gated DeltaNet + GQA | Qwen3.5-style linear attention with attention layers |
 
 ## Quick Start
 

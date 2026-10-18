@@ -65,6 +65,7 @@ checkpoints as `.safetensors` files and packages them for distribution.
 | Mamba2 | `mamba_layers`, `mamba2_*` | State Space Duality (SSD) |
 | Mamba3 | `mamba3_enabled: true`, `mamba2_*` | Trapezoidal discretization. Optional `mamba3_complex_rope`, `mamba3_mimo_rank` |
 | MoE (Mixture of Experts) | `num_experts`, `experts_per_tok`, `shared_expert_enabled` | Top-k routing with a load-balance loss |
+| Gated DeltaNet | `gdn_layers`, `gdn` | Qwen3.5 / Qwen3-Next linear attention. Mixes with Mamba and attention layers. blazr cannot serve it yet. Tested on CPU only |
 
 Layers mix within one model. `mamba_layers` lists the SSM layer indices, and every other layer uses attention.
 

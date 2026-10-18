@@ -103,17 +103,24 @@ pub fn print_banner(facts: &BannerFacts<'_>) {
 
     println!("📋 Configuration:");
     let num_mamba = config.model.mamba_layers.as_ref().map_or(0, Vec::len);
-    let num_attention = config.model.num_layers - num_mamba;
+    let num_gdn = config.model.gdn_layers.as_ref().map_or(0, Vec::len);
+    let num_attention = config.model.num_layers.saturating_sub(num_mamba + num_gdn);
     let mamba_type = if config.model.mamba2_num_heads.is_some() {
         "Mamba2"
     } else {
         "Mamba"
     };
+    let gdn_part = if num_gdn > 0 {
+        format!(" + {num_gdn} GDN")
+    } else {
+        String::new()
+    };
     println!(
-        "  Model: {} parameters ({} {} + {} MLA+MoE layers)",
+        "  Model: {} parameters ({} {}{} + {} MLA+MoE layers)",
         estimate_params(&config.model),
         num_mamba,
         mamba_type,
+        gdn_part,
         num_attention
     );
     println!("  Dataset: {} tokens", facts.dataset_size);

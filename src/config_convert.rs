@@ -8,7 +8,8 @@
 //! to boostr once instead of hand-ported into every oxidizr consumer.
 
 use crate::config::{
-    OxidizrModelConfig, RopeScalingSpec, SpeechLayoutSpec, MLP_LORA_TARGETS, SUPPORTED_LORA_TARGETS,
+    OxidizrModelConfig, RopeScalingSpec, SpeechLayoutSpec, GDN_LORA_TARGETS, MLP_LORA_TARGETS,
+    SUPPORTED_LORA_TARGETS,
 };
 use crate::prelude::Result;
 use boostr::error::Error;
@@ -22,6 +23,8 @@ use boostr::model::config::{
 /// hard-errors on anything else, deep inside model construction). Rejected
 /// here instead, at config-conversion time.
 const SUPPORTED_ROPE_SCALING_TYPES: [&str; 3] = ["linear", "llama3", "yarn"];
+
+mod gdn;
 
 fn model_error(reason: impl Into<String>) -> Error {
     Error::ModelError {
@@ -190,20 +193,21 @@ fn validate_lora(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Result<()> {
     // attention target under kv_latent_dim would yield no adapter at all. The
     // SwiGLU targets DO reach an MLA model — its FFN is an ordinary MLP, or a
     // MoE whose experts are adapted per projection — so they stay accepted.
+    // The GDN targets reach the GDN layers of an MLA hybrid, so they stay
+    // accepted too. `gdn::validate_gdn_roles` checks that GDN layers exist.
     if cfg.kv_latent_dim.is_some() {
-        if let Some(target) = lora
-            .target_modules
-            .iter()
-            .find(|target| !MLP_LORA_TARGETS.contains(&target.as_str()))
-        {
+        if let Some(target) = lora.target_modules.iter().find(|target| {
+            !MLP_LORA_TARGETS.contains(&target.as_str())
+                && !GDN_LORA_TARGETS.contains(&target.as_str())
+        }) {
             return Err(model_error(format!(
                 "lora.target_modules names {target:?} while kv_latent_dim is set, which \
                  selects the MLA attention path (q_a_proj / q_b_proj / \
                  kv_a_proj_with_mqa / kv_b_proj). LoRA adapters are wired to the dense \
                  q_proj/k_proj/v_proj/o_proj path only, so no adapter would be created \
                  for {target:?}. Remove {target:?} from lora.target_modules (the \
-                 gate_proj/up_proj/down_proj targets still work), or remove \
-                 kv_latent_dim."
+                 gate_proj/up_proj/down_proj targets and the GDN targets still work), \
+                 or remove kv_latent_dim."
             )));
         }
     }
@@ -415,12 +419,14 @@ impl OxidizrModelConfig {
     /// a required boostr field has no oxidizr source.
     pub fn to_boostr(&self) -> Result<ModelConfig> {
         let ssm_layers = checked_mamba_layers(self)?;
+        let gdn_layers = gdn::checked_gdn_layers(self, &ssm_layers)?;
         let shape = layer_shape(&ssm_layers, self.num_layers);
         let has_mamba = !ssm_layers.is_empty();
         let mamba3 = self.mamba3_enabled.unwrap_or(false);
         validate_attention_extras(self, &shape)?;
         validate_speech_layout(self)?;
         validate_lora(self, &shape)?;
+        gdn::validate_gdn_roles(self, &ssm_layers, &gdn_layers)?;
 
         let moe = to_moe(self)?;
         let intermediate_size = if moe.is_some() {
@@ -449,6 +455,8 @@ impl OxidizrModelConfig {
             // have no boostr equivalent.
             vision: None,
             audio: None,
+            // GDN layers stay out of boostr's config: `hybrid_layers` names
+            // one SSM kind per model. See the `gdn` module.
             gdn: None,
             qwen35_attention: None,
             hadamard: None,

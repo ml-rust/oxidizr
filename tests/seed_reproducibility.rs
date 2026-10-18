@@ -39,6 +39,8 @@ fn tiny_model_config() -> OxidizrModelConfig {
         mamba3_complex_rope: None,
         mamba3_mimo_rank: None,
         mamba3_use_conv: None,
+        gdn_layers: None,
+        gdn: None,
         vocab_size: 24,
         grow_vocab: false,
         tie_word_embeddings: false,
