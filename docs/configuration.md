@@ -282,6 +282,32 @@ trainer:
     action: skip
 ```
 
+### Activation Checkpointing
+
+`trainer.activation_checkpointing` trades compute for memory. A covered layer keeps only its input during the forward pass. The backward pass runs the layer again to rebuild its activations.
+
+| Value | Layers that recompute |
+|-------|-----------------------|
+| `none` | None. The default |
+| `all` | Every layer |
+| `{layers: [0, 3, 5]}` | The listed layer indices |
+
+Rules:
+
+- On CPU, the loss, every gradient and the MoE auxiliary and z-losses stay bit-identical to `none`. Tests cover this. Bitwise equality on CUDA is unconfirmed.
+- Peak memory and step time change.
+- Each covered layer runs its forward pass twice per step. MFU counts model FLOPs only, so the recompute lowers MFU.
+- `layers` must be non-empty, each index below `model.num_layers`, and no index listed twice. Each error names the index, `model.num_layers` and the key `trainer.activation_checkpointing.layers`.
+- The key stays out of the model hash and the checkpoint meta. A resume can change it.
+- Every data-parallel rank uses the same value. Evals never recompute: their forward pass keeps no graph.
+- Every layer type supports it: Mamba1, Mamba2, Mamba3, MLA, GQA, Gated DeltaNet, with an MLP or MoE FFN, LoRA included.
+
+```yaml
+trainer:
+  activation_checkpointing: all
+  # or: activation_checkpointing: {layers: [0, 1, 2, 3]}
+```
+
 ### Learning Rate Schedule
 
 Warmup runs first. Step `s` of `W` warmup steps applies `learning_rate * (s + 1) / W`, at least `1e-7`. The schedule covers every later step up to the run's last step `T`. `T` is `max_steps`, capped by the steps in `num_epochs` epochs.

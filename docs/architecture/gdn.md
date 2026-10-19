@@ -51,7 +51,7 @@ Each training forward starts from a zero conv window and a zero state. One seque
 
 An MoE GDN layer adds its load-balance and z losses to the step loss, as an MoE attention layer does.
 
-Activation checkpointing: boostr provides `GdnBlock::forward_train_checkpointed`, which gives the same values bit for bit. oxidizr has no trainer flag for it yet, so every GDN layer runs `forward_train`. The hook is `GdnLayer::forward` in `src/model/gdn/layer.rs`.
+Activation checkpointing: `trainer.activation_checkpointing` runs a covered GDN layer as one recompute segment, as it does every other layer. On CPU the values stay bit-identical. CUDA bitwise equality is unconfirmed. See [Activation Checkpointing](../configuration.md#activation-checkpointing).
 
 ## Checkpoint Layout
 

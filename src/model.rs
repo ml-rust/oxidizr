@@ -1,6 +1,6 @@
 use crate::prelude::{DType, Embedding, Init, Linear, Result, RmsNorm, Tensor, VarBuilder, VarMap};
 
-use crate::config::{LoraConfig, OxidizrModelConfig};
+use crate::config::{ActivationCheckpointing, LoraConfig, OxidizrModelConfig};
 use boostr::model::config::{default_rms_norm_eps, ModelConfig};
 use boostr::tensor::TensorId;
 // `cast` is a TypeConversionOps method; the trait must be in scope to call it.
@@ -8,6 +8,7 @@ use boostr::TypeConversionOps;
 use std::collections::HashMap;
 
 mod gdn;
+mod recompute;
 
 /// A weight tensor paired with the stable parameter id it was registered
 /// under. Used throughout the `*_weights_with_ids`/`with_ids` rebuild path
@@ -2122,18 +2123,20 @@ where
         match self {
             FfnLayer::Mlp(mlp) => {
                 let out = mlp.forward(client, x)?;
-                let load_balance_loss = boostr::autograd::Var::new(
-                    Tensor::<R>::zeros(&[1], DType::F32, x.tensor().device())?,
-                    false,
-                );
-                let z_loss = boostr::autograd::Var::new(
-                    Tensor::<R>::zeros(&[1], DType::F32, x.tensor().device())?,
-                    false,
-                );
+                let load_balance_loss = Self::zero_loss(x.tensor().device())?;
+                let z_loss = Self::zero_loss(x.tensor().device())?;
                 Ok((out, load_balance_loss, z_loss))
             }
             FfnLayer::Moe(moe) => moe.forward(client, x),
         }
+    }
+
+    /// The constant zero a dense MLP reports for each auxiliary loss.
+    fn zero_loss(device: &R::Device) -> Result<boostr::autograd::Var<R>> {
+        Ok(boostr::autograd::Var::new(
+            Tensor::<R>::zeros(&[1], DType::F32, device)?,
+            false,
+        ))
     }
 
     fn trainable_parameters(&self) -> Vec<(boostr::autograd::TensorId, &boostr::autograd::Var<R>)> {
@@ -3635,10 +3638,9 @@ where
         )
     }
 
+    /// [`LitGPT::forward_with`] with every layer keeping its activations.
     pub fn forward<C>(&self, client: &C, input_ids: &Tensor<R>) -> Result<ModelOutput<R>>
     where
-        // `BinaryOps` is carried for LoRA-adapted attention projections; see
-        // `CausalSelfAttention::forward`.
         C: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
@@ -3650,7 +3652,53 @@ where
             + boostr::IndexingOps<R>
             + boostr::NormalizationOps<R>
             + boostr::TypeConversionOps<R>
+            + boostr::GatedDeltaNetOps<R>
+            + 'static,
+        R::Client: boostr::RuntimeClient<R>
+            + boostr::TensorOps<R>
+            + boostr::ScalarOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::CompareOps<R>
+            + boostr::ConvOps<R>
+            + boostr::FlashAttentionOps<R>
+            + boostr::IndexingOps<R>
+            + boostr::TypeConversionOps<R>
+            + boostr::DequantOps<R>
             + boostr::GatedDeltaNetOps<R>,
+    {
+        self.forward_with(client, input_ids, &ActivationCheckpointing::None)
+    }
+
+    /// The forward pass. Each layer `checkpointing` covers recomputes its
+    /// activations in the backward pass. CPU tests check bit-identical outputs and
+    /// gradients. CUDA bitwise equality is unconfirmed.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the embedding, each layer, the final norm and `lm_head`.
+    pub fn forward_with<C>(
+        &self,
+        client: &C,
+        input_ids: &Tensor<R>,
+        checkpointing: &ActivationCheckpointing,
+    ) -> Result<ModelOutput<R>>
+    where
+        // `BinaryOps` is carried for LoRA-adapted attention projections; see
+        // `CausalSelfAttention::forward`. `'static` lets a checkpointed layer
+        // keep the client for its recompute.
+        C: boostr::RuntimeClient<R>
+            + boostr::TensorOps<R>
+            + boostr::ScalarOps<R>
+            + boostr::BinaryOps<R>
+            + boostr::CompareOps<R>
+            + boostr::ConvOps<R>
+            + boostr::QuantMatmulOps<R>
+            + boostr::RoPEOps<R>
+            + boostr::IndexingOps<R>
+            + boostr::NormalizationOps<R>
+            + boostr::TypeConversionOps<R>
+            + boostr::GatedDeltaNetOps<R>
+            + 'static,
         R::Client: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
@@ -3739,7 +3787,11 @@ where
         let mut z_losses = Vec::new();
 
         for (i, layer) in self.layers.iter().enumerate() {
-            let output = layer.forward(client, &x)?;
+            let output = if checkpointing.covers(i) {
+                layer.forward_checkpointed(client, &x, i)?
+            } else {
+                layer.forward(client, &x)?
+            };
             x = boostr::nn::var_contiguous(&output.hidden)?; // Force contiguous after each layer
 
             // Debug: check for NaN after each layer

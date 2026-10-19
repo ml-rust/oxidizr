@@ -8,7 +8,8 @@
 
 use boostr::{CpuClient, CpuDevice, CpuRuntime, VarMap};
 use oxidizr::config::{
-    DTypePrecision, DistributedConfig, LitConfig, OxidizrModelConfig, TargetDevice, TrainerConfig,
+    ActivationCheckpointing, DTypePrecision, DistributedConfig, LitConfig, OxidizrModelConfig,
+    TargetDevice, TrainerConfig,
 };
 use oxidizr::model::LitGPT;
 
@@ -95,6 +96,7 @@ fn trainer_config(seed: Option<u64>) -> TrainerConfig {
         eval: None,
         metrics: None,
         spike_guard: None,
+        activation_checkpointing: ActivationCheckpointing::None,
     }
 }
 

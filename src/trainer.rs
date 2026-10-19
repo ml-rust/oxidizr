@@ -266,9 +266,10 @@ where
             let scored = batch.scored;
 
             // Forward pass (returns logits + auxiliary losses + z-losses).
+            // Layers under `activation_checkpointing` recompute in backward.
             let fwd_start = if profile { Some(Instant::now()) } else { None };
             let output = oom_guard(Pass::Forward, self.batch_size, || {
-                step_model.forward(&self.client, &input)
+                step_model.forward_with(&self.client, &input, &self.config.activation_checkpointing)
             })?;
             if let Some(start) = fwd_start {
                 eprintln!(

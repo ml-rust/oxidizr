@@ -13,7 +13,9 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+mod activation_checkpointing;
 mod gdn;
+pub use activation_checkpointing::ActivationCheckpointing;
 pub use gdn::GdnSpec;
 
 // Default value functions for serde
@@ -815,6 +817,12 @@ pub struct TrainerConfig {
     /// off and the run trains bit-identical to a run without the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spike_guard: Option<SpikeGuardConfig>,
+
+    /// Layers that recompute their activations in the backward pass. See
+    /// [`ActivationCheckpointing`]. Recompute leaves the model unchanged, so the key is
+    /// outside the model config hash and the checkpoint meta.
+    #[serde(default, skip_serializing_if = "ActivationCheckpointing::is_none")]
+    pub activation_checkpointing: ActivationCheckpointing,
     // Unknown keys are ignored, as serde does for every config struct here.
     // Older configs carry `group_size` and `beta_kl`, which no trainer reads.
 }
@@ -885,6 +893,9 @@ impl LitConfig {
             eval.validate()?;
         }
         self.trainer.metrics.unwrap_or_default().check()?;
+        self.trainer
+            .activation_checkpointing
+            .check(self.model.num_layers)?;
         if let Some(guard) = &self.trainer.spike_guard {
             guard.check()?;
         }
@@ -1053,6 +1064,7 @@ impl LitConfig {
                 eval: None,
                 metrics: None,
                 spike_guard: None,
+                activation_checkpointing: ActivationCheckpointing::None,
             },
         }
     }
@@ -1155,6 +1167,7 @@ impl LitConfig {
                 eval: None,
                 metrics: None,
                 spike_guard: None,
+                activation_checkpointing: ActivationCheckpointing::None,
             },
         }
     }

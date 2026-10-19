@@ -16,8 +16,8 @@ use boostr::{
 };
 use oxidizr::commands::train_data::{run_loaders, TokenSource};
 use oxidizr::config::{
-    DTypePrecision, DistributedConfig, GdnSpec, LitConfig, OxidizrModelConfig, TargetDevice,
-    TrainerConfig,
+    ActivationCheckpointing, DTypePrecision, DistributedConfig, GdnSpec, LitConfig,
+    OxidizrModelConfig, TargetDevice, TrainerConfig,
 };
 use oxidizr::data::{DataPosition, LitDataLoader, RowLayout, RowOrder};
 use oxidizr::eval::{EvalConfig, Evaluator};
@@ -185,6 +185,7 @@ pub fn tiny_config(checkpoint_dir: &Path, max_steps: usize) -> LitConfig {
             eval: None,
             metrics: None,
             spike_guard: None,
+            activation_checkpointing: ActivationCheckpointing::None,
         },
     }
 }

@@ -209,10 +209,9 @@ where
     /// `norm -> mixer -> + x -> norm -> ffn -> + residual`.
     ///
     /// The mixer runs `GdnBlock::forward_train`. Each call starts from a
-    /// zero conv window and a zero recurrent state. Activation
-    /// checkpointing hook: oxidizr has no trainer flag for it yet. Once it
-    /// does, this call becomes `GdnBlock::forward_train_checkpointed`, which
-    /// gives the same values bit for bit.
+    /// zero conv window and a zero recurrent state. Under
+    /// `trainer.activation_checkpointing`, `Block::forward_checkpointed` runs
+    /// this whole call as one recompute segment.
     ///
     /// A dense MLP reports no auxiliary loss, as on the attention layers.
     ///
@@ -254,6 +253,16 @@ where
             aux_loss,
             z_loss,
         })
+    }
+
+    /// The same layer over the same parameters, each `TensorId` and flag kept.
+    pub(in crate::model) fn alias(&self) -> Self {
+        Self {
+            block: self.block.alias(),
+            input_layernorm: self.input_layernorm.alias(),
+            ffn: self.ffn.alias(),
+            post_attention_layernorm: self.post_attention_layernorm.alias(),
+        }
     }
 
     /// Trainable parameters in `named_parameters` order.
@@ -473,6 +482,34 @@ mod tests {
         let got = layer.forward(&client, &x).expect("layer forward");
         assert_eq!(bits(got.hidden.tensor()), bits(want.tensor()));
         assert!(got.aux_loss.is_none() && got.z_loss.is_none());
+    }
+
+    /// The alias keeps every id and flag, frozen LoRA bases included, and
+    /// gives the same output bits.
+    #[test]
+    fn the_alias_keeps_every_id_flag_and_output() {
+        let (device, client) = setup();
+        let model = build(&cfg(Some(lora(true))), 0x6d07);
+        let layer = gdn_layer(&model);
+        let alias = layer.alias();
+        let flags = |l: &GdnLayer<CpuRuntime>| -> Vec<(TensorId, bool)> {
+            l.block
+                .named_parameters()
+                .into_iter()
+                .map(|(_, var)| (var.id(), var.requires_grad()))
+                .chain(
+                    l.trainable_parameters()
+                        .into_iter()
+                        .map(|(id, var)| (id, var.requires_grad())),
+                )
+                .collect()
+        };
+        assert_eq!(flags(&alias), flags(layer));
+        assert!(flags(layer).iter().any(|(_, trains)| !trains));
+        let x = input(&device);
+        let got = alias.forward(&client, &x).expect("alias forward");
+        let want = layer.forward(&client, &x).expect("layer forward");
+        assert_eq!(bits(got.hidden.tensor()), bits(want.hidden.tensor()));
     }
 
     /// The per-step rebuild keeps every id, name and output.
