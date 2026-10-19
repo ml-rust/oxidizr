@@ -78,6 +78,9 @@ where
     /// Target mask rule. `Some` turns on masked loss scoring (audio-only for
     /// speech, continuation-only for prefix-LM).
     pub(super) target_mask: Option<TargetMask>,
+    /// The document separator. `Some` turns on document segments and the
+    /// separator loss mask, see [`super::host_masks`].
+    pub(super) document_mask: Option<u32>,
 }
 
 impl<R> LitDataLoader<R>
@@ -109,6 +112,7 @@ where
             order: EpochOrder::new(RowOrder::Stream),
             mixture: None,
             target_mask: None,
+            document_mask: None,
         }
     }
 

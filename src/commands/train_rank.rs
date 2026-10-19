@@ -63,6 +63,7 @@ where
         + boostr::CompareOps<R>
         + boostr::ConvOps<R>
         + boostr::FlashAttentionOps<R>
+        + boostr::ops::VarLenAttentionOps<R>
         + boostr::IndexingOps<R>
         + boostr::NormalizationOps<R>
         + boostr::QuantMatmulOps<R>
@@ -142,6 +143,7 @@ where
     } else {
         RowOrder::Stream
     };
+    let document_mask = train.document_mask_record();
     let mut loader = train.with_row_order(row_order);
     if slot.world > 1 {
         loader = loader.with_rank(slot.rank, slot.world)?;
@@ -225,6 +227,7 @@ where
             data_files: plan.data_files.clone(),
             weight_decay: plan.weight_decay.clone(),
             mixture,
+            document_mask,
         },
     )?;
     if slot.world > 1 {

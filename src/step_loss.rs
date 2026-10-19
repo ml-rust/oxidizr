@@ -282,6 +282,7 @@ mod tests {
             targets: ids,
             loss_mask,
             scored,
+            segments: None,
         }
     }
 

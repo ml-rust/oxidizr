@@ -266,6 +266,40 @@ for text in examples:
 np.array(all_tokens, dtype="<u4").tofile("data.bin")
 ```
 
+### Document Boundaries
+
+A row holds several documents back to back. Without `trainer.document_mask`, attention crosses them, as in standard packed LM training. With it, the separator id delimits documents. See [Document Masking](../configuration.md#document-masking) for the key.
+
+Segment rules, over the input tokens of each row:
+
+- A document ends at its separator. The separator belongs to the document it ends.
+- Every row start begins a new document. A row never continues the document of the row before it.
+- Two separators in a row make a one-token document.
+- A row without a separator is one document.
+
+Each token attends only to earlier tokens of its own document. RoPE needs no position reset: rotated scores depend only on the distance between two tokens.
+
+Loss rule:
+
+- A position whose input is the separator is unscored. Its target is the first token of the next document.
+- The document mask combines with `trainer.target_mask` or `model.speech_layout` by AND.
+- The scored count drops the separator positions. Step weighting uses it, see [loss weighting](../configuration.md#loss-weighting-under-gradient-accumulation).
+
+Example, `seq_len` 8, separator `S`:
+
+```text
+inputs:    a0 a1 a2 S  b0 b1 b2 b3
+documents: 0  0  0  0  1  1  1  1
+scored:    1  1  1  0  1  1  1  1
+```
+
+Limits:
+
+- Attention layers only. Mamba and Gated DeltaNet layers are refused.
+- No `model.sliding_window`.
+- On CUDA a GQA model needs head dim 64, 128 or 256, and f32 or f16.
+- An MLA model needs `model.dtype: f32`.
+
 ## Vocab Size
 
 Your config's `vocab_size` must match or exceed your tokenizer's vocabulary:

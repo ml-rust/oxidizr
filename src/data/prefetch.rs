@@ -2,7 +2,7 @@
 
 use super::batch::{Batch, DataLoader};
 use super::construction::LitDataLoader;
-use super::mask::{build_target_mask, scored_count};
+use super::segments::HostSegments;
 use crate::prelude::{DType, Error, Result, Tensor};
 use boostr::runtime::Runtime;
 use std::path::Path;
@@ -23,6 +23,8 @@ struct PrefetchedBatch {
     loss_mask: Option<Vec<f32>>,
     /// Positions the loss scores, see [`Batch::scored`]
     scored: usize,
+    /// Document segments, `None` when the document mask is off
+    segments: Option<HostSegments>,
     /// Batch dimensions
     batch_size: usize,
     seq_len: usize,
@@ -134,14 +136,7 @@ where
     fn prefetch_one(loader: &mut LitDataLoader<R>) -> Result<PrefetchedBatch> {
         let (batch_size, seq_len) = (loader.batch_size, loader.seq_len);
         let window = loader.next_window()?;
-
-        let loss_mask = loader
-            .target_mask
-            .as_ref()
-            .map(|mask| build_target_mask(mask, &window, batch_size, seq_len));
-        let scored = loss_mask
-            .as_deref()
-            .map_or(batch_size * seq_len, scored_count);
+        let masks = loader.host_masks(&window)?;
 
         let mut inputs = Vec::with_capacity(batch_size * seq_len);
         let mut targets = Vec::with_capacity(batch_size * seq_len);
@@ -153,8 +148,9 @@ where
         Ok(PrefetchedBatch {
             inputs,
             targets,
-            loss_mask,
-            scored,
+            loss_mask: masks.loss_mask,
+            scored: masks.scored,
+            segments: masks.segments,
             batch_size,
             seq_len,
         })
@@ -200,12 +196,17 @@ where
             )?),
             None => None,
         };
+        let segments = match &batch.segments {
+            Some(segments) => Some(segments.upload::<R>(&self.device)?),
+            None => None,
+        };
 
         Ok(Batch {
             inputs,
             targets,
             loss_mask,
             scored: batch.scored,
+            segments,
         })
     }
 

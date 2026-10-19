@@ -128,7 +128,7 @@ Both keys are omitted from the hashed config while absent, so existing checkpoin
 
 A run without a loss mask takes the mean loss of each micro-batch and scales it by `1 / gradient_accumulation`.
 
-A masked run (`trainer.target_mask` or `model.speech_layout`) weights every scored token of the step equally:
+A masked run (`trainer.target_mask`, `model.speech_layout` or `trainer.document_mask`) weights every scored token of the step equally:
 
 - The trainer draws all `gradient_accumulation` micro-batches of the step before the first forward pass.
 - Each loader counts the scored positions from its host copy of the mask. No device read is needed.
@@ -363,6 +363,42 @@ trainer:
   activation_checkpointing: all
   # or: activation_checkpointing: {layers: [0, 1, 2, 3]}
 ```
+
+### Document Masking
+
+`trainer.document_mask` stops attention and loss at document boundaries inside a packed row. [Document Boundaries](data/format.md#document-boundaries) gives the segment and loss rules.
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `separator_id` | The id that ends every document | The `separator_id` of the data's `.tokens.json` sidecar |
+
+```yaml
+trainer:
+  document_mask: {}                  # separator from the data sidecar
+  # or: document_mask: {separator_id: 100257}
+```
+
+Separator rules:
+
+- An unset `separator_id` comes from the first sidecar of the training files and `trainer.eval.data_file`.
+- Every sidecar present must agree with `separator_id` and with each other. The error names both sources and both ids.
+- No `separator_id` and no sidecar is an error naming `trainer.document_mask.separator_id`.
+- Unknown keys under `document_mask` are an error.
+
+Model limits. Each is an error naming the keys:
+
+- Attention layers only. A layer in `model.mamba_layers` or `model.gdn_layers` is refused: its recurrent state carries across documents. The error names the layer index.
+- `model.sliding_window` is refused. Varlen attention has no window.
+- An MLA model needs `model.dtype: f32`. Its mask is an F32 bias on the attention scores.
+- A GQA model on CUDA needs a head dim of 64, 128 or 256, and `model.dtype` f32 or f16. The error names the head dim. The CLI checks this once the target device is final.
+
+Checkpoint and run rules:
+
+- The checkpoint meta records `document_mask: {separator_id}`. A meta without the key is a run without the mask.
+- A resume that adds, removes or changes the mask warns. Under `--headless` it is an error.
+- Evals use the same mask as training.
+- Every data-parallel rank masks its own rows. Each row starts a new document, so ranks need no shared state.
+- Recompute under `activation_checkpointing` stays bit-identical on CPU.
 
 ### Learning Rate Schedule
 

@@ -6,7 +6,7 @@
 
 use super::names::NameMaps;
 use super::optimizer_io::stage_optimizer_state;
-use crate::config::{CheckpointMeta, OxidizrModelConfig};
+use crate::config::{CheckpointMeta, DocumentMaskRecord, OxidizrModelConfig};
 use crate::data::{DataPosition, DataSourceRecord, MixtureRecord};
 use crate::eval::EvalCheckpoint;
 use crate::metrics::SpikeGuardState;
@@ -207,6 +207,8 @@ pub struct SnapshotInput<'a, R: Runtime<DType = DType>> {
     pub spike_guard: Option<SpikeGuardState>,
     /// The weighted data mixture of the run. `None` without weights.
     pub mixture: Option<&'a MixtureRecord>,
+    /// The document mask of the run. `None` without `trainer.document_mask`.
+    pub document_mask: Option<DocumentMaskRecord>,
     /// Host copies of the frozen parameters.
     pub frozen: &'a FrozenCache,
 }
@@ -257,6 +259,7 @@ where
     meta.global_batch_rows = Some(input.global_batch_rows);
     meta.spike_guard = input.spike_guard;
     meta.mixture = input.mixture.cloned();
+    meta.document_mask = input.document_mask;
 
     Ok(SetSnapshot::from_parts(
         input.dir.to_path_buf(),

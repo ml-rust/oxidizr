@@ -1,10 +1,11 @@
 //! Token-stream data loading: row layout, data-parallel ranks, loss masks,
-//! the synchronous and prefetching loaders, data sources and their weighted
-//! mixtures, and the `.tokens.json` sidecar.
+//! document segments, the synchronous and prefetching loaders, data sources
+//! and their weighted mixtures, and the `.tokens.json` sidecar.
 
 mod batch;
 mod construction;
 mod data_config;
+mod host_masks;
 mod mask;
 mod mixture;
 mod multi_source;
@@ -13,6 +14,7 @@ mod prefetch;
 mod ranks;
 mod row_ranges;
 mod rows;
+mod segments;
 mod source;
 mod source_record;
 mod token_meta;
@@ -24,6 +26,7 @@ pub use mask::TargetMask;
 pub use mixture::{check_mixture_resume, MixtureRecord, MixtureSource};
 pub use prefetch::{create_prefetch_loader, PrefetchDataLoader};
 pub use rows::{DataPosition, RowLayout, RowOrder};
+pub use segments::BatchSegments;
 pub use source_record::{
     check_meta_sources, set_meta_sources, source_records, DataCheck, DataSourceRecord,
 };

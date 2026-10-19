@@ -17,8 +17,17 @@ use std::io::Write;
 use std::path::Path;
 
 mod activation_checkpointing;
+mod document_mask;
+mod document_mask_source;
 mod gdn;
 pub use activation_checkpointing::ActivationCheckpointing;
+pub use document_mask::{
+    check_document_mask_cuda, check_document_mask_model, describe_document_mask,
+    DocumentMaskConfig, DocumentMaskRecord, CUDA_VARLEN_HEAD_DIMS,
+};
+pub use document_mask_source::{
+    check_document_mask_resume, document_mask_files, resolve_run_separator, resolve_separator,
+};
 pub use gdn::GdnSpec;
 
 // Default value functions for serde
@@ -839,6 +848,13 @@ pub struct TrainerConfig {
     /// outside the model config hash and the checkpoint meta.
     #[serde(default, skip_serializing_if = "ActivationCheckpointing::is_none")]
     pub activation_checkpointing: ActivationCheckpointing,
+
+    /// Attention and loss that stop at document boundaries. See [`DocumentMaskConfig`].
+    ///
+    /// Absent, attention crosses documents inside a row. The checkpoint meta
+    /// records the resolved separator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_mask: Option<DocumentMaskConfig>,
     // Unknown keys are ignored, as serde does for every config struct here.
     // Older configs carry `group_size` and `beta_kl`, which no trainer reads.
 }
@@ -921,6 +937,7 @@ impl LitConfig {
         if let Some(guard) = &self.trainer.spike_guard {
             guard.check()?;
         }
+        check_document_mask_model(self)?;
 
         // Mamba2 constraint: hidden_size * expand == num_heads * head_dim
         if let (Some(num_heads), Some(head_dim), Some(expand)) = (
@@ -1089,6 +1106,7 @@ impl LitConfig {
                 metrics: None,
                 spike_guard: None,
                 activation_checkpointing: ActivationCheckpointing::None,
+                document_mask: None,
             },
         }
     }
@@ -1194,6 +1212,7 @@ impl LitConfig {
                 metrics: None,
                 spike_guard: None,
                 activation_checkpointing: ActivationCheckpointing::None,
+                document_mask: None,
             },
         }
     }
@@ -1277,6 +1296,10 @@ pub struct CheckpointMeta {
     /// `data_position` counts. Absent for a run without weights.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixture: Option<MixtureRecord>,
+    /// The document mask of the run. A resume with another mask warns, and
+    /// under `--headless` it is an error. Absent for a run without a mask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_mask: Option<DocumentMaskRecord>,
 }
 
 fn default_dtype_string() -> String {
@@ -1342,6 +1365,7 @@ impl CheckpointMeta {
             global_batch_rows: None,
             spike_guard: None,
             mixture: None,
+            document_mask: None,
         };
         set_meta_sources(&mut meta, data_sources);
         meta

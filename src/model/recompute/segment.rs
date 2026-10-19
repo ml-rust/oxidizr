@@ -4,6 +4,7 @@
 //! [`Block::forward`] again on an alias of the block. The alias keeps every
 //! `TensorId`, so the gradients land on the model's own parameters.
 
+use crate::data::BatchSegments;
 use crate::model::{Block, BlockOutput, BlockType, FfnLayer};
 use crate::prelude::{DType, Error, Result};
 use boostr::autograd::{checkpoint_many_with_client, checkpoint_with_client, Var};
@@ -46,6 +47,9 @@ where
     /// runs the layer again. On CPU the result equals the plain forward bit for
     /// bit, auxiliary losses included. CUDA agrees within a relative 1e-5.
     ///
+    /// `segments` are plain data, not segment inputs. The closure keeps a
+    /// shared handle to them, so the recompute masks the same documents.
+    ///
     /// # Errors
     ///
     /// The errors of [`Block::forward`], prefixed `checkpointed layer {layer_idx}`.
@@ -54,6 +58,7 @@ where
         client: &C,
         x: &Var<R>,
         layer_idx: usize,
+        segments: Option<&BatchSegments<R>>,
     ) -> Result<BlockOutput<R>>
     where
         C: boostr::RuntimeClient<R>
@@ -75,6 +80,7 @@ where
             + boostr::CompareOps<R>
             + boostr::ConvOps<R>
             + boostr::FlashAttentionOps<R>
+            + boostr::ops::VarLenAttentionOps<R>
             + boostr::TypeConversionOps<R>
             + boostr::DequantOps<R>
             + boostr::GatedDeltaNetOps<R>,
@@ -83,12 +89,14 @@ where
         let mut inputs: Vec<&Var<R>> = vec![x];
         inputs.extend(params.iter().map(|p| p.1).filter(|var| var.requires_grad()));
         let owned = self.alias();
+        // `BatchSegments` clones share one `Arc`, so the closure holds no copy.
+        let segments = segments.cloned();
         match self.aux_losses() {
             AuxLosses::Routed => {
                 let outputs = checkpoint_many_with_client(
                     move |xs: &[Var<R>], c: &C| {
                         let out = owned
-                            .forward(c, first(xs, layer_idx)?)
+                            .forward(c, first(xs, layer_idx)?, segments.as_ref())
                             .map_err(|e| segment_error(layer_idx, e))?;
                         match (out.aux_loss, out.z_loss) {
                             (Some(aux), Some(z)) => Ok(vec![out.hidden, aux, z]),
@@ -121,7 +129,7 @@ where
                 let hidden = checkpoint_with_client(
                     move |xs: &[Var<R>], c: &C| {
                         owned
-                            .forward(c, first(xs, layer_idx)?)
+                            .forward(c, first(xs, layer_idx)?, segments.as_ref())
                             .map(|out| out.hidden)
                             .map_err(|e| segment_error(layer_idx, e))
                     },
@@ -166,6 +174,7 @@ fn segment_error(layer_idx: usize, e: Error) -> NumrError {
 mod tests {
     use super::super::fixtures::{self, Model, BATCH, SEQ};
     use crate::config::{ActivationCheckpointing, OxidizrModelConfig};
+    use crate::data::BatchSegments;
     use crate::prelude::Tensor;
     use boostr::autograd::{
         backward, backward_wrt, var_add, var_mul, var_mul_scalar, var_reshape, var_sum, Var,
@@ -219,9 +228,20 @@ mod tests {
     }
 
     fn run(model: &Model, policy: &ActivationCheckpointing) -> Outcome {
-        let (device, client) = fixtures::setup();
+        let (device, _) = fixtures::setup();
+        run_on(model, policy, &fixtures::token_ids(&device), None)
+    }
+
+    /// [`run`] over `ids`, with the document `segments` when given.
+    fn run_on(
+        model: &Model,
+        policy: &ActivationCheckpointing,
+        ids: &Tensor<CpuRuntime>,
+        segments: Option<&BatchSegments<CpuRuntime>>,
+    ) -> Outcome {
+        let (_, client) = fixtures::setup();
         let out = model
-            .forward_with(&client, &fixtures::token_ids(&device), policy)
+            .forward_with(&client, ids, policy, segments)
             .expect("forward");
         assert_eq!(out.logits.shape()[..2], [BATCH, SEQ]);
         let loss = loss(&client, &out);
@@ -338,6 +358,57 @@ mod tests {
         assert_all_matches_plain(&fixtures::gdn_moe(), "gdn+moe");
     }
 
+    /// Under a document mask every attention arm recomputes bit for bit,
+    /// and the mask changes the logits.
+    #[test]
+    fn document_masked_recompute_is_bitwise() {
+        let (device, _) = fixtures::setup();
+        let (ids, segments) = fixtures::segmented_batch(&device);
+        let arms = [
+            (fixtures::legacy_mlp(), "legacy+mlp"),
+            (fixtures::legacy_moe(), "legacy+moe"),
+            (fixtures::mla_mlp(), "mla+mlp"),
+            (fixtures::mla_moe(), "mla+moe"),
+        ];
+        for (cfg, label) in arms {
+            let model = fixtures::build(&cfg);
+            let plain = run_on(
+                &model,
+                &ActivationCheckpointing::None,
+                &ids,
+                Some(&segments),
+            );
+            let recomputed = run_on(&model, &ActivationCheckpointing::All, &ids, Some(&segments));
+            assert_bitwise(&plain, &recomputed, label);
+            let unmasked = run_on(&model, &ActivationCheckpointing::None, &ids, None);
+            assert_ne!(
+                plain.logits, unmasked.logits,
+                "{label}: the mask changed nothing"
+            );
+        }
+    }
+
+    /// A recurrent arm refuses document segments instead of crossing documents.
+    #[test]
+    fn a_mamba_layer_refuses_segments() {
+        let (device, client) = fixtures::setup();
+        let (ids, segments) = fixtures::segmented_batch(&device);
+        let model = fixtures::build(&fixtures::mamba2());
+        let Err(e) = model.forward_with(
+            &client,
+            &ids,
+            &ActivationCheckpointing::None,
+            Some(&segments),
+        ) else {
+            panic!("a Mamba layer must refuse document segments");
+        };
+        assert!(
+            e.to_string()
+                .contains("Mamba layer cannot take document segments"),
+            "{e}"
+        );
+    }
+
     /// `{layers: [1]}` on three layers checkpoints the middle layer alone.
     #[test]
     fn one_listed_layer_of_three_is_bitwise() {
@@ -362,6 +433,7 @@ mod tests {
                 &client,
                 &fixtures::token_ids(&device),
                 &ActivationCheckpointing::All,
+                None,
             )
             .expect("forward");
         // The trainer asks backward for the trainable ids alone. This test asks the same.

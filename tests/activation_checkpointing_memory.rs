@@ -108,7 +108,9 @@ fn peak_bytes(num_layers: usize, policy: &ActivationCheckpointing) -> usize {
 
     let start = window_start();
     {
-        let out = model.forward_with(&client, &ids, policy).expect("forward");
+        let out = model
+            .forward_with(&client, &ids, policy, None)
+            .expect("forward");
         let logits = &out.logits;
         let flat = var_reshape(logits, &[logits.tensor().numel()]).expect("flatten");
         let loss = var_sum(&flat, &[0], false, &client).expect("sum");

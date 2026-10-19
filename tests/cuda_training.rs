@@ -8,6 +8,8 @@
 //! - A bit-identical interrupt and resume on CUDA, when two uninterrupted CUDA
 //!   runs already agree bit for bit.
 //! - f16 with dynamic loss scaling, and bf16: overflow steps skip, losses stay finite.
+//! - `trainer.document_mask` on a dense GQA model with head dim 64, the
+//!   varlen kernel's smallest: finite losses, and the first loss within 1e-4 of CPU.
 //!
 //! The CPU and CUDA runs start from one CPU-built weight file, because the
 //! seeded draws of the two backends differ.
@@ -42,8 +44,8 @@ use boostr::{
     CpuClient, CpuDevice, CpuRuntime, CudaClient, CudaDevice, CudaRuntime, DType, Runtime,
 };
 use common::{
-    build_model, build_model_on, scratch_dir, tiny_config, tiny_model_config, tokens,
-    train_parts_on, trainer_on, values_by_name_on, TrainClient,
+    build_model, build_model_on, document_masked, scratch_dir, tiny_config, tiny_model_config,
+    tokens, train_parts_on, trainer_on, values_by_name_on, TrainClient,
 };
 use oxidizr::checkpoint_set::{plan_optimizer_resume, OptimizerResume};
 use oxidizr::config::{
@@ -99,6 +101,8 @@ enum Stream {
     Shuffled,
     /// One row over and over, so every step scores the same batch.
     Repeated,
+    /// [`Stream::Shuffled`] under the document mask of the config.
+    Documents,
 }
 
 /// GDN layer 0 and attention layer 1, with attention head dim 32.
@@ -148,6 +152,26 @@ where
             let all = row.iter().cycle().take(row_len * 256).copied().collect();
             LitDataLoader::<R>::new(all, batch, seq, device)
         }
+        Stream::Documents => {
+            let separator = cfg
+                .trainer
+                .document_mask
+                .and_then(|m| m.separator_id)
+                .expect("the config sets a separator");
+            loader_on::<R>(cfg, Stream::Shuffled, device).with_document_mask(separator)
+        }
+    }
+}
+
+/// A dense GQA model with attention head dim 64, inside the varlen kernel's head dims.
+fn cuda_gqa_model_config() -> OxidizrModelConfig {
+    OxidizrModelConfig {
+        name: "gqa-cuda-test".to_string(),
+        hidden_size: 128,
+        num_heads: 2,
+        kv_heads: Some(1),
+        intermediate_size: Some(128),
+        ..tiny_model_config(false)
     }
 }
 
@@ -403,6 +427,37 @@ fn cuda_loss_falls_on_a_repeated_row() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// Bound between the first CUDA and CPU step losses under the document mask.
+const DOC_LOSS_RTOL: f64 = 1e-4;
+
+/// A head_dim 64 GQA model under the document mask trains through the CUDA
+/// varlen kernel. Every loss stays finite, and the first matches CPU.
+#[test]
+fn cuda_document_mask_matches_cpu() {
+    let Some((_guard, client, device)) = cuda() else {
+        return;
+    };
+    let dir = scratch_dir("cuda-document-mask");
+    let mut cfg = document_masked(gdn_config(&dir));
+    cfg.model = cuda_gqa_model_config();
+    let init = write_init(&cfg, &dir);
+    let stream = Stream::Documents;
+    let want = fresh::<CpuRuntime>(&cfg, Some(&init), stream, cpu(), STEPS, None);
+    let got = fresh::<CudaRuntime>(&cfg, Some(&init), stream, (client, device), STEPS, None);
+    assert_run_finite("cpu", &want);
+    assert_run_finite("cuda", &got);
+    for (step, (g, w)) in got.losses.iter().zip(&want.losses).enumerate() {
+        let rtol = if step == 0 { DOC_LOSS_RTOL } else { LOSS_RTOL };
+        assert!(
+            (g - w).abs() <= rtol * w.abs(),
+            "step {}: CUDA loss {g} vs CPU loss {w}",
+            step + 1
+        );
+    }
+    assert_values_close("cuda vs cpu", &got.values, &want.values, PARAM_RTOL);
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// Bit equality needs a deterministic CUDA step. Two uninterrupted runs
 /// check that first, and the resume check is skipped when they differ.
 #[test]
@@ -482,7 +537,7 @@ fn loss_and_grads(
     let ids = Tensor::<CudaRuntime>::from_slice(&ids, &[batch, seq], device)
         .map_err(|e| format!("token ids: {e}"))?;
     let out = model
-        .forward_with(client, &ids, policy)
+        .forward_with(client, &ids, policy, None)
         .map_err(|e| format!("forward: {e}"))?;
 
     let logits = out.logits.tensor();

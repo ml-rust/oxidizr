@@ -6,7 +6,10 @@ use crate::commands::train_data::TokenSource;
 use crate::commands::train_overrides::apply_cli_overrides;
 use crate::commands::train_resume::{resolve_resume, ResumePoint};
 use crate::commands::TrainArgs;
-use crate::config::{DTypePrecision, LitConfig};
+use crate::config::{
+    check_document_mask_cuda, check_document_mask_model, check_document_mask_resume,
+    resolve_run_separator, DTypePrecision, LitConfig,
+};
 use crate::data::resolve_data_files;
 use crate::distributed::{
     check_gpu_ids, check_sync_backend, parse_gpu_ids, reject_duplicate_gpus, BuildSupport,
@@ -98,6 +101,7 @@ impl RunPlan {
         if !headless {
             println!("Configuration loaded successfully!\n");
         }
+        resolve_document_mask(&mut config, &data_files, launch)?;
 
         let resume = resolve_resume(args.resume.as_deref(), &config, &data_files, headless)?;
         let (start_step, meta) = (resume.start_step, resume.meta_path.as_deref());
@@ -113,6 +117,8 @@ impl RunPlan {
         let spike_guard_state = read_spike_guard_state(meta, start_step)?;
         let weight_decay =
             resolve_weight_decay(&config.trainer, inherited_decay.as_ref(), headless)?;
+        let document_mask = config.trainer.document_mask.and_then(|m| m.record());
+        check_document_mask_resume(meta, start_step, document_mask, headless)?;
 
         if !headless {
             match data_files.as_slice() {
@@ -142,6 +148,27 @@ impl RunPlan {
             source,
         })
     }
+}
+
+/// Checks `trainer.document_mask` against the final config and fills in its separator.
+///
+/// `--dtype` can change the dtype after `LitConfig::validate`, so the model
+/// check runs again. A CLI launch on CUDA also checks the varlen kernel's limits.
+/// The resolved separator goes into the config, so the run record shows it.
+fn resolve_document_mask(
+    config: &mut LitConfig,
+    data_files: &[String],
+    launch: Launch,
+) -> Result<()> {
+    check_document_mask_model(config)?;
+    if launch == (Launch::Cli { uses_cpu: false }) {
+        check_document_mask_cuda(config)?;
+    }
+    let separator = resolve_run_separator(config, data_files)?;
+    if let (Some(mask), Some(id)) = (config.trainer.document_mask.as_mut(), separator) {
+        mask.separator_id = Some(id);
+    }
+    Ok(())
 }
 
 /// The GPU id list and world size of a run, after every check.

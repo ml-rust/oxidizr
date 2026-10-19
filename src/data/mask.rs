@@ -57,12 +57,12 @@ impl TargetMask {
 /// boundary index per row. A row can also start mid-sequence when the data
 /// was not packed to row boundaries; that is harmless here because scoring
 /// depends only on each target id's own value (`is_scored`), never on its
-/// position within a sequence. The loader performs no document-boundary
-/// attention masking, so attention crosses sequence boundaries inside a row
-/// the same way standard packed LM training corpora do.
+/// position within a sequence. Without `trainer.document_mask`, attention
+/// crosses sequence boundaries inside a row, as in standard packed LM
+/// training. [`super::host_masks`] adds the document mask.
 ///
-/// Shared by `LitDataLoader::next_batch` and `PrefetchDataLoader::prefetch_worker`
-/// so the two shift paths cannot diverge.
+/// Both loaders call it through `LitDataLoader::host_masks`, so the two
+/// shift paths cannot diverge.
 pub(super) fn build_target_mask(
     mask: &TargetMask,
     window: &[u32],

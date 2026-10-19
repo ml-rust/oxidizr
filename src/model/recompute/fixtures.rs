@@ -4,6 +4,7 @@
 //! 8 tokens and a 12-token vocab, so a CPU forward and backward stay small.
 
 use crate::config::{GdnSpec, LitConfig, LoraConfig, OxidizrModelConfig};
+use crate::data::{BatchSegments, LitDataLoader};
 use crate::model::LitGPT;
 use crate::prelude::{Tensor, VarBuilder, VarMap};
 use boostr::{CpuClient, CpuDevice, CpuRuntime};
@@ -147,4 +148,24 @@ pub(super) fn token_ids(device: &CpuDevice) -> Tensor<CpuRuntime> {
         .map(|i| ((i * 5 + i / 3) % VOCAB) as i64)
         .collect();
     Tensor::<CpuRuntime>::from_slice(&ids, &[BATCH, SEQ], device).expect("token ids")
+}
+
+/// Document separator of [`segmented_batch`]. Input 4 of each row holds it.
+const SEPARATOR: u32 = 9;
+
+/// `[BATCH, SEQ]` input ids and their document segments, built by the data loader.
+///
+/// Each row splits into two documents after its separator.
+pub(super) fn segmented_batch(
+    device: &CpuDevice,
+) -> (Tensor<CpuRuntime>, BatchSegments<CpuRuntime>) {
+    let tokens: Vec<u32> = (0..BATCH * (SEQ + 1))
+        .map(|i| ((i * 5 + i / 3) % VOCAB) as u32)
+        .collect();
+    let batch = LitDataLoader::<CpuRuntime>::new(tokens, BATCH, SEQ, device.clone())
+        .with_document_mask(SEPARATOR)
+        .next_batch()
+        .expect("segmented batch");
+    let segments = batch.segments.expect("the document mask is on");
+    (batch.inputs, segments)
 }

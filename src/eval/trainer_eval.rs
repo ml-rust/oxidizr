@@ -25,6 +25,7 @@ where
         + boostr::CompareOps<R>
         + boostr::ConvOps<R>
         + boostr::FlashAttentionOps<R>
+        + boostr::ops::VarLenAttentionOps<R>
         + boostr::IndexingOps<R>
         + boostr::NormalizationOps<R>
         + boostr::QuantMatmulOps<R>

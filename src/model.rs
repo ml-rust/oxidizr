@@ -1,6 +1,7 @@
 use crate::prelude::{DType, Embedding, Init, Linear, Result, RmsNorm, Tensor, VarBuilder, VarMap};
 
 use crate::config::{ActivationCheckpointing, LoraConfig, OxidizrModelConfig};
+use crate::data::BatchSegments;
 use boostr::model::config::{default_rms_norm_eps, ModelConfig};
 use boostr::tensor::TensorId;
 // `cast` is a TypeConversionOps method; the trait must be in scope to call it.
@@ -9,6 +10,7 @@ use std::collections::HashMap;
 
 mod gdn;
 mod recompute;
+mod segments;
 
 /// A weight tensor paired with the stable parameter id it was registered
 /// under. Used throughout the `*_weights_with_ids`/`with_ids` rebuild path
@@ -317,21 +319,24 @@ where
         Ok(Self { mla })
     }
 
+    /// `segment_ids`: `[B, S]` I32 document ids. `Some` keeps attention inside each document.
     fn forward<C>(
         &self,
         client: &C,
         x: &boostr::autograd::Var<R>,
+        segment_ids: Option<&Tensor<R>>,
     ) -> Result<boostr::autograd::Var<R>>
     where
         C: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
             + boostr::ScalarOps<R>
+            + boostr::CompareOps<R>
             + boostr::QuantMatmulOps<R>
             + boostr::RoPEOps<R>
             + boostr::TypeConversionOps<R>,
         R::Client: boostr::TensorOps<R> + boostr::ScalarOps<R> + boostr::DequantOps<R>,
     {
-        self.mla.forward(client, x)
+        self.mla.forward_with_segments(client, x, segment_ids)
     }
 
     fn trainable_parameters(&self) -> Vec<(boostr::autograd::TensorId, &boostr::autograd::Var<R>)> {
@@ -914,10 +919,13 @@ where
         })
     }
 
+    /// `segments`: document segments over the flattened `B * S` tokens.
+    /// `Some` runs varlen attention, causal inside each document.
     fn forward<C>(
         &self,
         client: &C,
         x: &boostr::autograd::Var<R>,
+        segments: Option<&boostr::ops::PackedSegments<R>>,
     ) -> Result<boostr::autograd::Var<R>>
     where
         // `BinaryOps`/`ScalarOps` are `LoraLinear::forward`'s bounds: a
@@ -933,6 +941,7 @@ where
             + boostr::TypeConversionOps<R>
             + boostr::QuantMatmulOps<R>,
         R::Client: boostr::FlashAttentionOps<R>
+            + boostr::ops::VarLenAttentionOps<R>
             + boostr::TensorOps<R>
             + boostr::BinaryOps<R>
             + boostr::ScalarOps<R>
@@ -981,6 +990,7 @@ where
             Some(&self.rope.cos),
             Some(&self.rope.sin),
             &spec,
+            segments,
         )?;
 
         self.o_proj.forward(client, &output)
@@ -2732,7 +2742,15 @@ where
         Ok(Self { block_type })
     }
 
-    fn forward<C>(&self, client: &C, x: &boostr::autograd::Var<R>) -> Result<BlockOutput<R>>
+    /// `segments`: the batch's document segments. The attention arms keep
+    /// attention inside each document. A Mamba or GDN arm refuses them: its
+    /// recurrent state crosses documents.
+    fn forward<C>(
+        &self,
+        client: &C,
+        x: &boostr::autograd::Var<R>,
+        segments: Option<&BatchSegments<R>>,
+    ) -> Result<BlockOutput<R>>
     where
         // `BinaryOps` is carried for `CausalSelfAttention::forward`, whose
         // projections may be LoRA-adapted. `GatedDeltaNetOps` is the GDN
@@ -2755,10 +2773,14 @@ where
             + boostr::CompareOps<R>
             + boostr::ConvOps<R>
             + boostr::FlashAttentionOps<R>
+            + boostr::ops::VarLenAttentionOps<R>
             + boostr::TypeConversionOps<R>
             + boostr::DequantOps<R>
             + boostr::GatedDeltaNetOps<R>,
     {
+        if segments.is_some() {
+            self.check_segments_supported()?;
+        }
         match &self.block_type {
             BlockType::Gdn(layer) => layer.forward(client, x),
             BlockType::Mamba { block, norm } => {
@@ -2819,7 +2841,7 @@ where
                 let x = input_layernorm.forward(client, x)?;
                 LitGPT::check_nan(x.tensor(), "attn_input_norm")?;
 
-                let x = attn.forward(client, &x)?;
+                let x = attn.forward(client, &x, segments.map(BatchSegments::segment_ids))?;
                 LitGPT::check_nan(x.tensor(), "attn_output")?;
 
                 let x = boostr::autograd::var_add(&x, residual, client)
@@ -2856,7 +2878,7 @@ where
                 // Legacy GQA + MLP or MoE (original nano)
                 let residual = x;
                 let x = input_layernorm.forward(client, x)?;
-                let x = attn.forward(client, &x)?;
+                let x = attn.forward(client, &x, segments.map(BatchSegments::packed))?;
                 let x = boostr::autograd::var_add(&x, residual, client)
                     .map_err(boostr::error::Error::Numr)?;
 
@@ -3638,7 +3660,7 @@ where
         )
     }
 
-    /// [`LitGPT::forward_with`] with every layer keeping its activations.
+    /// [`LitGPT::forward_with`] with every layer keeping its activations, and no document segments.
     pub fn forward<C>(&self, client: &C, input_ids: &Tensor<R>) -> Result<ModelOutput<R>>
     where
         C: boostr::RuntimeClient<R>
@@ -3661,26 +3683,33 @@ where
             + boostr::CompareOps<R>
             + boostr::ConvOps<R>
             + boostr::FlashAttentionOps<R>
+            + boostr::ops::VarLenAttentionOps<R>
             + boostr::IndexingOps<R>
             + boostr::TypeConversionOps<R>
             + boostr::DequantOps<R>
             + boostr::GatedDeltaNetOps<R>,
     {
-        self.forward_with(client, input_ids, &ActivationCheckpointing::None)
+        self.forward_with(client, input_ids, &ActivationCheckpointing::None, None)
     }
 
     /// The forward pass. Each layer `checkpointing` covers recomputes its
     /// activations in the backward pass. CPU tests check bit-identical outputs and
     /// gradients. CUDA agrees within a relative 1e-5.
     ///
+    /// `segments`: the batch's document segments, from
+    /// [`Batch::segments`](crate::data::Batch::segments). `Some` keeps every
+    /// attention layer inside each document. `None` attends across the whole row.
+    ///
     /// # Errors
     ///
     /// The errors of the embedding, each layer, the final norm and `lm_head`.
+    /// A Mamba or GDN layer given `segments` is an error.
     pub fn forward_with<C>(
         &self,
         client: &C,
         input_ids: &Tensor<R>,
         checkpointing: &ActivationCheckpointing,
+        segments: Option<&BatchSegments<R>>,
     ) -> Result<ModelOutput<R>>
     where
         // `BinaryOps` is carried for LoRA-adapted attention projections; see
@@ -3706,6 +3735,7 @@ where
             + boostr::CompareOps<R>
             + boostr::ConvOps<R>
             + boostr::FlashAttentionOps<R>
+            + boostr::ops::VarLenAttentionOps<R>
             + boostr::IndexingOps<R>
             + boostr::TypeConversionOps<R>
             + boostr::DequantOps<R>
@@ -3788,9 +3818,9 @@ where
 
         for (i, layer) in self.layers.iter().enumerate() {
             let output = if checkpointing.covers(i) {
-                layer.forward_checkpointed(client, &x, i)?
+                layer.forward_checkpointed(client, &x, i, segments)?
             } else {
-                layer.forward(client, &x)?
+                layer.forward(client, &x, segments)?
             };
             x = boostr::nn::var_contiguous(&output.hidden)?; // Force contiguous after each layer
 

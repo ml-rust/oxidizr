@@ -2,7 +2,7 @@ use crate::checkpoint_set::{
     apply_optimizer_resume, commit_set, remove_old_checkpoints, snapshot_set, CheckpointLabel,
     FrozenCache, NameMaps, OptimizerResume, SetSnapshot, SnapshotInput,
 };
-use crate::config::{OxidizrModelConfig, TrainerConfig};
+use crate::config::{DocumentMaskRecord, OxidizrModelConfig, TrainerConfig};
 use crate::data::{
     source_records, DataLoader, DataPosition, DataSourceRecord, MixtureRecord, RowLayout,
 };
@@ -54,6 +54,10 @@ pub struct TrainerRunConfig {
     /// [`mixture_record`](crate::data::LitDataLoader::mixture_record). Every
     /// checkpoint meta records it. `None` without weights.
     pub mixture: Option<MixtureRecord>,
+    /// The loader's document mask, from
+    /// [`document_mask_record`](crate::data::LitDataLoader::document_mask_record).
+    /// Every checkpoint meta records it. `None` without `trainer.document_mask`.
+    pub document_mask: Option<DocumentMaskRecord>,
 }
 
 /// The "LitGPT" style Trainer abstraction.
@@ -91,6 +95,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     data_sources: Vec<DataSourceRecord>,
     /// The weighted data mixture every checkpoint meta records.
     mixture: Option<MixtureRecord>,
+    /// The document mask every checkpoint meta records.
+    document_mask: Option<DocumentMaskRecord>,
     /// Host copies of the frozen parameters, shared by every checkpoint snapshot.
     frozen_host: FrozenCache,
     /// The background checkpoint writer and the checkpoint outcomes not yet reported.
@@ -127,6 +133,7 @@ where
         + boostr::CompareOps<R>
         + boostr::ConvOps<R>
         + boostr::FlashAttentionOps<R>
+        + boostr::ops::VarLenAttentionOps<R>
         + boostr::IndexingOps<R>
         + boostr::NormalizationOps<R>
         + boostr::QuantMatmulOps<R>
@@ -155,6 +162,7 @@ where
             data_files,
             weight_decay,
             mixture,
+            document_mask,
         } = run;
 
         config.distributed.validate()?;
@@ -215,6 +223,7 @@ where
             model_config,
             data_sources,
             mixture,
+            document_mask,
             frozen_host: FrozenCache::default(),
             checkpoints: CheckpointQueue::default(),
             lr_plan,
@@ -291,13 +300,19 @@ where
         // at a time
         for batch in batches {
             let (input, target, loss_mask) = (batch.inputs, batch.targets, batch.loss_mask);
-            let scored = batch.scored;
+            let (scored, segments) = (batch.scored, batch.segments);
 
             // Forward pass (returns logits + auxiliary losses + z-losses).
             // Layers under `activation_checkpointing` recompute in backward.
+            // `segments` keep attention inside each document under `trainer.document_mask`.
             let fwd_start = if profile { Some(Instant::now()) } else { None };
             let output = oom_guard(Pass::Forward, self.batch_size, || {
-                step_model.forward_with(&self.client, &input, &self.config.activation_checkpointing)
+                step_model.forward_with(
+                    &self.client,
+                    &input,
+                    &self.config.activation_checkpointing,
+                    segments.as_ref(),
+                )
             })?;
             if let Some(start) = fwd_start {
                 eprintln!(
@@ -859,6 +874,7 @@ where
             global_batch_rows: self.row_layout.batch_size(),
             spike_guard: self.metrics.spike_state(),
             mixture: self.mixture.as_ref(),
+            document_mask: self.document_mask,
             frozen: &self.frozen_host,
         })
     }

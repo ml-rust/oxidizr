@@ -1,5 +1,6 @@
 //! One eval pass: the forward-only cross-entropy over the eval batches.
 
+use crate::config::ActivationCheckpointing;
 use crate::data::{DataPosition, LitDataLoader};
 use crate::model::LitGPT;
 use crate::prelude::{DType, Error, Result, Tensor};
@@ -60,6 +61,7 @@ where
         + boostr::CompareOps<R>
         + boostr::ConvOps<R>
         + boostr::FlashAttentionOps<R>
+        + boostr::ops::VarLenAttentionOps<R>
         + boostr::IndexingOps<R>
         + boostr::NormalizationOps<R>
         + boostr::QuantMatmulOps<R>
@@ -82,7 +84,14 @@ where
             if batch.scored == 0 {
                 continue;
             }
-            let output = eval_model.forward(client, &batch.inputs)?;
+            // The eval loader shares the training builder, so its segments
+            // mask documents exactly as training does.
+            let output = eval_model.forward_with(
+                client,
+                &batch.inputs,
+                &ActivationCheckpointing::None,
+                batch.segments.as_ref(),
+            )?;
             let (b, s, v) = output.logits.tensor().dims3()?;
             let logits = var_reshape(&output.logits, &[b * s, v])?;
             let targets = batch.targets.reshape(&[b * s])?;

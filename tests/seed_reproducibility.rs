@@ -99,6 +99,7 @@ fn trainer_config(seed: Option<u64>) -> TrainerConfig {
         metrics: None,
         spike_guard: None,
         activation_checkpointing: ActivationCheckpointing::None,
+        document_mask: None,
     }
 }
 

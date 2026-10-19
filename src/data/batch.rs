@@ -2,11 +2,12 @@
 //! and building its loss mask.
 
 use super::construction::LitDataLoader;
-use super::mask::{build_target_mask, scored_count};
+use super::segments::BatchSegments;
 use crate::prelude::{DType, Result, Tensor};
 use boostr::runtime::Runtime;
 
-/// One training batch: inputs, next-token targets, and an optional loss mask.
+/// One training batch: inputs, next-token targets, an optional loss mask and
+/// optional document segments.
 pub struct Batch<R: Runtime<DType = DType>> {
     /// Token ids `[batch_size, seq_len]`, I64.
     pub inputs: Tensor<R>,
@@ -19,6 +20,9 @@ pub struct Batch<R: Runtime<DType = DType>> {
     /// Number of positions the loss scores, counted from the host copy of
     /// `loss_mask`. `batch_size * seq_len` when masking is off.
     pub scored: usize,
+    /// Document segments of the inputs. `Some` exactly when the loader's
+    /// document mask is on. The forward pass keeps attention inside each segment.
+    pub segments: Option<BatchSegments<R>>,
 }
 
 /// Common interface for all data loaders
@@ -64,24 +68,28 @@ where
         let inputs = raw_tensor.narrow(1, 0, self.seq_len)?.contiguous()?;
         let targets = raw_tensor.narrow(1, 1, self.seq_len)?.contiguous()?;
 
-        // Built from the same `window`, over the post-shift target window, so it
-        // lines up element-for-element with `targets` above.
-        let (loss_mask, scored) = match &self.target_mask {
-            Some(target_mask) => {
-                let mask = build_target_mask(target_mask, &window, self.batch_size, self.seq_len);
-                let scored = scored_count(&mask);
-                let tensor =
-                    Tensor::<R>::from_slice(&mask, &[self.batch_size, self.seq_len], &self.device)?;
-                (Some(tensor), scored)
-            }
-            None => (None, self.batch_size * self.seq_len),
+        // Built from the same `window` as `inputs` and `targets`, by the
+        // builder the prefetch loader shares, so the two loaders agree.
+        let masks = self.host_masks(&window)?;
+        let loss_mask = match &masks.loss_mask {
+            Some(mask) => Some(Tensor::<R>::from_slice(
+                mask,
+                &[self.batch_size, self.seq_len],
+                &self.device,
+            )?),
+            None => None,
+        };
+        let segments = match &masks.segments {
+            Some(segments) => Some(segments.upload::<R>(&self.device)?),
+            None => None,
         };
 
         Ok(Batch {
             inputs,
             targets,
             loss_mask,
-            scored,
+            scored: masks.scored,
+            segments,
         })
     }
 }

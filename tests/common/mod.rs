@@ -6,7 +6,7 @@
 // Each test binary compiles this module and uses a subset of it.
 #![allow(dead_code)]
 
-use boostr::ops::FusedOptimizerOps;
+use boostr::ops::{FusedOptimizerOps, VarLenAttentionOps};
 use boostr::tensor::TensorId;
 use boostr::{
     BinaryOps, CompareOps, ConvOps, CpuClient, CpuDevice, CpuRuntime, DType, DequantOps,
@@ -19,8 +19,8 @@ use oxidizr::commands::train_data::{run_loaders, TokenSource};
 use oxidizr::commands::TrainArgs;
 use oxidizr::config::{
     find_latest_checkpoint, ActivationCheckpointing, CheckpointMeta, DTypePrecision,
-    DistributedConfig, GdnSpec, LitConfig, LoraConfig, OxidizrModelConfig, TargetDevice,
-    TrainerConfig,
+    DistributedConfig, DocumentMaskConfig, GdnSpec, LitConfig, LoraConfig, OxidizrModelConfig,
+    TargetDevice, TrainerConfig,
 };
 use oxidizr::data::{
     Batch, DataPosition, LitDataLoader, RowLayout, RowOrder, TokenMeta, TokenOptions,
@@ -50,6 +50,7 @@ pub trait TrainClient<R: Runtime<DType = DType>>:
     + CompareOps<R>
     + ConvOps<R>
     + FlashAttentionOps<R>
+    + VarLenAttentionOps<R>
     + IndexingOps<R>
     + NormalizationOps<R>
     + QuantMatmulOps<R>
@@ -75,6 +76,7 @@ where
         + CompareOps<R>
         + ConvOps<R>
         + FlashAttentionOps<R>
+        + VarLenAttentionOps<R>
         + IndexingOps<R>
         + NormalizationOps<R>
         + QuantMatmulOps<R>
@@ -198,6 +200,7 @@ pub fn tiny_config(checkpoint_dir: &Path, max_steps: usize) -> LitConfig {
             metrics: None,
             spike_guard: None,
             activation_checkpointing: ActivationCheckpointing::None,
+            document_mask: None,
         },
     }
 }
@@ -332,6 +335,26 @@ pub fn data_loader(cfg: &LitConfig) -> LitDataLoader<CpuRuntime> {
     .with_row_order(RowOrder::Shuffled { seed: 7 })
 }
 
+/// Separator id of the document-mask tests. [`tokens`] holds it about once per 24 tokens.
+pub const DOC_SEPARATOR: u32 = 5;
+
+/// `cfg` with `trainer.document_mask` on, ending documents at [`DOC_SEPARATOR`].
+pub fn document_masked(mut cfg: LitConfig) -> LitConfig {
+    cfg.trainer.document_mask = Some(DocumentMaskConfig {
+        separator_id: Some(DOC_SEPARATOR),
+    });
+    cfg
+}
+
+/// [`data_loader`] with the document mask `cfg` sets, as `commands::train` applies it.
+pub fn masked_data_loader(cfg: &LitConfig) -> LitDataLoader<CpuRuntime> {
+    let loader = data_loader(cfg);
+    match cfg.trainer.document_mask.and_then(|m| m.separator_id) {
+        Some(separator_id) => loader.with_document_mask(separator_id),
+        None => loader,
+    }
+}
+
 /// A held-out eval of `rows` rows every `interval` steps, `batches` batches each.
 pub fn holdout_eval(rows: usize, interval: usize, batches: usize) -> EvalConfig {
     EvalConfig {
@@ -432,6 +455,8 @@ where
             data_files: Vec::new(),
             weight_decay,
             mixture: None,
+            // The loader of a test carries the separator `cfg` sets.
+            document_mask: cfg.trainer.document_mask.and_then(|m| m.record()),
         },
     )
     .expect("build trainer")

@@ -1,6 +1,6 @@
 //! The loaders of a training run: the training rows, and the eval rows under `trainer.eval`.
 
-use crate::config::LitConfig;
+use crate::config::{resolve_run_separator, LitConfig};
 use crate::data::{create_dummy_data, LitDataLoader};
 use crate::eval::{Evaluator, HoldoutSplit};
 use crate::prelude::DType;
@@ -25,6 +25,14 @@ impl TokenSource {
             Self::Generated(create_dummy_data(config.model.vocab_size, GENERATED_TOKENS))
         } else {
             Self::Files(data_files.to_vec())
+        }
+    }
+
+    /// The token files of this source. Empty for generated tokens.
+    pub fn files(&self) -> &[String] {
+        match self {
+            Self::Files(paths) => paths,
+            Self::Generated(_) => &[],
         }
     }
 
@@ -63,6 +71,9 @@ pub struct RunLoaders<R: Runtime<DType = DType>> {
 
 /// Opens the loaders of a run over `source`, each with the run's loss mask.
 ///
+/// Under `trainer.document_mask` both loaders also carry the separator that
+/// [`resolve_run_separator`] takes from the config or the data sidecars.
+///
 /// Under a holdout, each source of `N` rows keeps rows `[0, N - h)` for
 /// training, and the eval reads the last `h` rows of every source in order.
 /// The two sides share no row. An eval on `trainer.eval.data_file` reads
@@ -73,7 +84,10 @@ pub fn run_loaders<R: Runtime<DType = DType>>(
     source: &TokenSource,
     device: &R::Device,
 ) -> Result<RunLoaders<R>> {
-    let train = with_loss_mask(source.open(config, device)?, config)?;
+    let separator = resolve_run_separator(config, source.files())?;
+    // Train and eval share one mask rule, so eval scores the positions training scores.
+    let with_loss_mask = |loader: LitDataLoader<R>| with_masks(loader, config, separator);
+    let train = with_loss_mask(source.open(config, device)?)?;
     let Some(eval) = &config.trainer.eval else {
         return Ok(RunLoaders {
             train: with_mixture(train, config)?,
@@ -86,7 +100,7 @@ pub fn run_loaders<R: Runtime<DType = DType>>(
         Some(path) => TokenSource::Files(vec![path.clone()]).open(config, device),
         None => source.open(config, device),
     }?;
-    let evaluator = Evaluator::new(eval, &split, with_loss_mask(eval_source, config)?)?;
+    let evaluator = Evaluator::new(eval, &split, with_loss_mask(eval_source)?)?;
     let train = if split.plan.holdout_rows > 0 {
         train.with_row_ranges(&split.train_ranges)?
     } else {
@@ -115,17 +129,23 @@ fn with_mixture<R: Runtime<DType = DType>>(
     })
 }
 
-/// Applies the loss mask of `config` to `loader`.
+/// Applies the loss mask of `config` and the document mask `separator` to `loader`.
 ///
-/// Masked loss scoring is opt-in. Without `speech_layout` or `target_mask`
-/// the loader emits no mask and every position is scored.
+/// Masked loss scoring is opt-in. Without `speech_layout`, `target_mask` or
+/// a document mask the loader emits no mask and every position is scored.
 /// `try_with_speech_layout` rejects a corpus whose layout sidecar disagrees
 /// with the configured layout. `LitConfig::validate` rejects a config that
 /// sets both, so the two arms never overlap on a config from `from_yaml`.
-fn with_loss_mask<R: Runtime<DType = DType>>(
+/// The document mask ANDs with either of them.
+fn with_masks<R: Runtime<DType = DType>>(
     loader: LitDataLoader<R>,
     config: &LitConfig,
+    separator: Option<u32>,
 ) -> Result<LitDataLoader<R>> {
+    let loader = match separator {
+        Some(separator_id) => loader.with_document_mask(separator_id),
+        None => loader,
+    };
     Ok(
         match (&config.model.speech_layout, &config.trainer.target_mask) {
             (Some(spec), None) => loader.try_with_speech_layout(spec.layout())?,

@@ -42,6 +42,7 @@ fn trainer_error(cfg: &LitConfig) -> Option<String> {
             data_files: Vec::new(),
             weight_decay,
             mixture: None,
+            document_mask: None,
         },
     )
     .err()

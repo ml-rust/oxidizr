@@ -82,7 +82,7 @@ A reader thread fills batches of at most `--batch-bytes` of text (default 64 MiB
 | `oxidizr_version`         | The oxidizr that wrote the file                                 |
 | `splintr_version`         | The splintr that encoded the text, or `unknown`                 |
 | `tokenizer`               | `{"kind": "name", "name"}` or `{"kind": "file", "path", "hash"}` |
-| `separator_id`            | The EOS id after every document                                 |
+| `separator_id`            | The EOS id after every document. `trainer.document_mask` reads it |
 | `bos_id`                  | The id before every document's content, or `null`               |
 | `tokenizer_vocab_size`    | The tokenizer's highest id plus one                             |
 | `max_token_id`            | The highest id in the file, or `null` for zero tokens           |
