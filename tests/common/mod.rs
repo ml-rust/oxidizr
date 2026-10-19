@@ -647,3 +647,84 @@ pub fn assert_same_checkpoints(a: &Path, b: &Path) -> Vec<String> {
     }
     checked
 }
+
+/// GPT-2's byte-to-character map. Entry `b` spells byte `b` in a byte-level vocabulary.
+pub fn byte_level_alphabet() -> Vec<char> {
+    let printable = |b: u32| {
+        (u32::from(b'!')..=u32::from(b'~')).contains(&b)
+            || (0xA1..=0xAC).contains(&b)
+            || (0xAE..=0xFF).contains(&b)
+    };
+    let mut shifted = 0u32;
+    (0u32..256)
+        .map(|b| {
+            let code = if printable(b) {
+                b
+            } else {
+                shifted += 1;
+                255 + shifted
+            };
+            char::from_u32(code).expect("a valid code point")
+        })
+        .collect()
+}
+
+/// Id of `<|endoftext|>` in [`write_byte_level_tokenizer`]: its EOS.
+pub const BYTE_LEVEL_EOS: u32 = 256;
+/// Id of `<s>` in [`write_byte_level_tokenizer`] with `bos`.
+pub const BYTE_LEVEL_BOS: u32 = 257;
+
+/// Writes a byte-level BPE `tokenizer.json` into `dir` and returns its path.
+///
+/// Byte `b` is id `b`. One merge makes `th` id 258. `<|endoftext|>` is id
+/// [`BYTE_LEVEL_EOS`]. With `bos`, a template places `<s>`
+/// ([`BYTE_LEVEL_BOS`]) before every sequence.
+pub fn write_byte_level_tokenizer(dir: &Path, bos: bool) -> PathBuf {
+    let alphabet = byte_level_alphabet();
+    let mut vocab = serde_json::Map::new();
+    for (id, ch) in alphabet.iter().enumerate() {
+        vocab.insert(ch.to_string(), serde_json::json!(id));
+    }
+    vocab.insert("th".to_string(), serde_json::json!(258));
+    let mut added = vec![serde_json::json!(
+        {"id": BYTE_LEVEL_EOS, "content": "<|endoftext|>", "special": true}
+    )];
+    let mut json = serde_json::json!({
+        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+        "model": {"type": "BPE", "vocab": vocab, "merges": [["t", "h"]]}
+    });
+    if bos {
+        added.push(serde_json::json!({"id": BYTE_LEVEL_BOS, "content": "<s>", "special": true}));
+        json["post_processor"] = serde_json::json!({
+            "type": "TemplateProcessing",
+            "single": [
+                {"SpecialToken": {"id": "<s>", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}}
+            ],
+            "pair": [
+                {"SpecialToken": {"id": "<s>", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "<s>", "type_id": 1}},
+                {"Sequence": {"id": "B", "type_id": 1}}
+            ],
+            "special_tokens": {"<s>": {"id": "<s>", "ids": [BYTE_LEVEL_BOS], "tokens": ["<s>"]}}
+        });
+    }
+    json["added_tokens"] = serde_json::Value::Array(added);
+    let name = if bos {
+        "bos-tokenizer.json"
+    } else {
+        "tokenizer.json"
+    };
+    let path = dir.join(name);
+    std::fs::write(&path, json.to_string()).expect("write tokenizer.json");
+    path
+}
+
+/// The little-endian `u32` ids of the token file at `path`.
+pub fn read_tokens_le(path: &Path) -> Vec<u32> {
+    let bytes = std::fs::read(path).expect("read token file");
+    assert_eq!(bytes.len() % 4, 0, "a token file holds whole u32 ids");
+    let (ids, _) = bytes.as_chunks::<4>();
+    ids.iter().map(|c| u32::from_le_bytes(*c)).collect()
+}

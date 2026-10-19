@@ -1,160 +1,118 @@
 # Tokenization
 
-Language models don't process text directly - they work with numbers called **tokens**. Tokenization converts text into token IDs:
-
-```
-"Hello world" → [9906, 1917]
-```
-
-## What is a Token?
-
-A token is a piece of text that the model treats as a single unit. Tokens can be:
-
-- Whole words: `hello` → `[15339]`
-- Parts of words: `tokenization` → `[5765, 2065]`
-- Single characters: `!` → `[0]`
-- Special markers: `<|endoftext|>` → `[100257]`
-
-## Why Tokenize?
-
-Neural networks work with numbers, not text. Tokenization:
-
-1. Converts text to numbers the model can process
-2. Reduces vocabulary size (compared to one ID per character)
-3. Captures meaningful text chunks
-
-## Pre-Tokenized Data
-
-The easiest way to get started is using pre-tokenized data:
+`oxidizr tokenize` turns text files into the token file `oxidizr train -d` reads.
+The output is little-endian `u32` ids with no header. See [Data Format](format.md).
 
 ```bash
-# Download nano-start (already tokenized)
-hf download fs90/nano-start-data-bin --local-dir data/nano-start/tokenized --repo-type dataset
+cargo run --release --features vocab-cl100k -- tokenize \
+  -i data/raw -o data/corpus.bin --tokenizer cl100k_base
 
-# Train immediately
-cargo run --release -- -f models/nano.yaml -d data/nano-start/tokenized/combined.bin
+cargo run --release -- train -f models/nano.yaml -d data/corpus.bin
 ```
 
-## Tokenizing Your Own Data
+## Tokenizers
 
-To tokenize your own text, use [splintr](https://github.com/ml-rust/splintr):
+`--tokenizer` takes a splintr vocabulary name or a `tokenizer.json` path.
+A value is a path only when it ends in `.json`.
 
-```python
-from splintr import Tokenizer
-import numpy as np
+| Name          | Used by        | Feature          | BOS      | EOS (separator) |
+| ------------- | -------------- | ---------------- | -------- | --------------- |
+| `cl100k_base` | GPT-4, GPT-3.5 | `vocab-cl100k`   | none     | 100257          |
+| `o200k_base`  | GPT-4o         | `vocab-o200k`    | none     | 199999          |
+| `llama3`      | Llama 3        | `vocab-llama3`   | 128000   | 128001          |
+| `deepseek_v3` | DeepSeek V3/R1 | `vocab-deepseek` | 0        | 1               |
 
-# Load tokenizer
-tokenizer = Tokenizer("cl100k_base")  # OpenAI GPT-4 tokenizer
+- The default build bundles no vocabulary. `--tokenizer cl100k_base` then fails, and splintr's error names the missing feature.
+- Rebuild with that feature, or with `--features vocabs` for every vocabulary.
+- Any other splintr name works too when its `vocab-*` feature is on.
+- A `tokenizer.json` needs no feature. Prefer it for a real checkpoint: it carries the checkpoint's added tokens.
+- A `tokenizer.json` keeps its own post-processor template. Its BOS is the special token that template places first.
+- A `tokenizer.json` must declare an EOS token: `</s>`, `<eos>`, `<|endoftext|>`, `<|end_of_text|>` or `[SEP]`.
 
-# Tokenize text
-text = "Your training data here..."
-tokens = tokenizer.encode(text)
+The model's `vocab_size` must be at least the sidecar's `tokenizer_vocab_size`.
 
-# Save for oxidizr
-np.array(tokens, dtype=np.uint32).tofile("data.bin")
-```
+## Documents
 
-## Available Tokenizers
+Each document becomes the tokenizer's BOS (when it has one), the content ids, then the EOS id.
+A template that already ends with EOS gets no second one.
 
-| Tokenizer     | Used By        | Vocab Size |
-| ------------- | -------------- | ---------- |
-| `cl100k_base` | GPT-4, GPT-3.5 | ~100K      |
-| `o200k_base`  | GPT-4o         | ~200K      |
-| `llama3`      | Llama 3        | ~128K      |
-| `deepseek_v3` | DeepSeek V3/R1 | ~128K      |
+| Input                              | One document is                                          |
+| ---------------------------------- | -------------------------------------------------------- |
+| `.txt`, `--txt-docs file`          | the whole file                                           |
+| `.txt`, `--txt-docs blank-line`    | the lines between whitespace-only lines, minus the last line ending |
+| `.jsonl`                           | the `--field` string of one line (default `text`)        |
 
-## Tokenizer Selection
-
-Choose based on your use case:
-
-- **Learning/Experimenting**: `cl100k_base` (widely used, good docs)
-- **Llama-style models**: `llama3`
-- **DeepSeek-style**: `deepseek_v3`
-
-Ensure your config's `vocab_size` matches:
-
-```yaml
-model:
-  vocab_size: 100331 # For cl100k_base
-  # vocab_size: 128354  # For llama3 with agent tokens
-```
+- `--format auto` decides per file from its extension. `--format txt` or `--format jsonl` forces one format for every file.
+- An empty document is skipped. The sidecar counts it in `skipped_empty_documents`.
+- A blank JSONL line is skipped.
+- Invalid UTF-8, invalid JSON, a line that is not an object, or a missing or non-string field stops the run. The error names `file:line`.
+- One document must fit in memory. A document above 1 MiB is encoded across threads. Its ids stay the same.
 
 ## Special Tokens
 
-Tokenizers include special tokens for structure:
+By default, text that spells a special token stays ordinary text.
+A document holding `<|endoftext|>` can never forge a separator.
 
-| Token             | Purpose             | Example ID |
-| ----------------- | ------------------- | ---------- |
-| `<\|endoftext\|>` | End of example      | 100257     |
-| `<\|system\|>`    | System instructions | 100277     |
-| `<\|user\|>`      | User message        | 100278     |
-| `<\|assistant\|>` | Assistant response  | 100279     |
+`--allow-special` encodes such text as the special token's id.
+Use it only for text that places control tokens on purpose, such as a chat template.
 
-Use these to structure your training data:
+## Inputs
 
-```python
-text = "<|user|>What is 2+2?<|assistant|>4<|endoftext|>"
-tokens = tokenizer.encode(text)
+- A file named by `-i` is always read.
+- A directory is walked recursively for `.txt` and `.jsonl` files. Symlinked directories are not entered.
+- Files from one directory are read in path byte order. `-i` order holds between arguments.
+- A file reached twice, or an output path that is also an input, stops the run.
+
+## Output
+
+- The ids go to `out.bin.partial`, then a rename makes it `out.bin`.
+- An error before the rename removes the partial file. The old `out.bin` stays.
+- The sidecar `out.bin.tokens.json` is written last, atomically.
+- The output bytes depend only on the input bytes, the tokenizer and the options. `--batch-bytes` and the thread count never change them.
+
+A reader thread fills batches of at most `--batch-bytes` of text (default 64 MiB). At most two batches exist at once. A document above `--batch-bytes` is a batch of its own.
+
+## The Sidecar
+
+`<output>.tokens.json` describes the token file.
+
+| Field                     | Meaning                                                         |
+| ------------------------- | --------------------------------------------------------------- |
+| `format_version`          | Sidecar format version, `1`                                     |
+| `oxidizr_version`         | The oxidizr that wrote the file                                 |
+| `splintr_version`         | The splintr that encoded the text, or `unknown`                 |
+| `tokenizer`               | `{"kind": "name", "name"}` or `{"kind": "file", "path", "hash"}` |
+| `separator_id`            | The EOS id after every document                                 |
+| `bos_id`                  | The id before every document's content, or `null`               |
+| `tokenizer_vocab_size`    | The tokenizer's highest id plus one                             |
+| `max_token_id`            | The highest id in the file, or `null` for zero tokens           |
+| `num_tokens`              | Tokens in the file. The file holds `4 × num_tokens` bytes       |
+| `num_documents`           | Documents in the file                                           |
+| `skipped_empty_documents` | Empty documents left out                                        |
+| `hash_algo`               | `fnv1a64`: the algorithm of every hash here                     |
+| `file_hash`               | Hash of every byte of the token file                            |
+| `inputs`                  | Each input's `path`, `format`, `bytes` and `hash`, in read order |
+| `options`                 | `format`, `field`, `txt_docs` and `allow_special`               |
+
+Every hash is 64-bit FNV-1a as 16 hex digits.
+The sidecar holds no document offsets.
+
+## Pre-Tokenized Data
+
+The nano-start dataset ships already tokenized:
+
+```bash
+hf download fs90/nano-start-data-bin --local-dir data/nano-start/tokenized --repo-type dataset
+cargo run --release -- -f models/nano.yaml -d data/nano-start/tokenized/combined.bin
 ```
 
-## Batch Tokenization
+## Common Errors
 
-For large datasets:
-
-```python
-from splintr import Tokenizer
-import numpy as np
-
-tokenizer = Tokenizer("cl100k_base")
-
-# Read all your text files
-texts = []
-for path in text_files:
-    with open(path) as f:
-        texts.append(f.read())
-
-# Tokenize all (uses parallel processing)
-all_tokens = []
-for text in texts:
-    tokens = tokenizer.encode(text)
-    all_tokens.extend(tokens)
-    all_tokens.append(100257)  # EOS separator
-
-# Save
-np.array(all_tokens, dtype=np.uint32).tofile("combined.bin")
-```
-
-## Decoding Tokens
-
-Convert tokens back to text:
-
-```python
-tokenizer = Tokenizer("cl100k_base")
-
-tokens = [9906, 1917]
-text = tokenizer.decode(tokens)
-print(text)  # "Hello world"
-```
-
-## Common Issues
-
-**Token IDs out of range?**
-
-- Your data has token IDs larger than `vocab_size`
-- Use matching tokenizer and config
-
-**Strange characters in output?**
-
-- Tokenizer mismatch between training and inference
-- Use same tokenizer throughout
-
-**Training on different language?**
-
-- Most tokenizers work with any language
-- Some may have better support for specific languages
+- **Token ids out of range**: the model's `vocab_size` is below the tokenizer's. Set it to at least `tokenizer_vocab_size`.
+- **Strange text at inference**: training and inference use different tokenizers. Use one tokenizer throughout.
 
 ## Learn More
 
-- [splintr documentation](https://github.com/ml-rust/splintr)
-- [Data Format](format.md) - Binary file format details
-- [nano-start Guide](nano-start.md) - Educational dataset
+- [Data Format](format.md): binary file layout and rows
+- [nano-start Guide](nano-start.md): educational dataset
+- [splintr](https://github.com/ml-rust/splintr): the tokenizer library

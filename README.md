@@ -176,18 +176,17 @@ Start from a file in `models/`. [models/README.md](models/README.md) describes e
 
 ### Prepare the Data
 
-oxidizr memory-maps a binary file of native-endian `u32` tokens. The tokenizer must match `model.tokenizer_vocab`.
+oxidizr memory-maps a binary file of little-endian `u32` tokens. The tokenizer must match `model.tokenizer_vocab`.
 
-This Python snippet uses [splintr](https://github.com/ml-rust/splintr) to write a token file:
+`oxidizr tokenize` writes that file from `.txt` and `.jsonl` inputs:
 
-```python
-from splintr import Tokenizer
-import numpy as np
-
-tokenizer = Tokenizer("llama3")
-tokens = tokenizer.encode("Your training text here...")
-np.array(tokens, dtype=np.uint32).tofile("data/my-dataset.bin")
+```bash
+cargo run --release --features vocab-llama3 -- tokenize \
+  -i data/raw -o data/my-dataset.bin --tokenizer llama3
 ```
+
+A vocabulary name needs its `vocab-*` feature. A `tokenizer.json` path needs none.
+See [Tokenization](docs/data/tokenization.md).
 
 Pass the file with `-d`. Without `-d`, `train` generates 1,000,000 random tokens for a smoke test.
 
@@ -285,7 +284,7 @@ The CPU test suite runs every data-parallel path on in-process CPU ranks. The NC
 | `nccl` | Off | Multi-GPU data parallelism over NCCL. Implies `cuda` |
 | `huggingface` | Off | `push` command |
 | `audio` | Off | `prep-corpus` command, with the voxr corpus pipeline and the Whisper, NeuCodec, and Silero VAD models |
-| `vocab-<name>` | Off | Bundled tokenizer vocabulary for `prep-corpus --tokenizer <name>` |
+| `vocab-<name>` | Off | Bundled tokenizer vocabulary for `tokenize --tokenizer <name>` and `prep-corpus --tokenizer <name>` |
 | `vocabs` | Off | Every bundled vocabulary |
 
 Bundled vocabulary names: `cl100k`, `o200k`, `gpt-oss`, `phi4`, `olmo2`, `llama3`, `llama2`, `deepseek`, `qwen`, `glm`, `gemma2`, `gemma3`, `gemma4`, `kimi`, `mistral`, `modernbert`.

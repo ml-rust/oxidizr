@@ -25,7 +25,7 @@ Welcome to the Oxidizr documentation. Oxidizr is a production-grade LLM training
 ## Data
 
 - [Data Format](data/format.md) - Binary token format
-- [Tokenization](data/tokenization.md) - Using splintr for tokenization
+- [Tokenization](data/tokenization.md) - `oxidizr tokenize`, its document rules and sidecar
 - [Educational Dataset](data/nano-start.md) - The nano-start learning dataset
 
 ## Guides

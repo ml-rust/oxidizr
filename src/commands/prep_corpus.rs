@@ -46,10 +46,10 @@ use voxr::enhance::EnhanceOptions;
 use voxr::{
     check_max_speech_duration, decode_audio_file_mono_at, CorpusOptions, SpeechCorpusBuilder,
     TextTokenizer, Utterance, VadSegmentOptions, WhisperBundle, MAX_UTTERANCE_SECS,
-    PRETRAINED_TOKENIZER_NAMES,
 };
 
 use crate::speech_corpus::write_speech_corpus;
+use crate::tokenizer::TokenizerSource;
 
 /// Extensions a directory walk accepts. Everything else in the directory —
 /// transcripts, `.DS_Store`, a nested folder — is ignored.
@@ -277,27 +277,13 @@ fn manifest_path(output: &Path) -> PathBuf {
 
 /// Decide where the base text tokenizer comes from.
 ///
-/// A value ending in `.json` names a file; anything else is a splintr
-/// vocabulary name. A `.json` value naming no file is a hard error rather than
-/// a fall-through to the name branch: the fall-through reports "unknown
-/// pretrained tokenizer name /path/to/tokenizer.json", which hides a typo in a
-/// path behind an error about vocabularies.
+/// [`TokenizerSource::parse`] makes the name-or-path decision that
+/// `oxidizr tokenize` shares. voxr's [`TextTokenizer`] then loads it.
 fn resolve_tokenizer(value: &str) -> Result<TextTokenizer<'_>> {
-    let path = Path::new(value);
-    let is_json = path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
-    if !is_json {
-        return Ok(TextTokenizer::Pretrained(value));
-    }
-    if !path.is_file() {
-        return Err(anyhow::anyhow!(
-            "--tokenizer '{value}' ends in .json but names no file. Pass a tokenizer.json \
-             path that exists, or one of the vocabulary names: {}.",
-            PRETRAINED_TOKENIZER_NAMES.join(", ")
-        ));
-    }
-    Ok(TextTokenizer::JsonFile(path))
+    Ok(match TokenizerSource::parse(value)? {
+        TokenizerSource::Name(name) => TextTokenizer::Pretrained(name),
+        TokenizerSource::JsonFile(path) => TextTokenizer::JsonFile(path),
+    })
 }
 
 /// Whether a path carries one of [`AUDIO_EXTENSIONS`].

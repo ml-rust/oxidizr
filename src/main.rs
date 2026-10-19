@@ -4,7 +4,7 @@ use std::io::Write;
 
 #[cfg(feature = "audio")]
 use oxidizr::commands::PrepCorpusArgs;
-use oxidizr::commands::{self, ImportArgs, MergeArgs, PackArgs, TrainArgs};
+use oxidizr::commands::{self, ImportArgs, MergeArgs, PackArgs, TokenizeArgs, TrainArgs};
 
 #[cfg(feature = "huggingface")]
 use oxidizr::commands::PushArgs;
@@ -94,6 +94,9 @@ enum Commands {
     /// Merge LoRA adapters into base weights, writing a plain checkpoint
     Merge(MergeArgs),
 
+    /// Tokenize text files into a packed u32 token file with a sidecar
+    Tokenize(TokenizeArgs),
+
     /// Turn audio recordings into a packed speech-LM training corpus
     #[cfg(feature = "audio")]
     PrepCorpus(PrepCorpusArgs),
@@ -147,6 +150,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Commands::Import(args)) => commands::run_import(args),
         Some(Commands::Pack(args)) => commands::run_pack(args),
         Some(Commands::Merge(args)) => commands::run_merge(args),
+        Some(Commands::Tokenize(args)) => commands::run_tokenize(args),
         #[cfg(feature = "audio")]
         Some(Commands::PrepCorpus(args)) => commands::run_prep_corpus(args),
         #[cfg(feature = "huggingface")]
@@ -191,6 +195,12 @@ fn run(cli: Cli) -> Result<()> {
             );
                 println!(
                     "                                     Merge LoRA adapters into base weights"
+                );
+                println!(
+                    "  oxidizr tokenize -i <file|dir>... -o <out.bin> --tokenizer <name|tokenizer.json>"
+                );
+                println!(
+                    "                                     Tokenize text into a training token file"
                 );
                 println!(
                     "  oxidizr prep-corpus -i <audio-dir> -o <corpus.bin> --vad <vad.safetensors>"

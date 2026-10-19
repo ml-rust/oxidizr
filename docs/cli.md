@@ -4,7 +4,7 @@ Complete command-line interface documentation for Oxidizr.
 
 ## Overview
 
-Oxidizr uses a subcommand-based CLI with three main commands:
+Oxidizr uses a subcommand-based CLI:
 
 ```bash
 oxidizr <SUBCOMMAND> [OPTIONS]
@@ -13,6 +13,7 @@ oxidizr <SUBCOMMAND> [OPTIONS]
 **Subcommands:**
 
 - `train` - Train a language model
+- `tokenize` - Tokenize text files into a training token file
 - `pack` - Package a trained model for distribution
 - `push` - Push a packaged model to HuggingFace Hub (requires `--features huggingface`)
 
@@ -190,6 +191,56 @@ cargo run --release --features cuda -- train \
     --dtype bf16 \
     --resume auto
 ```
+
+## oxidizr tokenize
+
+Tokenize text files into a `.bin` token file for `oxidizr train -d`.
+See [Tokenization](data/tokenization.md) for the document rules and the sidecar.
+
+### Basic Usage
+
+```bash
+oxidizr tokenize -i <FILE|DIR>... -o <out.bin> --tokenizer <NAME|tokenizer.json> [OPTIONS]
+
+# A vocabulary name needs its feature:
+cargo run --release --features vocab-cl100k -- tokenize -i data/raw -o data/corpus.bin --tokenizer cl100k_base
+
+# A tokenizer.json needs no feature:
+cargo run --release -- tokenize -i docs.jsonl -o data/corpus.bin --tokenizer models/llama/tokenizer.json
+```
+
+### Options
+
+| Argument                       | Description                                                                 |
+| ------------------------------ | --------------------------------------------------------------------------- |
+| `-i, --input <PATH>...`        | Input files or directories. A directory is walked for `.txt` and `.jsonl` files |
+| `-o, --output <FILE>`          | Output token file                                                           |
+| `--tokenizer <NAME\|PATH>`     | `cl100k_base`, `o200k_base`, `llama3`, `deepseek_v3`, or a `tokenizer.json` path |
+| `--format <auto\|txt\|jsonl>`  | Input format. Default: `auto`, from each file's extension                  |
+| `--field <NAME>`               | JSONL field that holds the text. Default: `text`                           |
+| `--txt-docs <file\|blank-line>` | Text-file document boundary. Default: `file`, one document per file       |
+| `--allow-special`              | Encode text that spells a special token as that token's id                 |
+| `--batch-bytes <N>`            | Document text per encode batch. Default: `67108864`. The output does not depend on it |
+
+### Outputs
+
+- `out.bin`: little-endian `u32` ids, no header.
+- `out.bin.tokens.json`: the sidecar. It records the tokenizer, the separator and BOS ids, the counts and the hashes.
+
+The command writes `out.bin.partial` first, then renames it. An error leaves the old output in place.
+
+### Vocabulary Features
+
+The default build bundles no vocabulary. A name without its feature fails, and the error names the feature.
+
+| Name          | Feature          |
+| ------------- | ---------------- |
+| `cl100k_base` | `vocab-cl100k`   |
+| `o200k_base`  | `vocab-o200k`    |
+| `llama3`      | `vocab-llama3`   |
+| `deepseek_v3` | `vocab-deepseek` |
+
+`--features vocabs` bundles every vocabulary.
 
 ## oxidizr pack
 

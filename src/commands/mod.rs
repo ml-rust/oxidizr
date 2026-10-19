@@ -6,6 +6,7 @@
 //! - `merge` - Fold LoRA adapters into their base weights
 //! - `pack` - Package a trained model for distribution
 //! - `prep-corpus` - Turn audio recordings into a packed speech-LM corpus
+//! - `tokenize` - Turn text files into a packed token file with a sidecar
 //! - `push` - Push a packaged model to HuggingFace (feature-gated)
 
 pub mod import;
@@ -14,6 +15,7 @@ pub mod overrides;
 pub mod pack;
 #[cfg(feature = "audio")]
 pub mod prep_corpus;
+pub mod tokenize;
 pub mod train;
 pub mod train_data;
 mod train_overrides;
@@ -30,6 +32,7 @@ pub use merge::{run_merge, MergeArgs};
 pub use pack::{run_pack, PackArgs};
 #[cfg(feature = "audio")]
 pub use prep_corpus::{run_prep_corpus, PrepCorpusArgs};
+pub use tokenize::{run_tokenize, TokenizeArgs};
 pub use train::{run_train, run_train_with_group, TrainArgs};
 
 #[cfg(feature = "huggingface")]

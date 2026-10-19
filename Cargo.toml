@@ -58,7 +58,8 @@ audio = [
 ]
 
 # Bundled tokenizer vocabularies, forwarded to boostr and on to splintr. These
-# are what make `prep-corpus --tokenizer <name>` work for a name: the
+# are what make `tokenize --tokenizer <name>` and
+# `prep-corpus --tokenizer <name>` work for a name: the
 # vocabulary DATA is feature-gated (2.6-6.4 MB per family) and none is bundled
 # by default. `--tokenizer <path-to-tokenizer.json>` needs none of them, and is
 # the better choice for a real checkpoint because it carries its added tokens.
@@ -86,6 +87,9 @@ vocabs = ["boostr/vocabs"]
 # Provides: Tensor, Device, DType, Linear, Embedding, VarBuilder, etc.
 # Also re-exports cubecl_cuda::CudaRuntime when cuda feature is enabled
 boostr = { path = "../boostr", version = "0.9" }
+# Text tokenizers for `oxidizr tokenize` and `--tokenizer`. The same crate and
+# requirement boostr declares, so the `vocab-*` features above reach it too.
+splintr = "0.22"
 # Sample-level audio: decode, enhancement, and the speech-corpus builder.
 voxr = { version = "0.7", optional = true }
 

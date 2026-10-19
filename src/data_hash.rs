@@ -51,12 +51,14 @@ impl Fnv1a64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 
+    /// A hasher over no bytes yet.
     pub fn new() -> Self {
         Self {
             state: Self::OFFSET_BASIS,
         }
     }
 
+    /// Feeds `bytes`. Pieces in order give the hash of their concatenation.
     pub fn update(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             self.state ^= u64::from(byte);
@@ -64,6 +66,7 @@ impl Fnv1a64 {
         }
     }
 
+    /// The hash of every byte fed so far.
     pub fn finish(&self) -> u64 {
         self.state
     }
@@ -75,7 +78,8 @@ impl Default for Fnv1a64 {
     }
 }
 
-fn hex(value: u64) -> String {
+/// A hash as 16 lowercase hex digits, the form every stored hash takes.
+pub fn hex(value: u64) -> String {
     format!("{value:016x}")
 }
 

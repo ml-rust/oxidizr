@@ -7,9 +7,10 @@ Oxidizr accepts tokenized data in a simple binary format.
 Training data is stored as raw token IDs:
 
 - **Type**: u32 (32-bit unsigned integer)
-- **Byte order**: Little-endian
+- **Byte order**: little-endian on every platform
 - **Headers**: None (raw token stream)
 - **Extension**: `.bin`
+- **Sidecar**: `oxidizr tokenize` also writes `<file>.tokens.json`. See [Tokenization](tokenization.md#the-sidecar).
 
 ### Structure
 
@@ -65,7 +66,7 @@ print(f"Total tokens: {len(tokens)}")
 ```python
 import numpy as np
 
-tokens = np.fromfile("data.bin", dtype=np.uint32)
+tokens = np.fromfile("data.bin", dtype="<u4")  # little-endian u32
 print(f"Total tokens: {len(tokens)}")
 ```
 
@@ -97,8 +98,8 @@ import numpy as np
 # Your token IDs
 tokens = [100, 200, 300, 400, 500]
 
-# Save as binary
-np.array(tokens, dtype=np.uint32).tofile("data.bin")
+# Save as binary: "<u4" is little-endian u32 on every platform
+np.array(tokens, dtype="<u4").tofile("data.bin")
 ```
 
 ### From Python (struct)
@@ -115,28 +116,13 @@ with open("data.bin", "wb") as f:
 
 ## Tokenization
 
-Before creating binary files, you need to tokenize your text. The tokenizer converts text to token IDs.
+`oxidizr tokenize` turns `.txt` and `.jsonl` files into this format:
 
-### Using splintr (Recommended)
-
-[splintr](https://github.com/ml-rust/splintr) is our tokenizer library:
-
-```python
-from splintr import Tokenizer
-import numpy as np
-
-# Load tokenizer
-tokenizer = Tokenizer("cl100k_base")  # Or "llama3", "deepseek_v3"
-
-# Tokenize text
-text = "Hello, world! This is training data."
-tokens = tokenizer.encode(text)
-
-# Save as binary
-np.array(tokens, dtype=np.uint32).tofile("data.bin")
+```bash
+cargo run --release --features vocab-cl100k -- tokenize -i data/raw -o data/all_data.bin --tokenizer cl100k_base
 ```
 
-See [Tokenization](tokenization.md) for more details.
+Each document becomes its ids, then the tokenizer's EOS id. See [Tokenization](tokenization.md).
 
 ## Data Organization
 
@@ -150,7 +136,10 @@ cargo run --release -- -f config.yaml -d data/all_data.bin
 
 ### Concatenated Examples
 
-Multiple examples separated by EOS token:
+Multiple examples separated by the EOS id. `oxidizr tokenize` writes this layout:
+one example per document (see [Tokenization](tokenization.md#documents)), each followed by EOS.
+
+A file written by other tools needs the same layout:
 
 ```python
 import numpy as np
@@ -171,7 +160,7 @@ for text in examples:
     all_tokens.extend(tokens)
     all_tokens.append(EOS)  # Separator
 
-np.array(all_tokens, dtype=np.uint32).tofile("data.bin")
+np.array(all_tokens, dtype="<u4").tofile("data.bin")
 ```
 
 ## Vocab Size
