@@ -41,6 +41,7 @@ fn trainer_error(cfg: &LitConfig) -> Option<String> {
             model_config: cfg.model.clone(),
             data_files: Vec::new(),
             weight_decay,
+            mixture: None,
         },
     )
     .err()

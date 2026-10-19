@@ -34,7 +34,7 @@ The loader cuts the stream into rows of `max_seq_len + 1` tokens at fixed
 offsets. Row `r` is tokens `[r × (max_seq_len + 1), (r + 1) × (max_seq_len + 1))`.
 
 - Inputs are `row[0..max_seq_len]`. Targets are `row[1..max_seq_len + 1]`.
-- A batch is `batch_size` rows. Each epoch visits every row once.
+- A batch is `batch_size` rows. Each epoch visits every row once. A [weighted mixture](#weighted-mixture) sets its own epoch instead.
 - Row order: a per-epoch permutation seeded from `trainer.seed` when
   `trainer.shuffle_rows` is `true` (the default), stream order when `false`.
 - Steps per epoch: `floor(rows / batch_size) / gradient_accumulation`. The
@@ -173,6 +173,49 @@ each file. The eval reads the held-out ranges in file order.
 - Training never reads a held-out row.
 - `trainer.eval.holdout_rows` names one range, so it needs one file. With two or more files it is an error naming `trainer.eval.holdout_fraction`.
 
+#### Weighted mixture
+
+A `weight` on every source turns the stream into a weighted mixture:
+
+```yaml
+trainer:
+  data:
+    rows_per_epoch: 100000   # optional
+    sources:
+      - path: data/web.bin
+        weight: 0.7
+      - path: data/code.bin
+        weight: 0.3
+```
+
+- Set a `weight` on every source, or on none. A weight is a finite number above 0. Weights are relative: `0.7` and `0.3` mix as `7` and `3` do.
+- Without weights the run reads the plain stream, bit-identical to a run before mixtures.
+- An epoch holds `rows_per_epoch` rows. The default is every training row of every source.
+- `rows_per_epoch` needs weights. A value of 0 is an error.
+- One weighted source with the default `rows_per_epoch` trains bit-identical to that file without a weight.
+
+Per-epoch quota: source `i` supplies `c_i` rows of each epoch of `L` rows.
+
+- `c_i` is the largest-remainder rounding of `w_i / sum(w) * L`.
+- Each source gets the floor of its share. The rows left go one each to the largest remainders.
+- A tie goes to the lower source index. The quotas sum to `L` exactly.
+
+Order of the slots:
+
+- `trainer.shuffle_rows: true`: a seeded shuffle of the epoch's quotas. The seed mixes `trainer.seed` and the epoch, so each epoch draws another order.
+- `trainer.shuffle_rows: false`: a smooth weighted round-robin. It spreads each source evenly, and it is the same every epoch.
+
+Rows of a source:
+
+- A source reads its training rows in passes. Each pass reads every row once.
+- Under a shuffle, each pass is a permutation seeded from `trainer.seed`, the source and the pass. In stream order a pass reads the rows in order.
+- A source whose quota exceeds its rows repeats them: an upsampled source. A source with fewer quota rows than training rows takes several epochs per pass.
+- At startup the run prints each source's quota, its training rows, and the repeats per epoch, `c_i / n_i`.
+
+Data parallelism: every rank builds the same schedule. Rank `k` reads its usual slots of each global batch.
+
+Holdout: each source holds out its held-out rows first. The mixture covers the training rows only. The eval reads the held-out ranges in file order, unmixed.
+
 #### Resume
 
 A checkpoint meta lists every source under `data_sources`: its path, its hash
@@ -182,6 +225,9 @@ and its whole rows. A resume compares the sources by position.
 - A moved file with the same contents still matches. The path alone is not compared.
 - Resume with the original files in their original order, or start a fresh run.
 - A meta written before `data_sources` reads as one source: its `data_file_path` and `data_file_hash`. Its rows are not compared.
+- A mixture run's meta records `mixture`: the weights and `rows_per_epoch`. A resume with another weight, another `rows_per_epoch`, or without weights is an error naming the key.
+- A meta without `mixture` resumes only a run without weights.
+- The saved data position is exact under a mixture. The row at each slot depends only on the epoch, the slot, the seed and the sources.
 
 ### Sidecar Checks
 

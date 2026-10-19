@@ -7,7 +7,7 @@
 use super::names::NameMaps;
 use super::optimizer_io::stage_optimizer_state;
 use crate::config::{CheckpointMeta, OxidizrModelConfig};
-use crate::data::{DataPosition, DataSourceRecord};
+use crate::data::{DataPosition, DataSourceRecord, MixtureRecord};
 use crate::eval::EvalCheckpoint;
 use crate::metrics::SpikeGuardState;
 use crate::model::{stage_checkpoint_tensors, LitGPT, StageScope};
@@ -205,6 +205,8 @@ pub struct SnapshotInput<'a, R: Runtime<DType = DType>> {
     pub global_batch_rows: usize,
     /// Spike guard EMA and counters after `step` steps. `None` without a guard.
     pub spike_guard: Option<SpikeGuardState>,
+    /// The weighted data mixture of the run. `None` without weights.
+    pub mixture: Option<&'a MixtureRecord>,
     /// Host copies of the frozen parameters.
     pub frozen: &'a FrozenCache,
 }
@@ -254,6 +256,7 @@ where
     meta.world_size = Some(input.world_size);
     meta.global_batch_rows = Some(input.global_batch_rows);
     meta.spike_guard = input.spike_guard;
+    meta.mixture = input.mixture.cloned();
 
     Ok(SetSnapshot::from_parts(
         input.dir.to_path_buf(),

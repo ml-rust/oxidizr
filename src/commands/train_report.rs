@@ -1,8 +1,9 @@
-//! The console text of a training run: the parameter estimate, the banner, the OOM report.
+//! The console text of a training run: the parameter estimate, the banner,
+//! the data mixture, the OOM report.
 
 use crate::commands::train_plan::RunPlan;
 use crate::config::{LitConfig, OxidizrModelConfig};
-use crate::data::RowLayout;
+use crate::data::{MixtureSource, RowLayout};
 
 /// Estimate the number of parameters in the model
 pub fn estimate_params(cfg: &OxidizrModelConfig) -> String {
@@ -153,6 +154,25 @@ pub fn print_banner(facts: &BannerFacts<'_>) {
     println!();
     println!("Training in progress... (progress bar should appear below)");
     println!("If no progress bar appears, use --headless for text output.\n");
+}
+
+/// Prints each source's share of a weighted mixture, so heavy upsampling is visible.
+///
+/// A source of `n` training rows that supplies `c` rows per epoch repeats
+/// `c / n` times per epoch. `paths` names the sources in order.
+pub fn print_mixture(sources: &[MixtureSource], paths: &[String]) {
+    let rows: usize = sources.iter().map(|s| s.rows_per_epoch).sum();
+    println!("Data mixture: {rows} rows per epoch");
+    for (i, source) in sources.iter().enumerate() {
+        let path = paths.get(i).map_or("", String::as_str);
+        println!(
+            "  source {i} {path}: weight {}, {} of {} training rows per epoch ({:.2} repeats)",
+            source.weight,
+            source.rows_per_epoch,
+            source.train_rows,
+            source.repeats()
+        );
+    }
 }
 
 /// Prints the device memory, the run's sizes and what to reduce after an OOM.

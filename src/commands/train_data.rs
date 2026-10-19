@@ -66,7 +66,8 @@ pub struct RunLoaders<R: Runtime<DType = DType>> {
 /// Under a holdout, each source of `N` rows keeps rows `[0, N - h)` for
 /// training, and the eval reads the last `h` rows of every source in order.
 /// The two sides share no row. An eval on `trainer.eval.data_file` reads
-/// that file, and training keeps every row.
+/// that file, and training keeps every row. Weights in `trainer.data` mix
+/// the training rows. The eval reads its rows unmixed.
 pub fn run_loaders<R: Runtime<DType = DType>>(
     config: &LitConfig,
     source: &TokenSource,
@@ -75,7 +76,7 @@ pub fn run_loaders<R: Runtime<DType = DType>>(
     let train = with_loss_mask(source.open(config, device)?, config)?;
     let Some(eval) = &config.trainer.eval else {
         return Ok(RunLoaders {
-            train,
+            train: with_mixture(train, config)?,
             evaluator: None,
             holdout_rows: 0,
         });
@@ -91,10 +92,26 @@ pub fn run_loaders<R: Runtime<DType = DType>>(
     } else {
         train
     };
+    // After the holdout: the mixture covers the training rows only, and the eval stays unmixed.
+    let train = with_mixture(train, config)?;
     Ok(RunLoaders {
         train,
         evaluator: Some(evaluator),
         holdout_rows: split.plan.holdout_rows,
+    })
+}
+
+/// Applies the weighted mixture of `trainer.data` to `loader`, when its sources set weights.
+fn with_mixture<R: Runtime<DType = DType>>(
+    loader: LitDataLoader<R>,
+    config: &LitConfig,
+) -> Result<LitDataLoader<R>> {
+    let Some(data) = &config.trainer.data else {
+        return Ok(loader);
+    };
+    Ok(match data.weights() {
+        Some(weights) => loader.with_mixture(&weights, data.rows_per_epoch)?,
+        None => loader,
     })
 }
 

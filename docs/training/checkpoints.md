@@ -82,7 +82,7 @@ Each checkpoint is a set of three files in `checkpoint_dir`:
 |------|---------|
 | `<prefix>_step_N.safetensors` | Model weights after N completed optimizer steps |
 | `<prefix>_step_N.optimizer.safetensors` | AdamW state: `exp_avg`, `exp_avg_sq`, `master` per trainable tensor, and `__step` |
-| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, `no_decay_patterns` when set, `loss_scale` for an f16 run, `world_size`, `global_batch_rows`, the eval keys under `trainer.eval`, and `spike_guard` under `trainer.spike_guard` |
+| `checkpoint_step_N.meta.json` | Step N, config and data-file hashes with their `hash_algo`, dtype, `data_position`, `optimizer_file`, `weight_decay_rule`, `no_decay_patterns` when set, `loss_scale` for an f16 run, `world_size`, `global_batch_rows`, the eval keys under `trainer.eval`, `spike_guard` under `trainer.spike_guard`, and `mixture` under weighted `trainer.data.sources` |
 
 The end of a run writes the same set as `<prefix>_final.safetensors`,
 `<prefix>_final.optimizer.safetensors` and `checkpoint_final.meta.json`.
@@ -217,6 +217,12 @@ so a Rust upgrade cannot change them.
 The meta lists every data source under `data_sources`, with its hash and its
 whole rows. `--resume auto` and `--resume <path>` both refuse a changed source
 count, order, hash or row count. See [Several Files](../data/format.md#resume).
+
+A run with `trainer.data.sources[i].weight` records `mixture`: its `weights`
+and `rows_per_epoch`. They decide which rows `data_position` counts. A resume
+with other weights, another `rows_per_epoch`, or no weights stops with an
+error naming the key. A meta without `mixture` resumes only a run without
+weights. See [Weighted mixture](../data/format.md#weighted-mixture).
 
 Metadata without `hash_algo` holds `legacy` hashes from Rust's
 `DefaultHasher`. The resume recomputes them the legacy way. A legacy

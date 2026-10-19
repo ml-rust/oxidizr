@@ -23,8 +23,8 @@ use oxidizr::config::{
     TrainerConfig,
 };
 use oxidizr::data::{
-    DataPosition, LitDataLoader, RowLayout, RowOrder, TokenMeta, TokenOptions, TokenizerRecord,
-    TOKEN_META_VERSION,
+    Batch, DataPosition, LitDataLoader, RowLayout, RowOrder, TokenMeta, TokenOptions,
+    TokenizerRecord, TOKEN_META_VERSION,
 };
 use oxidizr::data_hash::HashAlgo;
 use oxidizr::eval::{read_eval_resume, EvalConfig, Evaluator};
@@ -223,6 +223,53 @@ pub fn write_token_file(path: &Path, tokens: &[u32]) {
     std::fs::write(path, bytes).expect("write token file");
 }
 
+/// Writes token files of `rows[i]` whole rows of `seq_len + 1` tokens, plus a
+/// 2-token tail, into `dir` as `part<i>.bin`.
+///
+/// Row tokens are their offset in the concatenation of every file's whole
+/// rows, so a row's first token over `seq_len + 1` names its global row.
+/// Tail tokens are `u32::MAX`, so [`offset_rows`] catches a row that reads a
+/// tail or spans two files.
+pub fn write_offset_files(dir: &Path, rows: &[usize], seq_len: usize) -> Vec<PathBuf> {
+    let width = (seq_len + 1) as u32;
+    let mut first = 0u32;
+    rows.iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let mut tokens: Vec<u32> = (first..first + n as u32 * width).collect();
+            tokens.extend([u32::MAX, u32::MAX]);
+            first += n as u32 * width;
+            let path = dir.join(format!("part{i}.bin"));
+            write_token_file(&path, &tokens);
+            path
+        })
+        .collect()
+}
+
+/// The global row of each row of `batch` over [`write_offset_files`] files,
+/// checking each is `seq_len + 1` consecutive offsets.
+pub fn offset_rows(batch: &Batch<CpuRuntime>, seq_len: usize) -> Vec<usize> {
+    let inputs: Vec<i64> = batch.inputs.contiguous().expect("contiguous").to_vec();
+    let targets: Vec<i64> = batch.targets.contiguous().expect("contiguous").to_vec();
+    let width = seq_len + 1;
+    inputs
+        .chunks(seq_len)
+        .zip(targets.chunks(seq_len))
+        .map(|(inp, tgt)| {
+            let start = inp[0] as usize;
+            assert_eq!(start % width, 0, "row starts at offset {start}");
+            let expected: Vec<i64> = (start..start + width).map(|t| t as i64).collect();
+            assert_eq!(
+                inp,
+                &expected[..seq_len],
+                "a row crossed a file or read a tail"
+            );
+            assert_eq!(tgt, &expected[1..], "a row crossed a file or read a tail");
+            start / width
+        })
+        .collect()
+}
+
 /// Writes `cfg` as a YAML config file at `path`, as `oxidizr train -f` reads it.
 pub fn write_config_yaml(path: &Path, cfg: &LitConfig) {
     let yaml = serde_yaml::to_string(cfg).expect("serialize config");
@@ -384,6 +431,7 @@ where
             model_config: cfg.model.clone(),
             data_files: Vec::new(),
             weight_decay,
+            mixture: None,
         },
     )
     .expect("build trainer")

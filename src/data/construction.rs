@@ -3,6 +3,7 @@
 //! training starts.
 
 use super::mask::TargetMask;
+use super::mixture::Mixture;
 use super::row_ranges::RowRanges;
 use super::rows::{DataPosition, EpochOrder, RowLayout, RowOrder};
 use super::source::RowStore;
@@ -36,6 +37,10 @@ use std::path::Path;
 /// Each epoch hands out every row once. The default is stream order;
 /// [`with_row_order`](Self::with_row_order) selects a seeded shuffle.
 ///
+/// # Mixture
+/// [`with_mixture`](Self::with_mixture) weighs the sources. Each epoch then
+/// holds a fixed number of slots, and each source fills its share of them.
+///
 /// # Ranks
 /// The default is rank 0 of a world of 1. [`with_rank`](Self::with_rank)
 /// makes the loader one rank of a data-parallel run. Every rank keeps the
@@ -68,6 +73,8 @@ where
     pub(super) world_size: usize,
     /// Row at each slot of each epoch.
     pub(super) order: EpochOrder,
+    /// The weighted mixture of the sources. `None` reads the row ranges as one stream.
+    pub(super) mixture: Option<Mixture>,
     /// Target mask rule. `Some` turns on masked loss scoring (audio-only for
     /// speech, continuation-only for prefix-LM).
     pub(super) target_mask: Option<TargetMask>,
@@ -100,6 +107,7 @@ where
             rank: 0,
             world_size: 1,
             order: EpochOrder::new(RowOrder::Stream),
+            mixture: None,
             target_mask: None,
         }
     }
@@ -213,14 +221,22 @@ where
     /// Row and global batch counts of this loader's row range.
     ///
     /// One global batch is `batch_size` rows from each of `world_size` ranks.
+    /// Under a weighted mixture an epoch is its rows per epoch.
     pub fn row_layout(&self) -> Result<RowLayout> {
-        RowLayout::for_world(self.ranges.len(), self.batch_size, self.world_size)
+        RowLayout::for_world(self.epoch_rows(), self.batch_size, self.world_size)
     }
 
-    /// Tokens in this loader's row range.
+    /// Slots per epoch: the mixture's rows per epoch, else the rows of the row ranges.
+    fn epoch_rows(&self) -> usize {
+        self.mixture
+            .as_ref()
+            .map_or(self.ranges.len(), Mixture::rows_per_epoch)
+    }
+
+    /// Tokens one epoch reads.
     #[allow(dead_code)]
     pub fn shard_size(&self) -> usize {
-        self.ranges.len() * self.row_width()
+        self.epoch_rows() * self.row_width()
     }
 }
 

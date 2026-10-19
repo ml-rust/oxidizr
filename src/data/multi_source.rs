@@ -36,15 +36,17 @@ where
     ///
     /// Each range is `(start, end)`, end exclusive. The ranges must ascend
     /// without overlap. Loader rows count across the ranges in order. The
-    /// position resets to the start.
+    /// position resets to the start. A weighted mixture is rebuilt over the
+    /// new ranges.
     ///
     /// # Errors
     /// Returns an error for an empty list, an empty range, a range past the
-    /// last whole row, or ranges out of order.
+    /// last whole row, or ranges out of order, and the errors of
+    /// [`with_mixture`](Self::with_mixture) under a mixture.
     pub fn with_row_ranges(mut self, spans: &[(usize, usize)]) -> Result<Self> {
         self.ranges = RowRanges::new(spans, self.total_rows())?;
         self.position = DataPosition::default();
-        Ok(self)
+        self.rebuild_mixture()
     }
 
     /// The global row ranges this loader reads, ascending.

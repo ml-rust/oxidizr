@@ -232,6 +232,11 @@ impl EpochOrder {
         }
     }
 
+    /// The row order this cache serves.
+    pub(crate) fn kind(&self) -> RowOrder {
+        self.order
+    }
+
     /// Shard-relative index of the row at `slot` of `epoch`'s order.
     ///
     /// `layout` bounds `slot` below `num_rows` and `num_rows` to `u32`.
@@ -253,7 +258,7 @@ impl EpochOrder {
 }
 
 /// A permutation of `0..num_rows` for `epoch`, seeded from `seed` and `epoch`.
-fn epoch_permutation(num_rows: usize, seed: u64, epoch: usize) -> Vec<u32> {
+pub(super) fn epoch_permutation(num_rows: usize, seed: u64, epoch: usize) -> Vec<u32> {
     let mut perm: Vec<u32> = (0..num_rows as u32).collect();
     perm.shuffle(&mut StdRng::seed_from_u64(epoch_seed(seed, epoch)));
     perm
@@ -261,7 +266,7 @@ fn epoch_permutation(num_rows: usize, seed: u64, epoch: usize) -> Vec<u32> {
 
 /// Mixes the epoch index into the base seed (golden-ratio increment), so
 /// each epoch of a run draws an independent permutation.
-fn epoch_seed(seed: u64, epoch: usize) -> u64 {
+pub(super) fn epoch_seed(seed: u64, epoch: usize) -> u64 {
     seed ^ (epoch as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 

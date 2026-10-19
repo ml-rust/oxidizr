@@ -49,9 +49,15 @@ where
         // `rank < world_size`, so these slots lie inside the global batch.
         let first_slot = start.row + self.rank * self.batch_size;
         let mut window = Vec::with_capacity(self.batch_size * width);
+        let order = self.order.kind();
         for slot in first_slot..first_slot + self.batch_size {
-            let row = self.order.row(&layout, start.epoch, slot);
-            window.extend_from_slice(self.store.row(self.ranges.global_row(row))?);
+            let global = match self.mixture.as_mut() {
+                Some(mixture) => mixture.global_row(order, start.epoch, slot)?,
+                None => self
+                    .ranges
+                    .global_row(self.order.row(&layout, start.epoch, slot)),
+            };
+            window.extend_from_slice(self.store.row(global)?);
         }
 
         self.position = DataPosition {

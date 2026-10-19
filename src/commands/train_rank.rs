@@ -7,10 +7,11 @@ use crate::checkpoint_set::OptimizerResume;
 use crate::commands::train_data::{run_loaders, RunLoaders};
 use crate::commands::train_plan::RunPlan;
 use crate::commands::train_report::{
-    cuda_memory_info, estimate_params, finish_rank, print_banner, run_config_json, BannerFacts,
+    cuda_memory_info, estimate_params, finish_rank, print_banner, print_mixture, run_config_json,
+    BannerFacts,
 };
 use crate::commands::train_resume::resume_data_position;
-use crate::data::{PrefetchDataLoader, RowOrder};
+use crate::data::{check_mixture_resume, PrefetchDataLoader, RowOrder};
 use crate::dp::RankSlot;
 use crate::eval::read_eval_resume;
 use crate::model::{load_checkpoint_into_model, LitGPT};
@@ -121,6 +122,9 @@ where
     // Before the seek: the held-out rows decide what the saved data position means.
     let meta = resume.meta_path.as_deref();
     let eval_resume = read_eval_resume(meta, resume.start_step, holdout_rows)?;
+    // Before the seek: the mixture decides which rows the saved data position counts.
+    let mixture = train.mixture_record();
+    check_mixture_resume(meta, resume.start_step, mixture.as_ref())?;
     // Only rank 0 evaluates. The others learn its early-stop decision by broadcast.
     let evaluator = evaluator.filter(|_| rank0).map(|e| e.resumed(eval_resume));
     if let (Some(eval), true) = (&evaluator, say) {
@@ -160,6 +164,9 @@ where
             row_order,
             prefetch
         );
+        if let Some(sources) = loader.mixture_sources() {
+            print_mixture(&sources, &plan.data_files);
+        }
         println!(
             "Data position: epoch {} row {}\n",
             start_position.epoch, start_position.row
@@ -217,6 +224,7 @@ where
             model_config: config.model.clone(),
             data_files: plan.data_files.clone(),
             weight_decay: plan.weight_decay.clone(),
+            mixture,
         },
     )?;
     if slot.world > 1 {

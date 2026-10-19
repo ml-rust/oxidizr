@@ -3,7 +3,9 @@ use crate::checkpoint_set::{
     FrozenCache, NameMaps, OptimizerResume, SetSnapshot, SnapshotInput,
 };
 use crate::config::{OxidizrModelConfig, TrainerConfig};
-use crate::data::{source_records, DataLoader, DataPosition, DataSourceRecord, RowLayout};
+use crate::data::{
+    source_records, DataLoader, DataPosition, DataSourceRecord, MixtureRecord, RowLayout,
+};
 use crate::dp::{reduce_step_gradients, reduce_step_weighting, AbortHook};
 use crate::eval::Evaluator;
 use crate::fit::CheckpointQueue;
@@ -48,6 +50,10 @@ pub struct TrainerRunConfig {
     pub data_files: Vec<String>,
     /// Resolved weight decay rule, from `crate::weight_decay::resolve_weight_decay`.
     pub weight_decay: WeightDecaySpec,
+    /// The loader's weighted data mixture, from
+    /// [`mixture_record`](crate::data::LitDataLoader::mixture_record). Every
+    /// checkpoint meta records it. `None` without weights.
+    pub mixture: Option<MixtureRecord>,
 }
 
 /// The "LitGPT" style Trainer abstraction.
@@ -83,6 +89,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     pub(crate) model_config: OxidizrModelConfig,
     /// Records of the training data files, taken once at construction.
     data_sources: Vec<DataSourceRecord>,
+    /// The weighted data mixture every checkpoint meta records.
+    mixture: Option<MixtureRecord>,
     /// Host copies of the frozen parameters, shared by every checkpoint snapshot.
     frozen_host: FrozenCache,
     /// The background checkpoint writer and the checkpoint outcomes not yet reported.
@@ -146,6 +154,7 @@ where
             model_config,
             data_files,
             weight_decay,
+            mixture,
         } = run;
 
         config.distributed.validate()?;
@@ -205,6 +214,7 @@ where
             start_position,
             model_config,
             data_sources,
+            mixture,
             frozen_host: FrozenCache::default(),
             checkpoints: CheckpointQueue::default(),
             lr_plan,
@@ -848,6 +858,7 @@ where
             world_size: self.world_size(),
             global_batch_rows: self.row_layout.batch_size(),
             spike_guard: self.metrics.spike_state(),
+            mixture: self.mixture.as_ref(),
             frozen: &self.frozen_host,
         })
     }

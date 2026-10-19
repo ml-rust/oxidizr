@@ -11,8 +11,9 @@ mod common;
 
 use boostr::{CpuDevice, CpuRuntime};
 use common::{
-    assert_same_checkpoints, checkpoint_meta_path, checkpoint_weights, cli_train_args,
-    sample_token_meta, scratch_dir, tiny_config, weights_file_bits, write_token_file,
+    assert_same_checkpoints, checkpoint_meta_path, checkpoint_weights, cli_train_args, offset_rows,
+    sample_token_meta, scratch_dir, tiny_config, weights_file_bits, write_offset_files,
+    write_token_file,
 };
 use oxidizr::checkpoint_set::CheckpointLabel;
 use oxidizr::commands::run_train;
@@ -26,49 +27,15 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const SEQ_LEN: usize = 3;
-const WIDTH: usize = SEQ_LEN + 1;
 
-/// Writes files of `rows[i]` whole rows plus a 2-token tail into `dir`.
-///
-/// Row tokens are their offset in the concatenation of every file's whole
-/// rows, so a row's first token over `WIDTH` names its global row. Tail
-/// tokens are `u32::MAX`, so a row that reads a tail or spans two files is
-/// caught by [`rows_of`].
+/// [`write_offset_files`] at rows of `SEQ_LEN + 1` tokens.
 fn offset_files(dir: &Path, rows: &[usize]) -> Vec<PathBuf> {
-    let mut first = 0u32;
-    rows.iter()
-        .enumerate()
-        .map(|(i, &n)| {
-            let mut tokens: Vec<u32> = (first..first + (n * WIDTH) as u32).collect();
-            tokens.extend([u32::MAX, u32::MAX]);
-            first += (n * WIDTH) as u32;
-            let path = dir.join(format!("part{i}.bin"));
-            write_token_file(&path, &tokens);
-            path
-        })
-        .collect()
+    write_offset_files(dir, rows, SEQ_LEN)
 }
 
-/// The global row of each row of `batch`, checking each is `WIDTH` consecutive offsets.
+/// [`offset_rows`] at rows of `SEQ_LEN + 1` tokens.
 fn rows_of(batch: &Batch<CpuRuntime>) -> Vec<usize> {
-    let inputs: Vec<i64> = batch.inputs.contiguous().expect("contiguous").to_vec();
-    let targets: Vec<i64> = batch.targets.contiguous().expect("contiguous").to_vec();
-    inputs
-        .chunks(SEQ_LEN)
-        .zip(targets.chunks(SEQ_LEN))
-        .map(|(inp, tgt)| {
-            let start = inp[0] as usize;
-            assert_eq!(start % WIDTH, 0, "row starts at offset {start}");
-            let expected: Vec<i64> = (start..start + WIDTH).map(|t| t as i64).collect();
-            assert_eq!(
-                inp,
-                &expected[..SEQ_LEN],
-                "a row crossed a file or read a tail"
-            );
-            assert_eq!(tgt, &expected[1..], "a row crossed a file or read a tail");
-            start / WIDTH
-        })
-        .collect()
+    offset_rows(batch, SEQ_LEN)
 }
 
 fn loader(paths: &[PathBuf], batch_size: usize) -> LitDataLoader<CpuRuntime> {
@@ -136,7 +103,7 @@ fn rank_windows_over_two_files_concatenate_to_the_global_window() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// `tiny_config` with rows of `WIDTH` tokens and an eval of `eval`.
+/// `tiny_config` with rows of `SEQ_LEN + 1` tokens and an eval of `eval`.
 fn holdout_config(dir: &Path, eval: EvalConfig) -> LitConfig {
     let mut cfg = tiny_config(&dir.join("ckpt"), 4);
     cfg.model.max_seq_len = SEQ_LEN;
@@ -292,7 +259,9 @@ fn a_one_source_config_trains_bit_identical_to_the_data_flag() {
     yaml_cfg.trainer.data = Some(DataConfig {
         sources: vec![DataSourceSpec {
             path: a.to_string_lossy().into_owned(),
+            weight: None,
         }],
+        rows_per_epoch: None,
     });
     run_train(cli_train_args(&dir, &yaml_cfg, &[], "yaml")).expect("yaml run");
     let checked = assert_same_checkpoints(&dir.join("ckpt-flag"), &dir.join("ckpt-yaml"));

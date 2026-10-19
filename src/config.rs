@@ -1,7 +1,7 @@
 use crate::checkpoint_set::{optimizer_path_for, weights_step, CheckpointLabel};
 use crate::data::{
     check_meta_sources, set_meta_sources, source_records, DataConfig, DataPosition,
-    DataSourceRecord,
+    DataSourceRecord, MixtureRecord,
 };
 use crate::data_hash::{hash_json, legacy_hash_str, HashAlgo};
 use crate::eval::EvalConfig;
@@ -1272,6 +1272,11 @@ pub struct CheckpointMeta {
     /// from it. Absent without `trainer.spike_guard`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spike_guard: Option<SpikeGuardState>,
+    /// Weights and rows per epoch of the run's weighted data mixture. A
+    /// resume with other values is an error: they decide which rows
+    /// `data_position` counts. Absent for a run without weights.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixture: Option<MixtureRecord>,
 }
 
 fn default_dtype_string() -> String {
@@ -1336,6 +1341,7 @@ impl CheckpointMeta {
             world_size: None,
             global_batch_rows: None,
             spike_guard: None,
+            mixture: None,
         };
         set_meta_sources(&mut meta, data_sources);
         meta

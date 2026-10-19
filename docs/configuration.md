@@ -206,12 +206,20 @@ The checkpoint meta records the scale, so a resume continues it exactly. See [Re
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `data.sources[i].path` | Token file `i`. `${VAR}` expands | none |
+| `data.sources[i].weight` | Share of each epoch's rows for file `i`, relative to the other weights. Finite and above 0 | none |
+| `data.rows_per_epoch` | Rows per epoch of a weighted mixture. Needs weights | every training row of every source |
 
 - Setting `trainer.data.sources` and `-d` together is an error naming both.
 - An empty list, an empty path or an unknown key is an error.
 - Each file drops its own tail shorter than a row. No row spans two files.
 - One source trains bit-identical to `-d` with that file.
-- See [Several Files](data/format.md#several-files) for the holdout and resume rules.
+- Set `weight` on every source, or on none. A weight on some sources only is an error naming both keys.
+- A weight of 0, below 0, or not finite is an error. `rows_per_epoch: 0` is an error.
+- Without weights the run reads one stream in list order, as before.
+- With weights, file `i` supplies `c_i` rows of each epoch of `L = rows_per_epoch` rows. `c_i` is the largest-remainder rounding of `w_i / sum(w) * L`. A tie goes to the lower index.
+- The holdout comes off each file first. The mixture covers the training rows only, and the eval stays unmixed.
+- A resume with other weights or another `rows_per_epoch` is an error naming the key. Resume with the original config, or start a fresh run.
+- See [Weighted mixture](data/format.md#weighted-mixture) for the slot order, upsampling and resume rules.
 
 ```yaml
 trainer:
@@ -219,6 +227,19 @@ trainer:
     sources:
       - path: data/web.bin
       - path: ${DATA_DIR}/code.bin
+```
+
+A weighted mixture of the same files:
+
+```yaml
+trainer:
+  data:
+    rows_per_epoch: 100000
+    sources:
+      - path: data/web.bin
+        weight: 0.7
+      - path: ${DATA_DIR}/code.bin
+        weight: 0.3
 ```
 
 ### Validation and Early Stopping
