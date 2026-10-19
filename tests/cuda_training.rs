@@ -35,6 +35,9 @@
 
 mod common;
 
+use boostr::autograd::{backward_wrt, var_add, var_mul, var_mul_scalar, var_reshape, var_sum, Var};
+use boostr::tensor::TensorId;
+use boostr::Tensor;
 use boostr::{
     CpuClient, CpuDevice, CpuRuntime, CudaClient, CudaDevice, CudaRuntime, DType, Runtime,
 };
@@ -44,7 +47,8 @@ use common::{
 };
 use oxidizr::checkpoint_set::{plan_optimizer_resume, OptimizerResume};
 use oxidizr::config::{
-    find_latest_checkpoint, CheckpointMeta, GdnSpec, LitConfig, OxidizrModelConfig, TargetDevice,
+    find_latest_checkpoint, ActivationCheckpointing, CheckpointMeta, GdnSpec, LitConfig,
+    OxidizrModelConfig, TargetDevice,
 };
 use oxidizr::data::{DataPosition, LitDataLoader, RowOrder};
 use oxidizr::loss_scale::read_loss_scale_state;
@@ -450,6 +454,171 @@ fn cuda_resume_is_bit_identical_when_the_step_is_deterministic() {
     }
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_dir_all(init_dir);
+}
+
+/// Relative bound between the plain and the recomputed step on CUDA.
+const CHECKPOINT_RTOL: f64 = 1e-5;
+/// Scale floor, so a near-zero tensor does not fail on rounding noise.
+const CHECKPOINT_SCALE_FLOOR: f64 = 1e-6;
+
+/// Gradient values by parameter name; `None` marks a parameter that got no gradient.
+type GradsByName = BTreeMap<String, Option<Vec<f32>>>;
+
+/// Loss and trainable gradients of one forward and backward under `policy`.
+///
+/// The loss is `sum(logits * w)` with a fixed `w`, plus the scaled MoE losses.
+fn loss_and_grads(
+    model: &LitGPT<CudaRuntime>,
+    client: &CudaClient,
+    device: &CudaDevice,
+    vocab: usize,
+    policy: &ActivationCheckpointing,
+) -> Result<(f64, GradsByName), String> {
+    let (batch, seq) = (2usize, 8usize);
+    let vocab = vocab as i64;
+    let ids: Vec<i64> = (0..(batch * seq) as i64)
+        .map(|i| (i * 5 + i / 3) % vocab)
+        .collect();
+    let ids = Tensor::<CudaRuntime>::from_slice(&ids, &[batch, seq], device)
+        .map_err(|e| format!("token ids: {e}"))?;
+    let out = model
+        .forward_with(client, &ids, policy)
+        .map_err(|e| format!("forward: {e}"))?;
+
+    let logits = out.logits.tensor();
+    let w: Vec<f32> = (0..logits.numel())
+        .map(|i| ((i * 37 + 11) % 101) as f32 / 101.0 - 0.5)
+        .collect();
+    let w = Tensor::<CudaRuntime>::from_slice(&w, logits.shape(), device)
+        .map_err(|e| format!("loss weights: {e}"))?;
+    let total = |v: &Var<CudaRuntime>| -> Result<Var<CudaRuntime>, String> {
+        let flat = var_reshape(v, &[v.tensor().numel()]).map_err(|e| format!("flatten: {e}"))?;
+        var_sum(&flat, &[0], false, client).map_err(|e| format!("sum: {e}"))
+    };
+    let weighted =
+        var_mul(&out.logits, &Var::new(w, false), client).map_err(|e| format!("mul: {e}"))?;
+    let mut loss = total(&weighted)?;
+    let terms = out
+        .aux_losses
+        .iter()
+        .map(|v| (v, 0.01))
+        .chain(out.z_losses.iter().map(|v| (v, 0.001)));
+    for (term, scale) in terms {
+        let scaled =
+            var_mul_scalar(&total(term)?, scale, client).map_err(|e| format!("scale: {e}"))?;
+        loss = var_add(&loss, &scaled, client).map_err(|e| format!("add: {e}"))?;
+    }
+
+    // The trainer asks backward for the trainable ids alone. This test asks the same.
+    let named = model
+        .named_trainable_parameters()
+        .map_err(|e| format!("named parameters: {e}"))?;
+    let ids: Vec<TensorId> = named.iter().map(|(_, id, _)| *id).collect();
+    let grads = backward_wrt(&loss, &ids, client).map_err(|e| format!("backward: {e}"))?;
+    let loss_value = loss
+        .tensor()
+        .contiguous()
+        .map_err(|e| format!("loss read: {e}"))?
+        .to_vec::<f32>()
+        .first()
+        .copied()
+        .ok_or_else(|| "empty loss tensor".to_string())?;
+    let mut by_name = BTreeMap::new();
+    for (name, id, _) in named {
+        let grad = match grads.get(id) {
+            Some(g) => Some(
+                g.contiguous()
+                    .map_err(|e| format!("gradient '{name}': {e}"))?
+                    .to_vec::<f32>(),
+            ),
+            None => None,
+        };
+        by_name.insert(name, grad);
+    }
+    Ok((f64::from(loss_value), by_name))
+}
+
+/// A GDN layer and an attention layer over an MoE FFN: one step under
+/// `ActivationCheckpointing::None` and under `All` agree on the loss and on
+/// every trainable gradient. The recompute sums in the same order as the
+/// plain pass, but CUDA kernels can differ in the last ulps, so the bound is
+/// relative and not bit equality.
+#[test]
+fn cuda_checkpointing_all_matches_none_on_gdn_moe_hybrid() {
+    let Some((_guard, client, device)) = cuda() else {
+        return;
+    };
+    let dir = scratch_dir("cuda-ckpt-parity");
+    let mut cfg = gdn_config(&dir);
+    cfg.model.num_experts = Some(4);
+    cfg.model.experts_per_tok = Some(2);
+    cfg.model.shared_expert_enabled = Some(true);
+    let vocab = cfg.model.vocab_size;
+    let model = build_model_on::<CudaRuntime>(&cfg, &device, &client);
+
+    let (plain_loss, plain) = loss_and_grads(
+        &model,
+        &client,
+        &device,
+        vocab,
+        &ActivationCheckpointing::None,
+    )
+    .expect("plain forward and backward");
+    let (re_loss, recomputed) = loss_and_grads(
+        &model,
+        &client,
+        &device,
+        vocab,
+        &ActivationCheckpointing::All,
+    )
+    .expect("recomputed forward and backward");
+
+    let loss_diff = (plain_loss - re_loss).abs();
+    assert!(
+        plain_loss.is_finite() && re_loss.is_finite(),
+        "loss not finite: none {plain_loss}, all {re_loss}"
+    );
+    assert!(
+        loss_diff <= CHECKPOINT_RTOL * plain_loss.abs().max(CHECKPOINT_SCALE_FLOOR),
+        "loss differs: none {plain_loss}, all {re_loss}, abs diff {loss_diff:e}"
+    );
+
+    assert_eq!(
+        plain.keys().collect::<Vec<_>>(),
+        recomputed.keys().collect::<Vec<_>>(),
+        "trainable parameter names differ"
+    );
+    let mut compared = 0usize;
+    for (name, want) in &plain {
+        let got = &recomputed[name];
+        let (want, got) = match (want, got) {
+            (Some(w), Some(g)) => (w, g),
+            // A routed expert no token reaches has no gradient in either run.
+            (None, None) if name.contains(".experts.") => continue,
+            (w, g) => panic!(
+                "gradient '{name}' present in none: {}, in all: {}",
+                w.is_some(),
+                g.is_some()
+            ),
+        };
+        assert_eq!(want.len(), got.len(), "gradient '{name}' length differs");
+        let max_diff = want
+            .iter()
+            .zip(got)
+            .map(|(a, b)| f64::from((a - b).abs()))
+            .fold(0.0, f64::max);
+        let scale = want
+            .iter()
+            .map(|a| f64::from(a.abs()))
+            .fold(CHECKPOINT_SCALE_FLOOR, f64::max);
+        assert!(
+            max_diff <= CHECKPOINT_RTOL * scale,
+            "gradient '{name}' differs: max abs diff {max_diff:e}, scale {scale:e}"
+        );
+        compared += 1;
+    }
+    assert!(compared > 0, "no trainable gradient was compared");
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// Most steps the f16 case runs to reach `STEPS` clean steps.

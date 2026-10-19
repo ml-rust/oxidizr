@@ -51,7 +51,7 @@ Each training forward starts from a zero conv window and a zero state. One seque
 
 An MoE GDN layer adds its load-balance and z losses to the step loss, as an MoE attention layer does.
 
-Activation checkpointing: `trainer.activation_checkpointing` runs a covered GDN layer as one recompute segment, as it does every other layer. On CPU the values stay bit-identical. CUDA bitwise equality is unconfirmed. See [Activation Checkpointing](../configuration.md#activation-checkpointing).
+Activation checkpointing: `trainer.activation_checkpointing` runs a covered GDN layer as one recompute segment, as it does every other layer. On CPU the values stay bit-identical. On CUDA a test checks agreement within a relative 1e-5. See [Activation Checkpointing](../configuration.md#activation-checkpointing).
 
 ## Checkpoint Layout
 
@@ -94,7 +94,7 @@ oxidizr trains in the tiled value-head order. Grouped order puts the value heads
 
 ## Unsupported
 
-- GPU training is unconfirmed. The tests run GDN training, resume and LoRA on CPU only. No run on a real GPU has checked the CUDA path.
+- Multi-GPU GDN training. Only single-GPU CUDA runs have a test.
 - blazr serving. blazr serves GDN through boostr's `qwen35` model. That model also expects Qwen3.5 gated full attention (`q_proj` rows `[query | gate]`, partial rotary). oxidizr's attention layers have no output gate. Training warns and writes no `config.json` for a GDN model, and `oxidizr merge` skips it.
 - Qwen3.5 gated attention layers. Every non-GDN, non-Mamba layer is oxidizr's own attention block.
 - Import of a Hugging Face Qwen3.5 checkpoint, and export to one. The names and head order differ as the table lists.

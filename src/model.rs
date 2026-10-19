@@ -3671,7 +3671,7 @@ where
 
     /// The forward pass. Each layer `checkpointing` covers recomputes its
     /// activations in the backward pass. CPU tests check bit-identical outputs and
-    /// gradients. CUDA bitwise equality is unconfirmed.
+    /// gradients. CUDA agrees within a relative 1e-5.
     ///
     /// # Errors
     ///

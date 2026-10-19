@@ -294,7 +294,7 @@ trainer:
 
 Rules:
 
-- On CPU, the loss, every gradient and the MoE auxiliary and z-losses stay bit-identical to `none`. Tests cover this. Bitwise equality on CUDA is unconfirmed.
+- On CPU, the loss, every gradient and the MoE auxiliary and z-losses stay bit-identical to `none`. Tests cover this. On CUDA a test checks agreement within a relative 1e-5. Bitwise equality there is not claimed.
 - Peak memory and step time change.
 - Each covered layer runs its forward pass twice per step. MFU counts model FLOPs only, so the recompute lowers MFU.
 - `layers` must be non-empty, each index below `model.num_layers`, and no index listed twice. Each error names the index, `model.num_layers` and the key `trainer.activation_checkpointing.layers`.

@@ -2,7 +2,7 @@
 //!
 //! A covered layer keeps only its input during the forward pass. The backward
 //! pass runs the layer again to rebuild its graph. CPU tests check bit-identical
-//! values and gradients. CUDA bitwise equality is unconfirmed. The key never
+//! values and gradients. CUDA agrees within a relative 1e-5. The key never
 //! enters the model config hash or a checkpoint meta, and a resume can change it.
 //!
 //! YAML:
