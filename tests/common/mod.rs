@@ -14,17 +14,22 @@ use boostr::{
     ReduceOps, RoPEOps, Runtime, RuntimeClient, ScalarOps, ShapeOps, Tensor, TensorOps,
     TypeConversionOps, UnaryOps, VarMap,
 };
+use oxidizr::checkpoint_set::plan_optimizer_resume;
 use oxidizr::commands::train_data::{run_loaders, TokenSource};
 use oxidizr::config::{
-    ActivationCheckpointing, DTypePrecision, DistributedConfig, GdnSpec, LitConfig,
-    OxidizrModelConfig, TargetDevice, TrainerConfig,
+    find_latest_checkpoint, ActivationCheckpointing, CheckpointMeta, DTypePrecision,
+    DistributedConfig, GdnSpec, LitConfig, LoraConfig, OxidizrModelConfig, TargetDevice,
+    TrainerConfig,
 };
 use oxidizr::data::{DataPosition, LitDataLoader, RowLayout, RowOrder};
-use oxidizr::eval::{EvalConfig, Evaluator};
-use oxidizr::model::LitGPT;
+use oxidizr::eval::{read_eval_resume, EvalConfig, Evaluator};
+use oxidizr::fit::{CheckpointNote, EvalReport, FitStart, FitSummary, StepReport, StepSink};
+use oxidizr::loss_scale::read_loss_scale_state;
+use oxidizr::model::{load_checkpoint_into_model, LitGPT};
+use oxidizr::prelude::{Error, Result};
 use oxidizr::schedule::LrSchedule;
 use oxidizr::trainer::{LitTrainer, TrainerRunConfig};
-use oxidizr::weight_decay::{resolve_weight_decay, WeightDecaySpec};
+use oxidizr::weight_decay::{inherited_weight_decay, resolve_weight_decay, WeightDecaySpec};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -158,6 +163,7 @@ pub fn tiny_config(checkpoint_dir: &Path, max_steps: usize) -> LitConfig {
             log_interval: 10,
             save_interval: 0,
             max_checkpoints: 0,
+            async_checkpoint: false,
             load_balance_alpha: 0.0,
             max_grad_norm: 1.0,
             target_grad_norm: None,
@@ -454,4 +460,190 @@ pub fn event_files(dir: &Path) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// LoRA adapters of rank 2 on `q_proj` and `v_proj`, with the whole base frozen.
+pub fn tiny_lora() -> LoraConfig {
+    LoraConfig {
+        rank: 2,
+        alpha: 4.0,
+        target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+        freeze_base: true,
+        train_modules: Vec::new(),
+    }
+}
+
+/// What one [`fit_session`] reached.
+pub struct FitSession {
+    /// Bit patterns of every trainable tensor after the session.
+    pub bits: BTreeMap<String, Vec<u32>>,
+    pub final_step: usize,
+    pub stop_reason: Option<String>,
+}
+
+/// Fits `cfg` from the latest checkpoint in its directory, or from step 0 when
+/// `resume` is false, as `commands::train` sets the run up.
+///
+/// The latest checkpoint is the one `--resume auto` picks. An eval runs when
+/// `cfg.trainer.eval` is set.
+pub fn fit_session(
+    cfg: &LitConfig,
+    resume: bool,
+    sink: &mut dyn StepSink,
+) -> (FitSession, Result<()>) {
+    let mut model = build_model(cfg);
+    let (start_step, found) = if resume {
+        let (weights, meta, step) = find_latest_checkpoint(&cfg.trainer.checkpoint_dir)
+            .expect("scan")
+            .expect("a committed step set");
+        load_checkpoint_into_model(&mut model, &weights).expect("load weights");
+        (step, Some((weights, meta)))
+    } else {
+        (0, None)
+    };
+    let weights = found.as_ref().map(|(w, _)| w.as_str());
+    let meta = found.as_ref().map(|(_, m)| m.as_str());
+    let plan = plan_optimizer_resume(weights, meta, start_step).expect("optimizer plan");
+    let inherited = inherited_weight_decay(meta, start_step).expect("inherited rule");
+    let decay = resolve_weight_decay(&cfg.trainer, inherited.as_ref(), true).expect("rule");
+    let scale = read_loss_scale_state(meta, start_step).expect("loss scale");
+
+    let (mut train, evaluator) = match cfg.trainer.eval {
+        Some(_) => {
+            let (train, evaluator) = eval_loaders(cfg);
+            let state =
+                read_eval_resume(meta, start_step, evaluator.holdout_rows()).expect("eval state");
+            (train, Some(evaluator.resumed(state)))
+        }
+        None => (data_loader(cfg), None),
+    };
+    let layout = train.row_layout().expect("row layout");
+    let position = meta
+        .map(|m| CheckpointMeta::load(m).expect("meta"))
+        .and_then(|m| m.data_position)
+        .unwrap_or_default();
+    train.seek(position).expect("seek");
+
+    let mut parts = train_parts(&model);
+    let (final_step, stop_reason, result) = {
+        let mut t = trainer_with_decay(cfg, &mut parts, layout, start_step, position, decay);
+        t.apply_optimizer_resume(&plan).expect("optimizer state");
+        t.restore_loss_scale(scale).expect("loss scale");
+        if let Some(evaluator) = evaluator {
+            t.attach_eval(evaluator);
+        }
+        let result = t.fit_with_sink(&model, &mut train, sink);
+        (
+            t.global_step(),
+            t.early_stop_reason().map(str::to_string),
+            result,
+        )
+    };
+    let session = FitSession {
+        bits: bits_by_name(&parts),
+        final_step,
+        stop_reason,
+    };
+    (session, result)
+}
+
+/// A sink that ends the run with an error in `on_step` of step `at`.
+///
+/// The step's eval and save never run. The fit loop then waits for every
+/// checkpoint write in flight, so the sets before step `at` are on disk.
+pub struct StopAtStep<S> {
+    pub inner: S,
+    pub at: usize,
+}
+
+impl<S: StepSink> StepSink for StopAtStep<S> {
+    fn on_start(&mut self, start: &FitStart) -> Result<()> {
+        self.inner.on_start(start)
+    }
+    fn on_step(&mut self, report: &StepReport) -> Result<()> {
+        self.inner.on_step(report)?;
+        if report.step == self.at {
+            return Err(Error::TrainingError {
+                reason: format!("stopped at step {}", self.at),
+            });
+        }
+        Ok(())
+    }
+    fn on_eval(&mut self, step: usize, report: &EvalReport) -> Result<()> {
+        self.inner.on_eval(step, report)
+    }
+    fn on_checkpoint(&mut self, note: &CheckpointNote) -> Result<()> {
+        self.inner.on_checkpoint(note)
+    }
+    fn on_error(&mut self, step: usize, error: &Error) {
+        self.inner.on_error(step, error)
+    }
+    fn on_finish(&mut self, summary: &FitSummary) -> Result<()> {
+        self.inner.on_finish(summary)
+    }
+}
+
+/// Sorted entry names of `dir`, without TensorBoard event files.
+///
+/// Only a `tensorboard` build writes event files, and their names hold a time.
+pub fn dir_entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with("events.out.tfevents."))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The checkpoint meta at `path` as JSON, without what differs between two runs.
+///
+/// `timestamp` goes, and `checkpoint_file` keeps its file name only.
+pub fn comparable_meta(path: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(path).expect("read meta");
+    let mut meta: serde_json::Value = serde_json::from_str(&text).expect("meta json");
+    let map = meta.as_object_mut().expect("meta object");
+    map.remove("timestamp");
+    let file = map
+        .get("checkpoint_file")
+        .and_then(serde_json::Value::as_str)
+        .expect("checkpoint_file")
+        .to_string();
+    let name = Path::new(&file)
+        .file_name()
+        .expect("file name")
+        .to_string_lossy()
+        .into_owned();
+    map.insert(
+        "checkpoint_file".to_string(),
+        serde_json::Value::String(name),
+    );
+    meta
+}
+
+/// `a` and `b` hold the same checkpoint files, byte-equal, with equal metas.
+///
+/// Every `.safetensors` file must match byte for byte. Every `.meta.json`
+/// must match after [`comparable_meta`]. Returns the checkpoint file names.
+pub fn assert_same_checkpoints(a: &Path, b: &Path) -> Vec<String> {
+    let names = dir_entries(a);
+    assert_eq!(names, dir_entries(b), "the checkpoint files differ");
+    let mut checked = Vec::new();
+    for name in names {
+        if name.ends_with(".safetensors") {
+            let left = std::fs::read(a.join(&name)).expect("read file");
+            let right = std::fs::read(b.join(&name)).expect("read file");
+            assert!(left == right, "{name} differs between the runs");
+            checked.push(name);
+        } else if name.ends_with(".meta.json") {
+            assert_eq!(
+                comparable_meta(&a.join(&name)),
+                comparable_meta(&b.join(&name)),
+                "{name} differs between the runs"
+            );
+            checked.push(name);
+        }
+    }
+    checked
 }

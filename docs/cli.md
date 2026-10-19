@@ -115,6 +115,7 @@ cargo run --release -- train -f models/nano.yaml --batch-size 4 --seq-len 256 --
 | ----------------------- | ------------------------------------------------------- |
 | `--resume <PATH\|auto>` | Resume from checkpoint. Use `auto` to find latest. Restores weights, optimizer state and data position. See [Checkpoints](training/checkpoints.md). |
 | `--max-checkpoints <N>` | Maximum checkpoints to keep. 0 = unlimited. Default: 10 |
+| `--async-checkpoint`    | Commit checkpoint sets on a background thread. Sets `trainer.async_checkpoint: true`. See [Checkpoints](training/checkpoints.md#background-writes). |
 
 Example:
 

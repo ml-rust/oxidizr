@@ -4,31 +4,25 @@
 mod common;
 
 use common::{
-    bits_by_name, build_model, eval_loaders, holdout_eval, scratch_dir, tiny_config, train_parts,
-    trainer_with_decay,
+    build_model, fit_session as session, holdout_eval, scratch_dir, tiny_config, train_parts,
+    StopAtStep,
 };
-use oxidizr::checkpoint_set::{plan_optimizer_resume, CheckpointLabel};
-use oxidizr::config::{find_latest_checkpoint, CheckpointMeta, LitConfig};
+use oxidizr::checkpoint_set::CheckpointLabel;
+use oxidizr::config::{CheckpointMeta, LitConfig};
 use oxidizr::data::DataPosition;
 use oxidizr::eval::{read_eval_resume, EarlyStoppingConfig};
 use oxidizr::fit::{
     CheckpointNote, EvalReport, FitStart, FitSummary, JsonSink, StepReport, StepSink,
 };
-use oxidizr::loss_scale::read_loss_scale_state;
 use oxidizr::metrics::GpuMemory;
-use oxidizr::model::load_checkpoint_into_model;
 use oxidizr::prelude::{Error, Result};
 use oxidizr::run_record::EVALS_FILE;
-use oxidizr::weight_decay::{inherited_weight_decay, resolve_weight_decay};
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 const STEPS: usize = 6;
 const HALF: usize = STEPS / 2;
 const HOLDOUT: usize = 40;
-
-type Bits = BTreeMap<String, Vec<u32>>;
 
 fn no_gpu() -> Option<GpuMemory> {
     None
@@ -77,63 +71,6 @@ fn config(dir: &Path, save: usize, early: Option<EarlyStoppingConfig>) -> LitCon
     cfg
 }
 
-struct Session {
-    bits: Bits,
-    final_step: usize,
-    stop_reason: Option<String>,
-}
-
-/// Fits `cfg` from the latest checkpoint in its directory, or from step 0 when
-/// `resume` is false, as `commands::train` sets the run up.
-fn session(cfg: &LitConfig, resume: bool, sink: &mut dyn StepSink) -> (Session, Result<()>) {
-    let mut model = build_model(cfg);
-    let (start_step, found) = if resume {
-        let (weights, meta, step) = find_latest_checkpoint(&cfg.trainer.checkpoint_dir)
-            .expect("scan")
-            .expect("a committed step set");
-        load_checkpoint_into_model(&mut model, &weights).expect("load weights");
-        (step, Some((weights, meta)))
-    } else {
-        (0, None)
-    };
-    let weights = found.as_ref().map(|(w, _)| w.as_str());
-    let meta = found.as_ref().map(|(_, m)| m.as_str());
-    let plan = plan_optimizer_resume(weights, meta, start_step).expect("optimizer plan");
-    let inherited = inherited_weight_decay(meta, start_step).expect("inherited rule");
-    let decay = resolve_weight_decay(&cfg.trainer, inherited.as_ref(), true).expect("rule");
-    let scale = read_loss_scale_state(meta, start_step).expect("loss scale");
-
-    let (mut train, evaluator) = eval_loaders(cfg);
-    let resume_state =
-        read_eval_resume(meta, start_step, evaluator.holdout_rows()).expect("eval state");
-    let layout = train.row_layout().expect("row layout");
-    let position = meta
-        .map(|m| CheckpointMeta::load(m).expect("meta"))
-        .and_then(|m| m.data_position)
-        .unwrap_or_default();
-    train.seek(position).expect("seek");
-
-    let mut parts = train_parts(&model);
-    let (final_step, stop_reason, result) = {
-        let mut t = trainer_with_decay(cfg, &mut parts, layout, start_step, position, decay);
-        t.apply_optimizer_resume(&plan).expect("optimizer state");
-        t.restore_loss_scale(scale).expect("loss scale");
-        t.attach_eval(evaluator.resumed(resume_state));
-        let result = t.fit_with_sink(&model, &mut train, sink);
-        (
-            t.global_step(),
-            t.early_stop_reason().map(str::to_string),
-            result,
-        )
-    };
-    let session = Session {
-        bits: bits_by_name(&parts),
-        final_step,
-        stop_reason,
-    };
-    (session, result)
-}
-
 /// A headless sink whose output nobody reads.
 fn quiet() -> JsonSink<std::io::Sink, std::io::Sink> {
     JsonSink::new(std::io::sink(), std::io::sink(), no_gpu)
@@ -179,6 +116,50 @@ fn a_run_with_evals_resumes_bit_identical_including_evals_json() {
     assert_eq!(a.evals_since_best, b.evals_since_best);
     assert_eq!(a.holdout_rows, Some(HOLDOUT));
     assert_eq!(b.holdout_rows, Some(HOLDOUT));
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// The async writer commits the step-`HALF` set while later steps run. A stop
+/// at step `HALF + 1`, before its eval, leaves that set and `HALF` eval lines.
+/// The resume must match a synchronous uninterrupted run bit for bit.
+#[test]
+fn an_async_run_with_evals_resumes_bit_identical_including_evals_json() {
+    let dir = scratch_dir("eval-exact-resume-async");
+    let (reference_dir, stopped_dir) = (dir.join("reference"), dir.join("stopped"));
+    let reference_cfg = config(&reference_dir, HALF, None);
+    let mut stopped_cfg = config(&stopped_dir, HALF, None);
+    stopped_cfg.trainer.async_checkpoint = true;
+
+    let (reference, result) = session(&reference_cfg, false, &mut quiet());
+    result.expect("reference run");
+
+    let mut stop = StopAtStep {
+        inner: quiet(),
+        at: HALF + 1,
+    };
+    let (stopped, result) = session(&stopped_cfg, false, &mut stop);
+    assert!(result.is_err(), "the stop sink ends the first session");
+    assert_eq!(stopped.final_step, HALF + 1);
+    assert!(
+        stopped_dir
+            .join(CheckpointLabel::Step(HALF).meta_file_name())
+            .exists(),
+        "the error path waits for the write in flight"
+    );
+    let (resumed, result) = session(&stopped_cfg, true, &mut quiet());
+    result.expect("resumed run");
+
+    assert_eq!(resumed.final_step, STEPS);
+    assert_eq!(
+        reference.bits, resumed.bits,
+        "weights differ after the resume"
+    );
+    let reference_evals = fs::read_to_string(reference_dir.join(EVALS_FILE)).expect("evals");
+    let resumed_evals = fs::read_to_string(stopped_dir.join(EVALS_FILE)).expect("evals");
+    assert_eq!(reference_evals, resumed_evals);
+    let (a, b) = (final_meta(&reference_dir), final_meta(&stopped_dir));
+    assert_eq!(a.best_eval_loss, b.best_eval_loss);
+    assert_eq!(a.evals_since_best, b.evals_since_best);
     let _ = fs::remove_dir_all(dir);
 }
 

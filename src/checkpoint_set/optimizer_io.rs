@@ -12,7 +12,7 @@ use boostr::format::SafeTensors;
 use boostr::ops::TensorOps;
 use boostr::optimizer::Optimizer;
 use boostr::runtime::{Runtime, RuntimeClient};
-use boostr::TypeConversionOps;
+use boostr::{CpuRuntime, TypeConversionOps};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -28,35 +28,49 @@ fn fail(path: &Path, what: &str, e: impl std::fmt::Display, next: &str) -> Error
     }
 }
 
-/// Write the state of `optimizer` to `path`, keyed by checkpoint name.
+fn stage_fail(what: &str, e: impl std::fmt::Display) -> Error {
+    Error::TrainingError {
+        reason: format!("optimizer state {what}: {e}. Check that host memory is free."),
+    }
+}
+
+/// Copy the state of `optimizer` to host memory, keyed by checkpoint name.
 ///
-/// Each tensor goes to host memory at its own dtype, as the weights do.
-/// The write is atomic: an error leaves an existing file unchanged.
-pub fn write_optimizer_file<R>(
-    path: &Path,
+/// Each tensor keeps its own dtype, as the weights do. The copy is required:
+/// the next step updates the device state in place.
+pub fn stage_optimizer_state<R>(
     optimizer: &FusedAdamW<R>,
     name_maps: &NameMaps,
-) -> Result<()>
+) -> Result<HashMap<String, Tensor<CpuRuntime>>>
 where
     R: Runtime<DType = DType>,
     R::Client: RuntimeClient<R> + TensorOps<R> + TypeConversionOps<R>,
 {
-    let next = "Check that the checkpoint directory is writable and has free space.";
     let state = optimizer
         .state_dict(name_maps.names())
-        .map_err(|e| fail(path, "export failed", e, next))?;
+        .map_err(|e| stage_fail("export failed", e))?;
     let cpu = boostr::CpuDevice::new();
     let mut staged = HashMap::with_capacity(state.len());
-    for (key, tensor) in &state {
-        let host = stage_tensor_for_safetensors::<R>(tensor, &cpu)
-            .map_err(|e| fail(path, &format!("copy of '{key}' to host failed"), e, next))?;
-        staged.insert(key.clone(), host);
+    for (key, tensor) in state {
+        let host = stage_tensor_for_safetensors::<R>(&tensor, &cpu)
+            .map_err(|e| stage_fail(&format!("copy of '{key}' to host failed"), e))?;
+        staged.insert(key, host);
     }
+    Ok(staged)
+}
+
+/// Write the host optimizer state `staged` to `path`.
+///
+/// The write is atomic: an error leaves an existing file unchanged.
+pub fn write_staged_optimizer_file(
+    path: &Path,
+    staged: &HashMap<String, Tensor<CpuRuntime>>,
+) -> Result<()> {
+    let next = "Check that the checkpoint directory is writable and has free space.";
     let mut metadata = HashMap::new();
     metadata.insert("format".to_string(), FORMAT.to_string());
     metadata.insert("optimizer".to_string(), "adamw".to_string());
-    save_safetensors(path, &staged, Some(&metadata))
-        .map_err(|e| fail(path, "write failed", e, next))
+    save_safetensors(path, staged, Some(&metadata)).map_err(|e| fail(path, "write failed", e, next))
 }
 
 /// Read every tensor of the optimizer state file at `path` onto `device`.

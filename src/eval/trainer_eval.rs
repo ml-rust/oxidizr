@@ -4,9 +4,8 @@ use super::resume::EvalCheckpoint;
 use super::run::{evaluate, EvalTotals};
 use super::state::{EvalOutcome, Evaluator};
 use super::stopper::Decision;
-use crate::checkpoint_set::CheckpointLabel;
 use crate::dp::PEER_STOP_REASON;
-use crate::fit::{CheckpointNote, EvalReport, StepSink};
+use crate::fit::{EvalReport, StepSink};
 use crate::model::LitGPT;
 use crate::prelude::{DType, Result};
 use crate::run_record::EVALS_FILE;
@@ -61,9 +60,10 @@ where
 
     /// Runs the eval due once `completed` of `total_steps` steps are done.
     ///
-    /// The eval goes to `evals.json` and to `sink`. A new best loss writes the
-    /// `best` checkpoint when `save_interval` is above 0. The interval
-    /// checkpoint of the same step comes after, so its meta holds this eval's counters.
+    /// The eval goes to `evals.json` and to `sink`. Returns true when its loss
+    /// is a new best. The fit loop then saves the `best` checkpoint, and any
+    /// interval checkpoint of the same step, from one snapshot. Their metas
+    /// hold this eval's counters.
     ///
     /// Only data-parallel rank 0 evaluates. The fit loop broadcasts its stop decision.
     pub(crate) fn eval_if_due(
@@ -72,22 +72,22 @@ where
         completed: usize,
         total_steps: usize,
         sink: &mut dyn StepSink,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.quiet() {
-            return Ok(());
+            return Ok(false);
         }
         let due = self
             .eval
             .as_ref()
             .is_some_and(|eval| eval.is_due(completed, total_steps));
         if !due {
-            return Ok(());
+            return Ok(false);
         }
         let Some(totals) = self.evaluate_now(model)? else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(eval) = self.eval.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
         let loss = totals.loss();
         let decision = eval.stopper.observe(loss);
@@ -106,11 +106,7 @@ where
         eval.record(completed, &report);
         self.metrics.scalars.eval(completed, &report);
         sink.on_eval(completed, &report)?;
-        if decision == Decision::Improved && self.config.save_interval > 0 {
-            self.write_set(model, CheckpointLabel::Best, completed)?;
-            sink.on_checkpoint(&CheckpointNote::Best { step: completed })?;
-        }
-        Ok(())
+        Ok(decision == Decision::Improved)
     }
 
     /// Why the run stops early. `None` without an eval, or while the patience lasts.

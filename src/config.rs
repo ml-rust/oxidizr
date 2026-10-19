@@ -643,6 +643,13 @@ pub struct TrainerConfig {
     pub save_interval: usize,
     #[serde(default = "default_max_checkpoints")]
     pub max_checkpoints: usize, // Max checkpoints to keep (0 = unlimited)
+    /// Commit checkpoint sets on a background writer thread. `false` commits
+    /// them on the training thread.
+    ///
+    /// Either way the training thread first copies the set to host memory.
+    /// The weights and optimizer files are byte-equal in both modes. See `docs/training/checkpoints.md`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub async_checkpoint: bool,
     pub load_balance_alpha: f64, // For MoE auxiliary loss
 
     // Gradient control parameters (from "Keep the Gradients Flowing" research)
@@ -1034,7 +1041,8 @@ impl LitConfig {
                 checkpoint_sidecars: Vec::new(),
                 log_interval: 10,
                 save_interval: 500,
-                max_checkpoints: 10,     // Keep last 10 checkpoints
+                max_checkpoints: 10, // Keep last 10 checkpoints
+                async_checkpoint: false,
                 load_balance_alpha: 0.0, // No MoE
                 max_grad_norm: 1.0,      // Gradient clipping threshold
                 target_grad_norm: None,  // No normalization
@@ -1137,7 +1145,8 @@ impl LitConfig {
                 checkpoint_sidecars: Vec::new(),
                 log_interval: 10,
                 save_interval: 500,
-                max_checkpoints: 10,      // Keep last 10 checkpoints
+                max_checkpoints: 10, // Keep last 10 checkpoints
+                async_checkpoint: false,
                 load_balance_alpha: 0.01, // For MoE load balancing
                 max_grad_norm: 1.0,       // Gradient clipping threshold
                 target_grad_norm: None,   // No normalization
@@ -1260,20 +1269,36 @@ impl CheckpointMeta {
         checkpoint_file: &str,
         data_position: Option<DataPosition>,
     ) -> anyhow::Result<Self> {
-        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let model_config_hash = compute_model_config_hash(model_config);
-        let data_file_hash = data_file_path
-            .map(compute_file_hash)
-            .transpose()?
-            .unwrap_or_default();
-        let data_file_path = data_file_path.unwrap_or_default();
-
-        Ok(Self {
+        let data_file_hash = data_file_path.map(compute_file_hash).transpose()?;
+        Ok(Self::with_data_hash(
             step,
-            timestamp,
+            model_config,
+            data_file_path.zip(data_file_hash.as_deref()),
+            checkpoint_file,
+            data_position,
+        ))
+    }
+
+    /// [`new`](Self::new) with a data file hash computed before.
+    ///
+    /// `data_file` is the data file path and its [`compute_file_hash`] hash.
+    /// A trainer hashes its data file once and passes the hash to every save.
+    pub fn with_data_hash(
+        step: usize,
+        model_config: &OxidizrModelConfig,
+        data_file: Option<(&str, &str)>,
+        checkpoint_file: &str,
+        data_position: Option<DataPosition>,
+    ) -> Self {
+        let model_config_hash = compute_model_config_hash(model_config);
+        let (data_file_path, data_file_hash) = data_file.unwrap_or_default();
+
+        Self {
+            step,
+            timestamp: Self::timestamp_now(),
             model_config_hash,
             data_file_path: data_file_path.to_string(),
-            data_file_hash,
+            data_file_hash: data_file_hash.to_string(),
             checkpoint_file: checkpoint_file.to_string(),
             dtype: model_config.dtype.to_string(),
             data_position,
@@ -1288,7 +1313,12 @@ impl CheckpointMeta {
             world_size: None,
             global_batch_rows: None,
             spike_guard: None,
-        })
+        }
+    }
+
+    /// The local time as a meta `timestamp` records it.
+    pub fn timestamp_now() -> String {
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
 
     /// Save metadata as `checkpoint_step_{step}.meta.json` in `checkpoint_dir`.

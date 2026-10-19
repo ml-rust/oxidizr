@@ -43,6 +43,15 @@ pub fn apply_cli_overrides(args: &TrainArgs, config: &mut LitConfig) -> Result<S
             *slot = value;
         }
     }
+    if args.async_checkpoint {
+        if say {
+            println!(
+                "CLI override: async_checkpoint = true (was {})",
+                config.trainer.async_checkpoint
+            );
+        }
+        config.trainer.async_checkpoint = true;
+    }
 
     let current_backend = config.trainer.distributed.backend.clone();
     let backend_source = match resolve_sync_backend(args.sync_backend.as_deref(), current_backend) {

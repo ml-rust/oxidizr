@@ -70,6 +70,12 @@ where
     /// Every rank waits at a barrier after the final save.
     /// An error on this rank calls [`abort_collectives`](Self::abort_collectives)
     /// before it returns, so peers do not wait in a collective.
+    ///
+    /// # Checkpoints
+    /// Under `trainer.async_checkpoint` a background thread commits each set.
+    /// A failed commit returns an error at the next step boundary. After any
+    /// error the loop waits for the commit in flight and prints its failure.
+    /// The final set is written on this thread after every earlier commit.
     pub fn fit_with_sink<D: DataLoader<R>>(
         &mut self,
         model: &LitGPT<R>,
@@ -79,6 +85,7 @@ where
         let result = self.run_fit(model, data_loader, sink);
         if result.is_err() {
             self.abort_collectives();
+            self.abandon_checkpoints();
         }
         result
     }
@@ -92,6 +99,7 @@ where
     ) -> Result<()> {
         // blazr reads config.json to serve a checkpoint directly.
         self.save_blazr_config_if_needed();
+        self.start_checkpoint_writer()?;
         self.sync_initial_parameters(model)?;
         // A resumed rank 0 can start stopped. Every rank must agree before step one.
         self.sync_early_stop()?;
@@ -145,16 +153,17 @@ where
             sink.on_step(&report)?;
             last = Some((loss, grad_norm));
 
-            // Before the interval save, so its meta holds this eval's counters.
-            self.eval_if_due(model, completed, total_steps, sink)?;
-            if self.is_save_step(completed) {
-                self.save_checkpoint(model, completed)?;
-                sink.on_checkpoint(&CheckpointNote::Saved { step: completed })?;
-            }
+            // Before the save, so its metas hold this eval's counters.
+            let improved = self.eval_if_due(model, completed, total_steps, sink)?;
+            let labels = self.due_labels(completed, improved);
+            self.request_save(model, completed, labels, sink)?;
+            self.drain_checkpoints(sink)?;
             // Every rank learns rank 0's stop decision before the next step draws data.
             self.sync_early_stop()?;
         }
 
+        // Every interval and best commit reports before the final save starts.
+        self.finish_checkpoints(sink)?;
         let path = format!(
             "{}/{}_final.safetensors",
             self.config.checkpoint_dir,
@@ -209,11 +218,6 @@ where
     fn is_log_step(&self, index: usize) -> bool {
         let interval = self.config.log_interval;
         index == self.start_step || (interval > 0 && index.is_multiple_of(interval))
-    }
-
-    /// Whether an interval checkpoint is due once `completed` steps are done.
-    fn is_save_step(&self, completed: usize) -> bool {
-        self.config.save_interval > 0 && completed.is_multiple_of(self.config.save_interval)
     }
 
     /// Appends the `steps.json` line of `report`.

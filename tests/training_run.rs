@@ -37,6 +37,7 @@ fn headless_args_for(dir: &Path, data: &Path, cfg: &LitConfig, run: &str) -> Tra
         sync_backend: None,
         prefetch: 0,
         max_checkpoints: None,
+        async_checkpoint: false,
         dtype: None,
         checkpoint_dir: None,
         run_dir: Some(dir.join(run).to_string_lossy().into_owned()),

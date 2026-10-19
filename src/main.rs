@@ -170,6 +170,7 @@ fn run(cli: Cli) -> Result<()> {
                     sync_backend: cli.sync_backend,
                     prefetch: cli.prefetch.unwrap_or(0),
                     max_checkpoints: cli.max_checkpoints,
+                    async_checkpoint: false,
                     dtype: cli.dtype,
                     checkpoint_dir: cli.checkpoint_dir,
                     run_dir: None,

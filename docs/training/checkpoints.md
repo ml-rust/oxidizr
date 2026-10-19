@@ -131,6 +131,26 @@ have an optimizer file and no meta, because that save stopped early.
 
 `--max-checkpoints` removes all three files of an old set.
 
+### Background Writes
+
+`trainer.async_checkpoint: true` commits each set on a background writer thread:
+
+```yaml
+trainer:
+  save_interval: 500
+  async_checkpoint: true
+```
+
+- The training thread first copies the weights, the optimizer state and every meta field to host memory. The next step then runs while the writer commits.
+- The writer keeps the same order: optimizer file, weights, meta. The weights and optimizer files are byte-equal to a synchronous run. The meta differs only in its timestamp and directory path.
+- A step that saves both `best` and `step_N` copies the state once. Both sets come from that copy.
+- At most one save is in flight. The next save waits for it, so host memory holds one copy at a time. A wait prints one warning: raise `save_interval` to stop it.
+- Under LoRA the frozen base weights are copied to host memory once per run. Every save reuses that copy, so it stays in host memory for the whole run.
+- The `checkpoint` lines of headless output and the progress bar fire when the meta is on disk. Under async writes, a line can arrive some steps after its save.
+- A failed write stops the run at the next step boundary. The error names the label, the step and the checkpoint directory.
+- After any error, the run waits for the write in flight. A crash during a write leaves a set without its meta, and `--resume auto` skips it.
+- The final set is written on the training thread, after every earlier write commits.
+
 ## Resume Behavior
 
 When resuming:

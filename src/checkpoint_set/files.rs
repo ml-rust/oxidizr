@@ -77,6 +77,17 @@ impl CheckpointLabel {
     }
 }
 
+/// `step_N`, `final` or `best`: the label part of the file names.
+impl std::fmt::Display for CheckpointLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Step(step) => write!(f, "step_{step}"),
+            Self::Final => f.write_str("final"),
+            Self::Best => f.write_str("best"),
+        }
+    }
+}
+
 /// The step of a `*_step_N.safetensors` weights file name.
 pub fn weights_step(file_name: &str) -> Option<usize> {
     match CheckpointLabel::of_weights_file(file_name)? {
@@ -139,6 +150,13 @@ mod tests {
             label.optimizer_file_name(PREFIX),
             "nano_512_117m_f32_best.optimizer.safetensors"
         );
+    }
+
+    #[test]
+    fn labels_display_as_their_file_name_part() {
+        assert_eq!(CheckpointLabel::Step(7).to_string(), "step_7");
+        assert_eq!(CheckpointLabel::Final.to_string(), "final");
+        assert_eq!(CheckpointLabel::Best.to_string(), "best");
     }
 
     #[test]

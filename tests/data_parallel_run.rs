@@ -10,8 +10,8 @@ mod common;
 use boostr::runtime::{Communicator, LocalCommunicator, ReduceOp};
 use boostr::{CpuRuntime, DType, NumrError, NumrResult};
 use common::{
-    bits_by_name, build_model, event_files, holdout_eval, scratch_dir, tiny_config, tokens,
-    train_parts, write_config_yaml, write_token_file,
+    assert_same_checkpoints, bits_by_name, build_model, event_files, holdout_eval, scratch_dir,
+    tiny_config, tokens, train_parts, write_config_yaml, write_token_file,
 };
 use oxidizr::checkpoint_set::CheckpointLabel;
 use oxidizr::commands::{run_train, run_train_with_group, TrainArgs};
@@ -50,6 +50,7 @@ fn args_for(dir: &Path, data: &Path, cfg: &LitConfig, run: &str) -> TrainArgs {
         sync_backend: None,
         prefetch: 0,
         max_checkpoints: None,
+        async_checkpoint: false,
         dtype: None,
         checkpoint_dir: None,
         run_dir: Some(dir.join(run).to_string_lossy().into_owned()),
@@ -511,5 +512,57 @@ fn a_gpu_list_unlike_the_group_is_an_error() {
         err.contains("names 1 GPUs, and the rank group has 2 ranks"),
         "{err}"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Rank 0's writer thread commits the same bytes as a synchronous world-2 run.
+#[test]
+fn a_world_two_async_run_writes_the_sync_files() {
+    let (dir, data, sync_cfg) = setup("dp-run-async", 4, 2);
+    let mut async_cfg = sync_cfg.clone();
+    async_cfg.trainer.async_checkpoint = true;
+    async_cfg.trainer.checkpoint_dir = dir.join("ckpt-async").to_string_lossy().into_owned();
+    run_world(args_for(&dir, &data, &sync_cfg, "sync")).expect("sync world-2 run");
+    run_world(args_for(&dir, &data, &async_cfg, "async")).expect("async world-2 run");
+
+    let checked = assert_same_checkpoints(
+        Path::new(&sync_cfg.trainer.checkpoint_dir),
+        Path::new(&async_cfg.trainer.checkpoint_dir),
+    );
+    for label in [
+        CheckpointLabel::Step(2),
+        CheckpointLabel::Step(4),
+        CheckpointLabel::Final,
+    ] {
+        assert!(checked.contains(&label.meta_file_name()), "{checked:?}");
+        assert_eq!(meta(&async_cfg, label).world_size, Some(2), "{label:?}");
+    }
+    let record = RunRecord::load(&dir.join("async")).expect("run.json");
+    assert_eq!(record.status, RunStatus::Completed, "{record:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Rank 0's writer fails: its checkpoint directory lies under a regular file.
+/// Rank 0 aborts the group, so rank 1 returns long before the group timeout.
+#[test]
+fn a_world_two_async_write_error_fails_the_run_without_a_hang() {
+    let (dir, data, mut cfg) = setup("dp-run-async-error", 4, 2);
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, b"a regular file").expect("write blocker");
+    cfg.trainer.checkpoint_dir = blocker.join("ckpt").to_string_lossy().into_owned();
+    cfg.trainer.async_checkpoint = true;
+
+    let start = Instant::now();
+    let result = run_world(args_for(&dir, &data, &cfg, "run"));
+    let elapsed = start.elapsed();
+    let err = format!("{:#}", result.expect_err("no checkpoint can be written"));
+    assert!(
+        elapsed < TIMEOUT,
+        "a rank waited for the timeout: {elapsed:?}"
+    );
+    assert!(err.contains("checkpoint `step_2` of step 2"), "{err}");
+    assert!(err.contains("was not written"), "{err}");
+    let record = RunRecord::load(&dir.join("run")).expect("run.json after a failed run");
+    assert_eq!(record.status, RunStatus::Failed);
     let _ = std::fs::remove_dir_all(dir);
 }

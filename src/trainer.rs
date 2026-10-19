@@ -1,11 +1,12 @@
 use crate::checkpoint_set::{
-    apply_optimizer_resume, remove_old_checkpoints, write_checkpoint_set, CheckpointLabel,
-    CheckpointSave, NameMaps, OptimizerResume,
+    apply_optimizer_resume, commit_set, remove_old_checkpoints, snapshot_set, CheckpointLabel,
+    FrozenCache, NameMaps, OptimizerResume, SetSnapshot, SnapshotInput,
 };
-use crate::config::{OxidizrModelConfig, TrainerConfig};
+use crate::config::{compute_file_hash, OxidizrModelConfig, TrainerConfig};
 use crate::data::{DataLoader, DataPosition, RowLayout};
 use crate::dp::{reduce_step_gradients, reduce_step_weighting, AbortHook};
 use crate::eval::Evaluator;
+use crate::fit::CheckpointQueue;
 use crate::loss_scale::{resolve_loss_scale, restore_loss_scale, weighted_loss, LossScaler};
 use crate::metrics::TrainMetrics;
 use crate::oom_guard::{oom_guard, Pass};
@@ -80,6 +81,12 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     // Checkpoint metadata
     pub(crate) model_config: OxidizrModelConfig,
     data_file_path: Option<String>,
+    /// `compute_file_hash` of `data_file_path`, taken once at construction.
+    data_file_hash: Option<String>,
+    /// Host copies of the frozen parameters, shared by every checkpoint snapshot.
+    frozen_host: FrozenCache,
+    /// The background checkpoint writer and the checkpoint outcomes not yet reported.
+    pub(crate) checkpoints: CheckpointQueue,
     /// Warmup, post-warmup schedule and step count of this run.
     pub(crate) lr_plan: LrPlan,
     /// Guard against a silently all-ones or nearly-all-zeros loss mask: the
@@ -143,6 +150,17 @@ where
 
         config.distributed.validate()?;
         let name_maps = NameMaps::new(&parameter_names, &parameter_ids)?;
+        // Every checkpoint meta records this hash. One read here serves every save.
+        let data_file_hash = data_file_path
+            .as_deref()
+            .map(compute_file_hash)
+            .transpose()
+            .map_err(|e| Error::TrainingError {
+                reason: format!(
+                    "the training data file hash for checkpoint metas failed: {e}. Check \
+                     that the data file is readable."
+                ),
+            })?;
 
         // The no-decay group is config, not state: build it before any state load.
         let decay_plan =
@@ -189,6 +207,9 @@ where
             start_position,
             model_config,
             data_file_path,
+            data_file_hash,
+            frozen_host: FrozenCache::default(),
+            checkpoints: CheckpointQueue::default(),
             lr_plan,
             mask_stats_logged: false,
             last_loss: None,
@@ -790,6 +811,7 @@ where
 
     /// Writes optimizer state, weights, then the meta that marks the set complete.
     ///
+    /// The set is copied to host memory first, then committed on this thread.
     /// Every rank holds the same replica, so only rank 0 writes.
     pub(crate) fn write_set(
         &self,
@@ -800,14 +822,28 @@ where
         if self.quiet() {
             return Ok(());
         }
-        write_checkpoint_set(CheckpointSave {
+        commit_set(&self.snapshot_set(model, step)?, label, true)
+    }
+
+    /// Copies the checkpoint set after `step` completed steps to host memory.
+    ///
+    /// Every meta field comes from host state now. The commit adds the file
+    /// names and the timestamp.
+    pub(crate) fn snapshot_set(
+        &self,
+        model: &crate::model::LitGPT<R>,
+        step: usize,
+    ) -> Result<SetSnapshot> {
+        snapshot_set(SnapshotInput {
             dir: Path::new(&self.config.checkpoint_dir),
             prefix: &self.model_config.checkpoint_prefix(),
-            label,
             step,
             position: self.data_position_after(step),
             model_config: &self.model_config,
-            data_file_path: self.data_file_path.as_deref(),
+            data_file: self
+                .data_file_path
+                .as_deref()
+                .zip(self.data_file_hash.as_deref()),
             model,
             params: self.params,
             optimizer: &self.optimizer,
@@ -818,6 +854,7 @@ where
             world_size: self.world_size(),
             global_batch_rows: self.row_layout.batch_size(),
             spike_guard: self.metrics.spike_state(),
+            frozen: &self.frozen_host,
         })
     }
 

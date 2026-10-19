@@ -78,6 +78,11 @@ pub struct TrainArgs {
     #[arg(long = "max-checkpoints")]
     pub max_checkpoints: Option<usize>,
 
+    /// Commit checkpoint sets on a background thread. Sets
+    /// `trainer.async_checkpoint` to true. Absent, the config value applies.
+    #[arg(long = "async-checkpoint")]
+    pub async_checkpoint: bool,
+
     /// Model precision override: f32, f16, or bf16. Overrides `model.dtype`
     /// only when given; the config value applies otherwise.
     #[arg(long = "dtype")]

@@ -66,11 +66,13 @@ pub struct EvalReport {
 }
 
 /// A checkpoint event of the fit loop.
+///
+/// `Saved` and `Best` mean committed: the meta is on disk when the note fires.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CheckpointNote {
-    /// The interval checkpoint labelled `step` is on disk.
+    /// The interval checkpoint labelled `step` is committed.
     Saved { step: usize },
-    /// The `best` checkpoint now holds the weights after step `step`.
+    /// The `best` checkpoint now holds the committed weights after step `step`.
     Best { step: usize },
     /// The final checkpoint save starts. `path` names its weights file.
     Final { path: String },
@@ -92,11 +94,14 @@ pub struct FitSummary {
 /// Receives the events of one fit loop, in order.
 ///
 /// The loop calls `on_start` once, then `on_step` for every step. After a
-/// step it calls `on_eval` when an eval is due, `on_checkpoint(Best)` when
-/// that eval wrote the best checkpoint, and `on_checkpoint(Saved)` after an
-/// interval save. It ends with `on_checkpoint(Final)` and `on_finish`, or with
-/// `on_error` when a step returns an error. An error from a hook stops the
-/// loop with that error.
+/// step it calls `on_eval` when an eval is due. At each step boundary it
+/// calls `on_checkpoint(Best)` and `on_checkpoint(Saved)` for every set
+/// committed since the last boundary, in commit order. Without
+/// `trainer.async_checkpoint` a set commits at its own step, so its note
+/// follows that step's eval. With it, a note can arrive steps later. Every
+/// `Saved` and `Best` note arrives before `on_checkpoint(Final)`. The loop
+/// ends with `on_checkpoint(Final)` and `on_finish`, or with `on_error` when
+/// a step returns an error. An error from a hook stops the loop with that error.
 pub trait StepSink {
     fn on_start(&mut self, start: &FitStart) -> Result<()>;
     fn on_step(&mut self, report: &StepReport) -> Result<()>;

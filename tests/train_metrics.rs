@@ -32,6 +32,7 @@ fn args(dir: &Path, cfg: &LitConfig) -> TrainArgs {
         sync_backend: None,
         prefetch: 0,
         max_checkpoints: None,
+        async_checkpoint: false,
         dtype: None,
         checkpoint_dir: None,
         run_dir: Some(dir.join("run").to_string_lossy().into_owned()),

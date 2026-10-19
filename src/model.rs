@@ -4988,19 +4988,54 @@ where
     R: boostr::Runtime<DType = DType>,
     R::Client: boostr::RuntimeClient<R> + boostr::TensorOps<R> + boostr::TypeConversionOps<R>,
 {
+    let tensors = stage_checkpoint_tensors(path, model, params, StageScope::All)?;
+    save_staged_checkpoint(path, &tensors)
+}
+
+/// Which parameters [`stage_checkpoint_tensors`] copies to host memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageScope {
+    /// Every parameter a checkpoint carries.
+    All,
+    /// The parameters in the optimizer map.
+    Trainable,
+    /// The frozen parameters: those absent from the optimizer map.
+    Frozen,
+}
+
+/// Copy the `scope` parameters to host memory, keyed by checkpoint name.
+///
+/// Each tensor keeps its own dtype. `params` and the model are the sources,
+/// as [`save_checkpoint_from_params`] documents. `source` names the
+/// checkpoint in error messages.
+///
+/// # Errors
+/// Returns an error when a trainable parameter is absent from `params`, or a copy fails.
+pub fn stage_checkpoint_tensors<R>(
+    source: &str,
+    model: &LitGPT<R>,
+    params: &HashMap<TensorId, Tensor<R>>,
+    scope: StageScope,
+) -> Result<HashMap<String, Tensor<boostr::CpuRuntime>>>
+where
+    R: boostr::Runtime<DType = DType>,
+    R::Client: boostr::RuntimeClient<R> + boostr::TensorOps<R> + boostr::TypeConversionOps<R>,
+{
     let cpu_device = boostr::CpuDevice::new();
     let parameters = model.named_parameters()?;
     let mut tensors = HashMap::with_capacity(parameters.len());
 
     for (name, id, var) in &parameters {
         let tensor = match params.get(id) {
+            Some(_) if scope == StageScope::Frozen => continue,
             Some(tensor) => tensor,
+            None if !var.requires_grad() && scope == StageScope::Trainable => continue,
             None if !var.requires_grad() => var.tensor(),
             None => {
                 return Err(boostr::error::Error::ModelError {
                     reason: format!(
                         "trainable parameter '{name}' ({id}) is absent from the optimizer \
-                         parameter map while saving checkpoint '{path}'. The optimizer \
+                         parameter map while saving checkpoint '{source}'. The optimizer \
                          lost track of it; rebuild the model and optimizer from the \
                          same parameter set before saving."
                     ),
@@ -5013,12 +5048,21 @@ where
             cpu_tensor,
         );
     }
+    Ok(tensors)
+}
 
+/// Write host `tensors` from [`stage_checkpoint_tensors`] as the weights file at `path`.
+///
+/// The write is atomic: an error leaves an existing file unchanged.
+pub fn save_staged_checkpoint(
+    path: &str,
+    tensors: &HashMap<String, Tensor<boostr::CpuRuntime>>,
+) -> Result<()> {
     let mut metadata = HashMap::new();
     metadata.insert("format".to_string(), "oxidizr-litgpt".to_string());
     metadata.insert("parameter_count".to_string(), tensors.len().to_string());
 
-    boostr::format::safetensors::save_safetensors(path, &tensors, Some(&metadata))
+    boostr::format::safetensors::save_safetensors(path, tensors, Some(&metadata))
 }
 
 pub fn load_checkpoint_into_model<R>(model: &mut LitGPT<R>, path: &str) -> Result<()>

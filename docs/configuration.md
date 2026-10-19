@@ -146,7 +146,19 @@ The unmasked path keeps the old mean form on purpose. The sum form gives the sam
 |-----------|-------------|---------|
 | `checkpoint_dir` | Checkpoint directory | "./checkpoints" |
 | `save_interval` | Steps between saves | 500 |
+| `max_checkpoints` | Interval sets to keep. 0 keeps every set | 10 |
+| `async_checkpoint` | Commit checkpoint sets on a background thread | false |
 | `log_interval` | Steps between logs | 10 |
+
+`async_checkpoint: true` moves the file writes off the training thread:
+
+- At each save the training thread copies the set to host memory, then runs the next step.
+- One writer thread writes the optimizer file, the weights, then the meta. The weights and optimizer files are byte-equal to a run without the key. The meta differs only in its timestamp and directory path.
+- At most one save is in flight. A save that finds the previous one unfinished waits for it, and the run prints one warning.
+- A failed write stops the run at the next step boundary. The error names the label, the step and the directory.
+- The final set is written on the training thread, after every earlier save commits.
+- The key has effect only with `save_interval` above 0. In a data-parallel run, rank 0 alone holds the writer.
+- `--async-checkpoint` sets the key to true for one run.
 
 ### Advanced
 

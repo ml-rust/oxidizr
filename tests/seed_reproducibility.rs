@@ -69,6 +69,7 @@ fn trainer_config(seed: Option<u64>) -> TrainerConfig {
         log_interval: 10,
         save_interval: 500,
         max_checkpoints: 10,
+        async_checkpoint: false,
         load_balance_alpha: 0.0,
         max_grad_norm: 1.0,
         target_grad_norm: None,
