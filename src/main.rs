@@ -23,9 +23,9 @@ struct Cli {
     #[arg(short = 'f', long = "config", global = true)]
     config_file: Option<String>,
 
-    /// Path to training data file (shortcut for 'oxidizr train -d')
-    #[arg(short = 'd', long = "data", global = true)]
-    data_file: Option<String>,
+    /// Training data file, repeatable (shortcut for 'oxidizr train -d')
+    #[arg(id = "data_file", short = 'd', long = "data", global = true)]
+    data_files: Vec<String>,
 
     /// Override target device (shortcut for 'oxidizr train --target-device')
     #[arg(long = "target-device", global = true)]
@@ -162,7 +162,7 @@ fn run(cli: Cli) -> Result<()> {
                     config_file: cli
                         .config_file
                         .unwrap_or_else(|| "models/nano.yaml".to_string()),
-                    data_file: cli.data_file,
+                    data_files: cli.data_files,
                     target_device: cli.target_device,
                     seq_length: cli.seq_length,
                     batch_size: cli.batch_size,

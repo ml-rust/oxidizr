@@ -9,7 +9,7 @@ mod stopper;
 mod trainer_eval;
 
 pub use config::{EarlyStoppingConfig, EvalConfig};
-pub use holdout::HoldoutPlan;
+pub use holdout::{HoldoutPlan, HoldoutSplit};
 pub use resume::{read_eval_resume, EvalCheckpoint, EvalResume};
 pub use run::{evaluate, EvalTotals};
 pub use state::{EvalOutcome, Evaluator};

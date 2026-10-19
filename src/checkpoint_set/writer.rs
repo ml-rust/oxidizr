@@ -237,7 +237,7 @@ mod tests {
         let optimizer = HashMap::from([("model.norm.weight.exp_avg".to_string(), tensor(0.5))]);
         let model = LitConfig::nano_baseline().model;
         let position = Some(DataPosition::default());
-        let meta = CheckpointMeta::with_data_hash(step, &model, None, "", position);
+        let meta = CheckpointMeta::with_data_hash(step, &model, &[], "", position);
         let (dir, prefix) = (dir.to_path_buf(), PREFIX.to_string());
         Arc::new(SetSnapshot::from_parts(
             dir, prefix, step, weights, optimizer, meta,

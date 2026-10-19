@@ -215,7 +215,7 @@ where
             headless: plan.headless,
             start_step: resume.start_step,
             model_config: config.model.clone(),
-            data_file_path: plan.data_file.clone(),
+            data_files: plan.data_files.clone(),
             weight_decay: plan.weight_decay.clone(),
         },
     )?;

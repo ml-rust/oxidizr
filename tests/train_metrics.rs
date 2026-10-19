@@ -20,7 +20,7 @@ fn args(dir: &Path, cfg: &LitConfig) -> TrainArgs {
     write_config_yaml(&cfg_path, cfg);
     TrainArgs {
         config_file: cfg_path.to_string_lossy().into_owned(),
-        data_file: Some(data.to_string_lossy().into_owned()),
+        data_files: vec![data.to_string_lossy().into_owned()],
         target_device: Some("cpu".to_string()),
         seq_length: None,
         batch_size: None,

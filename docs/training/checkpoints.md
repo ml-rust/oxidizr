@@ -210,9 +210,13 @@ Restore the file, or remove `optimizer_file` from the meta to resume with
 fresh Adam moments.
 
 `--resume auto` with `--data` compares the model config hash and the
-data-file hash. The data-file hash covers the first 1 MiB of the file and
-its size. Both hashes use 64-bit FNV-1a (`hash_algo: fnv1a64`), so a Rust
-upgrade cannot change them.
+data-file hash of every source. The data-file hash covers the first 1 MiB of
+the file and its size. Both hashes use 64-bit FNV-1a (`hash_algo: fnv1a64`),
+so a Rust upgrade cannot change them.
+
+The meta lists every data source under `data_sources`, with its hash and its
+whole rows. `--resume auto` and `--resume <path>` both refuse a changed source
+count, order, hash or row count. See [Several Files](../data/format.md#resume).
 
 Metadata without `hash_algo` holds `legacy` hashes from Rust's
 `DefaultHasher`. The resume recomputes them the legacy way. A legacy

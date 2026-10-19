@@ -47,9 +47,11 @@ cargo run --release --features cuda -- train -f <config.yaml> [OPTIONS]
 
 ### Data Options
 
-| Argument            | Description                                                                 |
-| ------------------- | --------------------------------------------------------------------------- |
-| `-d, --data <FILE>` | Path to tokenized data file (.bin). If not specified, generates dummy data. |
+| Argument            | Description |
+| ------------------- | ----------- |
+| `-d, --data <FILE>` | Tokenized data file (.bin). Repeat the flag to read several files as one stream, in flag order. Without `-d` or `trainer.data.sources` the run trains on generated tokens. Setting both is an error. |
+
+See [Several Files](data/format.md#several-files) for the stream, holdout and resume rules.
 
 ### Device Options
 

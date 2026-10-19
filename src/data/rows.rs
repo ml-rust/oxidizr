@@ -3,9 +3,10 @@
 //!
 //! A row is `seq_len + 1` consecutive tokens at a fixed offset: row `r` of a
 //! loader whose row range starts at `first_row` is tokens
-//! `[(first_row + r) * (seq_len + 1), (first_row + r + 1) * (seq_len + 1))`.
-//! A batch is `batch_size` rows. Each epoch hands out every row once, in the
-//! order [`EpochOrder`] gives.
+//! `[(first_row + r) * (seq_len + 1), (first_row + r + 1) * (seq_len + 1))`
+//! of a one-source stream. A stream of several sources is their rows in
+//! source order, and each source drops its own tail. A batch is `batch_size`
+//! rows. Each epoch hands out every row once, in the order [`EpochOrder`] gives.
 //!
 //! Under data parallelism every rank reads the same row range in the same
 //! order. One global batch is `batch_size` rows per rank times the world

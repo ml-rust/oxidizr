@@ -7,6 +7,7 @@ use crate::commands::train_overrides::apply_cli_overrides;
 use crate::commands::train_resume::{resolve_resume, ResumePoint};
 use crate::commands::TrainArgs;
 use crate::config::{DTypePrecision, LitConfig};
+use crate::data::resolve_data_files;
 use crate::distributed::{
     check_gpu_ids, check_sync_backend, parse_gpu_ids, reject_duplicate_gpus, BuildSupport,
 };
@@ -30,7 +31,9 @@ pub enum Launch {
 pub struct RunPlan {
     /// The config after every CLI override.
     pub config: LitConfig,
-    pub data_file: Option<String>,
+    /// Training data files in stream order: the `-d` flags or `trainer.data.sources`.
+    /// Empty for generated tokens.
+    pub data_files: Vec<String>,
     pub headless: bool,
     pub prefetch: usize,
     pub run_dir: String,
@@ -74,6 +77,7 @@ impl RunPlan {
             println!("Loading configuration from: {}", args.config_file);
         }
         let backend_source = apply_cli_overrides(args, &mut config)?;
+        let data_files = resolve_data_files(&args.data_files, config.trainer.data.as_ref())?;
         let (gpu_ids, world) = resolve_ranks(args, &mut config, launch, backend_source)?;
 
         if config.model.dtype != DTypePrecision::F32 && !headless {
@@ -95,12 +99,7 @@ impl RunPlan {
             println!("Configuration loaded successfully!\n");
         }
 
-        let resume = resolve_resume(
-            args.resume.as_deref(),
-            &config,
-            args.data_file.as_deref(),
-            headless,
-        )?;
+        let resume = resolve_resume(args.resume.as_deref(), &config, &data_files, headless)?;
         let (start_step, meta) = (resume.start_step, resume.meta_path.as_deref());
         let global_batch_rows = config.trainer.batch_size.saturating_mul(world);
         if let Some(warning) = check_resume_world(meta, start_step, world, global_batch_rows)? {
@@ -116,15 +115,20 @@ impl RunPlan {
             resolve_weight_decay(&config.trainer, inherited_decay.as_ref(), headless)?;
 
         if !headless {
-            match &args.data_file {
-                Some(path) => println!("Loading training data from memory-mapped file: {path}"),
-                None => println!("Creating dummy training data..."),
+            match data_files.as_slice() {
+                [] => println!("Creating dummy training data..."),
+                [path] => println!("Loading training data from memory-mapped file: {path}"),
+                paths => println!(
+                    "Loading training data from {} files: {}",
+                    paths.len(),
+                    paths.join(", ")
+                ),
             }
         }
-        let source = TokenSource::for_run(args.data_file.as_deref(), &config);
+        let source = TokenSource::for_run(&data_files, &config);
         Ok(Self {
             config,
-            data_file: args.data_file.clone(),
+            data_files,
             headless,
             prefetch: args.prefetch,
             run_dir: run_dir.to_string(),

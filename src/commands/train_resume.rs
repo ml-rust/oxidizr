@@ -5,7 +5,7 @@
 
 use crate::checkpoint_set::manual_resume_target;
 use crate::config::{find_latest_checkpoint, CheckpointMeta, LitConfig};
-use crate::data::{DataPosition, RowLayout};
+use crate::data::{check_meta_sources, DataPosition, RowLayout};
 use anyhow::Result;
 use std::path::Path;
 
@@ -23,28 +23,34 @@ pub struct ResumePoint {
 
 /// Resolves `--resume`: `auto` finds the latest checkpoint, a path names one.
 ///
-/// `auto` checks the checkpoint against the model config and `data_file`.
+/// `auto` checks the checkpoint against the model config and `data_files`.
 /// On a mismatch an interactive run asks to clear the checkpoints and start
 /// fresh. A headless run fails instead.
 ///
+/// A path resumes that checkpoint. When its meta records data sources, the
+/// data files must match them in count, order, hash and rows.
+///
 /// # Errors
-/// Returns an error when the checkpoint is unusable, the user declines, or a
-/// headless run finds a mismatch.
+/// Returns an error when the checkpoint is unusable, the user declines, a
+/// headless run finds a mismatch, or a path resume names other data.
 pub fn resolve_resume(
     resume: Option<&str>,
     config: &LitConfig,
-    data_file: Option<&str>,
+    data_files: &[String],
     headless: bool,
 ) -> Result<ResumePoint> {
     match resume {
         None => Ok(ResumePoint::default()),
-        Some("auto") => resolve_auto(config, data_file, headless),
+        Some("auto") => resolve_auto(config, data_files, headless),
         Some(path) => {
             if !headless {
                 println!("Loading checkpoint from: {path}");
             }
             // `*_step_N` resumes at step N, `*_final` at the step its meta records.
             let (step, meta_path) = manual_resume_target(path)?;
+            if let Some(meta) = &meta_path {
+                check_resume_data(meta, config, data_files)?;
+            }
             if !headless && step > 0 {
                 println!("Resuming from step {step}");
             }
@@ -57,11 +63,30 @@ pub fn resolve_resume(
     }
 }
 
-fn resolve_auto(
-    config: &LitConfig,
-    data_file: Option<&str>,
-    headless: bool,
-) -> Result<ResumePoint> {
+/// Refuses a resume whose data files differ from the sources `meta_path` records.
+///
+/// A run on generated tokens, or a meta without recorded data, is not checked.
+fn check_resume_data(meta_path: &str, config: &LitConfig, data_files: &[String]) -> Result<()> {
+    if data_files.is_empty() {
+        return Ok(());
+    }
+    let meta = CheckpointMeta::load(meta_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read checkpoint metadata {meta_path}: {e}. Restore the file, or pass \
+             the checkpoint's .safetensors path to --resume without it."
+        )
+    })?;
+    if meta.data_sources.is_empty() && meta.data_file_hash.is_empty() {
+        return Ok(());
+    }
+    let check = check_meta_sources(&meta, data_files, config.model.max_seq_len)?;
+    match check.mismatch {
+        Some(mismatch) => anyhow::bail!("checkpoint {meta_path}: {mismatch}"),
+        None => Ok(()),
+    }
+}
+
+fn resolve_auto(config: &LitConfig, data_files: &[String], headless: bool) -> Result<ResumePoint> {
     let checkpoint_dir = &config.trainer.checkpoint_dir;
     if !headless {
         println!("Auto-resume: searching for latest checkpoint in {checkpoint_dir}");
@@ -85,14 +110,15 @@ fn resolve_auto(
         meta_path: Some(meta_path.clone()),
         weights: Some(checkpoint_path),
     };
-    let Some(data_path) = data_file else {
+    if data_files.is_empty() {
         if !headless {
             println!("⚠️  No data file specified, skipping validation");
             println!("Resuming from step {step}");
         }
         return Ok(resumed);
-    };
-    let validation = CheckpointMeta::load(&meta_path)?.validate(&config.model, data_path)?;
+    }
+    let validation =
+        CheckpointMeta::load(&meta_path)?.validate_sources(&config.model, data_files)?;
     if validation.is_valid() {
         if let Some(warning) = validation.data_check_warning() {
             // stderr in both modes: an unchecked data file is worth a line even in headless output.
@@ -123,6 +149,9 @@ fn resolve_auto(
         println!("❌ Data file mismatch:");
         println!("   Checkpoint hash: {}", validation.checkpoint_data_hash);
         println!("   Current hash:    {}", validation.current_data_hash);
+        if let Some(mismatch) = &validation.data_mismatch {
+            println!("   {mismatch}");
+        }
     }
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("\nThe current configuration does not match the existing checkpoint.");
@@ -130,9 +159,14 @@ fn resolve_auto(
     println!("  {checkpoint_dir}\n");
 
     if headless {
+        let data = validation
+            .data_mismatch
+            .as_deref()
+            .map(|m| format!(" Data: {m}"))
+            .unwrap_or_default();
         anyhow::bail!(
             "Checkpoint validation failed in headless mode. Clear checkpoints manually or fix \
-             config mismatch."
+             config mismatch.{data}"
         );
     }
     if !prompt_confirmation("Do you want to clear old checkpoints and start fresh?") {

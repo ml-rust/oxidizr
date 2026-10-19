@@ -1,6 +1,9 @@
 use crate::checkpoint_set::{optimizer_path_for, weights_step, CheckpointLabel};
-use crate::data::DataPosition;
-use crate::data_hash::{hash_json, legacy_file_hash, legacy_hash_str, HashAlgo};
+use crate::data::{
+    check_meta_sources, set_meta_sources, source_records, DataConfig, DataPosition,
+    DataSourceRecord,
+};
+use crate::data_hash::{hash_json, legacy_hash_str, HashAlgo};
 use crate::eval::EvalConfig;
 use crate::loss_scale::{resolve_loss_scale, LossScaleConfig};
 use crate::metrics::{MetricsConfig, SpikeGuardConfig, SpikeGuardState};
@@ -809,6 +812,12 @@ pub struct TrainerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_scale: Option<LossScaleConfig>,
 
+    /// Training data files, read as one stream in order. See [`DataConfig`].
+    ///
+    /// Absent, `-d/--data` names the files. Setting both is an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<DataConfig>,
+
     /// Validation evals and early stopping. See [`EvalConfig`].
     ///
     /// Absent, the run evaluates nothing and trains as before.
@@ -874,6 +883,9 @@ impl LitConfig {
                 &format!("trainer.checkpoint_sidecars[{i}]"),
             )?;
         }
+        if let Some(data) = config.trainer.data.as_mut() {
+            data.expand_env_vars()?;
+        }
         if let Some(eval) = config.trainer.eval.as_mut() {
             if let Some(raw) = eval.data_file.take() {
                 eval.data_file = Some(crate::config_paths::expand_env_vars(
@@ -896,6 +908,9 @@ impl LitConfig {
         resolve_loss_scale(self.trainer.loss_scale.as_ref(), self.model.dtype)?;
         // A fresh run's rule. A resume checks its inherited rule again in train.
         crate::weight_decay::resolve_weight_decay(&self.trainer, None, true)?;
+        if let Some(data) = &self.trainer.data {
+            data.validate()?;
+        }
         if let Some(eval) = &self.trainer.eval {
             eval.validate()?;
         }
@@ -1069,6 +1084,7 @@ impl LitConfig {
                 target_mask: None,
                 shuffle_rows: true,
                 loss_scale: None,
+                data: None,
                 eval: None,
                 metrics: None,
                 spike_guard: None,
@@ -1173,6 +1189,7 @@ impl LitConfig {
                 target_mask: None,
                 shuffle_rows: true,
                 loss_scale: None,
+                data: None,
                 eval: None,
                 metrics: None,
                 spike_guard: None,
@@ -1190,6 +1207,11 @@ pub struct CheckpointMeta {
     pub model_config_hash: String,
     pub data_file_path: String,
     pub data_file_hash: String,
+    /// Every training data source in stream order. Absent in metas written
+    /// before multi-source data: those read as one source, `data_file_path`
+    /// with `data_file_hash`. Empty for a run on generated data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_sources: Vec<DataSourceRecord>,
     pub checkpoint_file: String,
     /// Model precision used when saving checkpoint (for resume validation)
     #[serde(default = "default_dtype_string")]
@@ -1269,36 +1291,37 @@ impl CheckpointMeta {
         checkpoint_file: &str,
         data_position: Option<DataPosition>,
     ) -> anyhow::Result<Self> {
-        let data_file_hash = data_file_path.map(compute_file_hash).transpose()?;
+        let paths: Vec<String> = data_file_path.map(str::to_string).into_iter().collect();
+        let sources = source_records(&paths, model_config.max_seq_len)?;
         Ok(Self::with_data_hash(
             step,
             model_config,
-            data_file_path.zip(data_file_hash.as_deref()),
+            &sources,
             checkpoint_file,
             data_position,
         ))
     }
 
-    /// [`new`](Self::new) with a data file hash computed before.
+    /// [`new`](Self::new) with data source records computed before.
     ///
-    /// `data_file` is the data file path and its [`compute_file_hash`] hash.
-    /// A trainer hashes its data file once and passes the hash to every save.
+    /// `data_sources` come from [`source_records`], empty for generated data.
+    /// A trainer hashes its data files once and passes the records to every save.
     pub fn with_data_hash(
         step: usize,
         model_config: &OxidizrModelConfig,
-        data_file: Option<(&str, &str)>,
+        data_sources: &[DataSourceRecord],
         checkpoint_file: &str,
         data_position: Option<DataPosition>,
     ) -> Self {
         let model_config_hash = compute_model_config_hash(model_config);
-        let (data_file_path, data_file_hash) = data_file.unwrap_or_default();
 
-        Self {
+        let mut meta = Self {
             step,
             timestamp: Self::timestamp_now(),
             model_config_hash,
-            data_file_path: data_file_path.to_string(),
-            data_file_hash: data_file_hash.to_string(),
+            data_file_path: String::new(),
+            data_file_hash: String::new(),
+            data_sources: Vec::new(),
             checkpoint_file: checkpoint_file.to_string(),
             dtype: model_config.dtype.to_string(),
             data_position,
@@ -1313,7 +1336,9 @@ impl CheckpointMeta {
             world_size: None,
             global_batch_rows: None,
             spike_guard: None,
-        }
+        };
+        set_meta_sources(&mut meta, data_sources);
+        meta
     }
 
     /// The local time as a meta `timestamp` records it.
@@ -1345,11 +1370,21 @@ impl CheckpointMeta {
         Ok(meta)
     }
 
-    /// Validate that this checkpoint matches the current config and data
+    /// Validate that this checkpoint matches the current config and one data file.
     pub fn validate(
         &self,
         model_config: &OxidizrModelConfig,
         data_file_path: &str,
+    ) -> anyhow::Result<CheckpointValidation> {
+        self.validate_sources(model_config, &[data_file_path.to_string()])
+    }
+
+    /// Validate that this checkpoint matches the current config and the data
+    /// files `data_files`, in stream order. See [`check_meta_sources`].
+    pub fn validate_sources(
+        &self,
+        model_config: &OxidizrModelConfig,
+        data_files: &[String],
     ) -> anyhow::Result<CheckpointValidation> {
         // A legacy model hash is recomputed the legacy way, so an old meta
         // still matches under the toolchain that wrote it.
@@ -1363,29 +1398,19 @@ impl CheckpointMeta {
         // A legacy data hash that differs can mean another file or another
         // Rust release. The two cannot be told apart, so the resume goes ahead
         // unchecked, and `data_check_warning` says so.
-        let (current_data_hash, data_checked, data_matches) = match self.hash_algo {
-            HashAlgo::Fnv1a64 => {
-                let hash = compute_file_hash(data_file_path)?;
-                let matches = self.data_file_hash == hash;
-                (hash, true, matches)
-            }
-            HashAlgo::Legacy => {
-                let hash = legacy_file_hash(data_file_path)?;
-                let checked = self.data_file_hash == hash;
-                (hash, checked, true)
-            }
-        };
+        let data = check_meta_sources(self, data_files, model_config.max_seq_len)?;
         let dtype_matches = self.dtype == current_dtype;
 
         Ok(CheckpointValidation {
             model_matches,
-            data_matches,
-            data_checked,
+            data_matches: data.matches,
+            data_checked: data.checked,
             dtype_matches,
             checkpoint_model_hash: self.model_config_hash.clone(),
             current_model_hash,
-            checkpoint_data_hash: self.data_file_hash.clone(),
-            current_data_hash,
+            checkpoint_data_hash: data.checkpoint_hash,
+            current_data_hash: data.current_hash,
+            data_mismatch: data.mismatch,
             checkpoint_dtype: self.dtype.clone(),
             current_dtype,
         })
@@ -1404,6 +1429,8 @@ pub struct CheckpointValidation {
     pub current_model_hash: String,
     pub checkpoint_data_hash: String,
     pub current_data_hash: String,
+    /// What differs between the recorded and current data sources. `None` when they match.
+    pub data_mismatch: Option<String>,
     pub checkpoint_dtype: String,
     pub current_dtype: String,
 }

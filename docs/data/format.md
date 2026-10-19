@@ -41,6 +41,11 @@ offsets. Row `r` is tokens `[r × (max_seq_len + 1), (r + 1) × (max_seq_len + 1
   partial batch at an epoch's end is dropped.
 - Tokens past the last whole row are never read.
 
+On a little-endian machine the loader memory-maps each file and reads the ids
+in place. On a big-endian machine it reads each file into memory once and
+decodes every id from little-endian bytes. A mapped file must not shrink
+while a run reads it.
+
 A dataset of short, independent examples can be packed so no example
 straddles a row: write rows of exactly `max_seq_len + 1` tokens and pad each
 row's tail with an id the loss mask never scores.
@@ -128,11 +133,63 @@ Each document becomes its ids, then the tokenizer's EOS id. See [Tokenization](t
 
 ### Single File
 
-Simple approach - one file with all data:
+One file with all data:
 
 ```bash
 cargo run --release -- -f config.yaml -d data/all_data.bin
 ```
+
+### Several Files
+
+Repeat `-d` to read several files as one stream, in flag order:
+
+```bash
+cargo run --release -- train -f config.yaml -d data/web.bin -d data/code.bin
+```
+
+`trainer.data.sources` names the same list in the config:
+
+```yaml
+trainer:
+  data:
+    sources:
+      - path: data/web.bin
+      - path: data/code.bin
+```
+
+- The stream is file 0's whole rows, then file 1's, and so on.
+- Each file drops its own tail shorter than a row. No row spans two files.
+- The row order shuffles the whole stream. Row `r` of the shuffle can come from any file.
+- Setting `-d` and `trainer.data.sources` together is an error naming both.
+- One source in `trainer.data.sources` trains bit-identical to `-d` with that file.
+- `${VAR}` in a source path expands, as in `trainer.checkpoint_dir`.
+
+#### Held-out rows
+
+Under `trainer.eval.holdout_fraction`, each file holds out that fraction of
+its own rows, rounded down per file. The held-out rows come off the end of
+each file. The eval reads the held-out ranges in file order.
+
+- Training never reads a held-out row.
+- `trainer.eval.holdout_rows` names one range, so it needs one file. With two or more files it is an error naming `trainer.eval.holdout_fraction`.
+
+#### Resume
+
+A checkpoint meta lists every source under `data_sources`: its path, its hash
+and its whole rows. A resume compares the sources by position.
+
+- A changed file count, file order, hash or row count is an error. The error names the source.
+- A moved file with the same contents still matches. The path alone is not compared.
+- Resume with the original files in their original order, or start a fresh run.
+- A meta written before `data_sources` reads as one source: its `data_file_path` and `data_file_hash`. Its rows are not compared.
+
+### Sidecar Checks
+
+A file with a `<file>.tokens.json` sidecar is checked when it opens:
+
+- The sidecar's `num_tokens` must equal the file's token count.
+- The sidecar's `max_token_id` must be below `model.vocab_size`. The error names the file, `max_token_id` and `vocab_size`.
+- A file without a sidecar is not checked.
 
 ### Concatenated Examples
 

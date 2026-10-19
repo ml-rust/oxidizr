@@ -3,13 +3,15 @@
 //! training starts.
 
 use super::mask::TargetMask;
+use super::row_ranges::RowRanges;
 use super::rows::{DataPosition, EpochOrder, RowLayout, RowOrder};
-use super::source::DataSource;
-use crate::prelude::{DType, Error, Result};
+use super::source::RowStore;
+use crate::prelude::{DType, Result};
 use boostr::model::SpeechLayout;
 use boostr::runtime::Runtime;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 /// Row loader supporting both in-memory and memory-mapped datasets.
 ///
@@ -17,12 +19,18 @@ use std::path::{Path, PathBuf};
 /// The stream is cut into fixed rows of `seq_len + 1` tokens (see
 /// [`super::rows`]). A batch is `batch_size` rows: inputs are
 /// `row[0..seq_len]`, targets are `row[1..seq_len + 1]`. Tokens past the last
-/// whole row of the source are never read.
+/// whole row of a source are never read.
+///
+/// # Sources
+/// [`from_files`](Self::from_files) reads several token files as one
+/// stream: the rows of file 0, then the rows of file 1, and so on. Each file
+/// drops its own tail, so no row spans two files.
 ///
 /// # Row range
-/// A loader reads the stream rows `[first_row, end_row)`. The default is every
-/// whole row. [`with_row_range`](Self::with_row_range) narrows it, for
+/// A loader reads ascending global row ranges. The default is every whole
+/// row. [`with_row_range`](Self::with_row_range) narrows it to one range, for
 /// example to split a held-out eval range off the end.
+/// [`with_row_ranges`](Self::with_row_ranges) reads several ranges in order.
 ///
 /// # Row order
 /// Each epoch hands out every row once. The default is stream order;
@@ -35,24 +43,23 @@ use std::path::{Path, PathBuf};
 /// slots of every global batch.
 ///
 /// # Supported Formats
-/// - `.bin` files: Raw binary token arrays (u32)
+/// - `.bin` files: raw little-endian `u32` token arrays
 /// - In-memory: Vec<u32> for small datasets or testing
 ///
 /// # Memory Mapping
-/// Files are memory-mapped, so the OS pages the dataset in on demand.
+/// On a little-endian target files are memory-mapped, so the OS pages the
+/// dataset in on demand.
 pub struct LitDataLoader<R>
 where
     R: Runtime<DType = DType>,
 {
-    /// Data source - either in-memory or memory-mapped
-    pub(super) data_source: DataSource,
+    /// The rows of every source, in source order.
+    pub(super) store: RowStore,
     pub(super) batch_size: usize,
     pub(super) seq_len: usize,
     pub(super) device: R::Device,
-    /// First stream row this loader reads.
-    pub(super) first_row: usize,
-    /// One past the last stream row this loader reads.
-    end_row: usize,
+    /// The global rows this loader reads.
+    pub(super) ranges: RowRanges,
     /// Next batch's place in the row order. Every rank holds the same one.
     pub(super) position: DataPosition,
     /// This loader's data-parallel rank, below `world_size`.
@@ -64,11 +71,6 @@ where
     /// Target mask rule. `Some` turns on masked loss scoring (audio-only for
     /// speech, continuation-only for prefix-LM).
     pub(super) target_mask: Option<TargetMask>,
-    /// File this loader was opened from, `None` for in-memory data.
-    ///
-    /// Kept so [`try_with_speech_layout`](Self::try_with_speech_layout) can find
-    /// the corpus layout sidecar that sits beside it.
-    source_path: Option<PathBuf>,
 }
 
 impl<R> LitDataLoader<R>
@@ -77,33 +79,32 @@ where
 {
     /// Create a new data loader from in-memory tokens (for testing or small datasets)
     pub fn new(tokens: Vec<u32>, batch_size: usize, seq_len: usize, device: R::Device) -> Self {
-        Self::from_source(DataSource::InMemory(tokens), batch_size, seq_len, device)
+        let store = RowStore::in_memory(tokens, seq_len + 1);
+        Self::from_store(store, batch_size, seq_len, device)
     }
 
-    fn from_source(
-        data_source: DataSource,
+    pub(super) fn from_store(
+        store: RowStore,
         batch_size: usize,
         seq_len: usize,
         device: R::Device,
     ) -> Self {
-        let end_row = data_source.len() / (seq_len + 1);
+        let ranges = RowRanges::whole(store.total_rows());
         Self {
-            data_source,
+            store,
             batch_size,
             seq_len,
             device,
-            first_row: 0,
-            end_row,
+            ranges,
             position: DataPosition::default(),
             rank: 0,
             world_size: 1,
             order: EpochOrder::new(RowOrder::Stream),
             target_mask: None,
-            source_path: None,
         }
     }
 
-    /// Create a data loader from a memory-mapped binary file
+    /// Create a data loader from one token file.
     ///
     /// # Arguments
     /// * `path` - Path to .bin file containing raw u32 tokens
@@ -112,18 +113,15 @@ where
     /// * `device` - Target runtime device
     ///
     /// # File Format
-    /// The .bin file should contain a contiguous array of u32 tokens in native endianness.
+    /// The .bin file holds a contiguous array of little-endian u32 tokens.
+    /// [`from_files`](Self::from_files) documents the sidecar check.
     pub fn from_file<P: AsRef<Path>>(
         path: P,
         batch_size: usize,
         seq_len: usize,
         device: R::Device,
     ) -> Result<Self> {
-        let path_ref = path.as_ref();
-        let data_source = DataSource::map_file(path_ref)?;
-        let mut loader = Self::from_source(data_source, batch_size, seq_len, device);
-        loader.source_path = Some(path_ref.to_path_buf());
-        Ok(loader)
+        Self::from_files(&[path], batch_size, seq_len, device)
     }
 
     /// Select how rows are ordered within each epoch.
@@ -139,20 +137,8 @@ where
     ///
     /// # Errors
     /// Returns an error when the range is empty or ends past the last whole row.
-    pub fn with_row_range(mut self, start: usize, end: usize) -> Result<Self> {
-        let total = self.total_rows();
-        if start >= end || end > total {
-            return Err(Error::DataError {
-                reason: format!(
-                    "row range [{start}, {end}) is not a non-empty range inside the {total} \
-                     whole rows of this data. Pick a range inside [0, {total})."
-                ),
-            });
-        }
-        self.first_row = start;
-        self.end_row = end;
-        self.position = DataPosition::default();
-        Ok(self)
+    pub fn with_row_range(self, start: usize, end: usize) -> Result<Self> {
+        self.with_row_ranges(&[(start, end)])
     }
 
     /// Enable masked loss scoring with an arbitrary [`TargetMask`] rule.
@@ -181,11 +167,12 @@ where
 
     /// Enable audio-only loss masking, first checking the corpus layout sidecar.
     ///
-    /// If the data file has a `*.layout.json` sidecar (see
+    /// If a data file has a `*.layout.json` sidecar (see
     /// [`crate::speech_corpus`]), it records the layout the corpus was PACKED
     /// with and MUST match `vocab`. Disagreement is a hard error: the ids would
     /// resolve to different codebooks and the mask would select different
-    /// positions, with nothing else in the pipeline able to notice.
+    /// positions, with nothing else in the pipeline able to notice. Every
+    /// file of a multi-file loader is checked.
     ///
     /// Masking is driven by the layout itself, so EITHER layout can be checked
     /// here: a corpus packed as `expressive-tts-1.7b` is accepted when that is
@@ -194,7 +181,7 @@ where
     /// A missing sidecar is not an error — corpora packed before layouts were
     /// recorded, and plain text corpora, have none.
     pub fn try_with_speech_layout(self, layout: SpeechLayout) -> Result<Self> {
-        if let Some(path) = &self.source_path {
+        for path in self.store.paths() {
             crate::speech_corpus::check_corpus_layout(path, &layout)?;
         }
         Ok(self.with_speech_layout(layout))
@@ -202,7 +189,7 @@ where
 
     /// Returns the total number of tokens in the dataset
     pub fn dataset_size(&self) -> usize {
-        self.data_source.len()
+        self.store.total_tokens()
     }
 
     /// Tokens per row: `seq_len` inputs plus the one extra target.
@@ -210,31 +197,30 @@ where
         self.seq_len + 1
     }
 
-    /// Whole rows in the source, whatever the row range.
+    /// Whole rows over every source, whatever the row range.
     pub fn total_rows(&self) -> usize {
-        self.data_source.len() / self.row_width()
+        self.store.total_rows()
     }
 
     /// The stream rows `(start, end)` this loader reads, end exclusive.
+    ///
+    /// Under several ranges this spans the start of the first range to the
+    /// end of the last. [`row_ranges`](Self::row_ranges) gives each range.
     pub fn row_range(&self) -> (usize, usize) {
-        (self.first_row, self.end_row)
+        self.ranges.hull()
     }
 
     /// Row and global batch counts of this loader's row range.
     ///
     /// One global batch is `batch_size` rows from each of `world_size` ranks.
     pub fn row_layout(&self) -> Result<RowLayout> {
-        RowLayout::for_world(
-            self.end_row - self.first_row,
-            self.batch_size,
-            self.world_size,
-        )
+        RowLayout::for_world(self.ranges.len(), self.batch_size, self.world_size)
     }
 
     /// Tokens in this loader's row range.
     #[allow(dead_code)]
     pub fn shard_size(&self) -> usize {
-        (self.end_row - self.first_row) * self.row_width()
+        self.ranges.len() * self.row_width()
     }
 }
 
@@ -247,7 +233,7 @@ pub fn create_dummy_data(vocab_size: usize, total_tokens: usize) -> Vec<u32> {
     data
 }
 
-/// Write tokens to a binary file for use with memory-mapped data loader
+/// Write tokens as little-endian `u32` to a binary file for the data loader.
 ///
 /// # Example
 /// ```no_run
@@ -258,17 +244,10 @@ pub fn create_dummy_data(vocab_size: usize, total_tokens: usize) -> Vec<u32> {
 /// ```
 #[allow(dead_code)] // Public API for users to create binary token files
 pub fn write_tokens_to_file<P: AsRef<Path>>(tokens: &[u32], path: P) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let mut file = File::create(path)?;
-
-    // Write tokens as raw bytes (native endianness)
-    let bytes = unsafe {
-        std::slice::from_raw_parts(tokens.as_ptr() as *const u8, std::mem::size_of_val(tokens))
-    };
-
-    file.write_all(bytes)?;
-    file.sync_all()?;
-
-    Ok(())
+    let mut writer = BufWriter::new(File::create(path)?);
+    for token in tokens {
+        writer.write_all(&token.to_le_bytes())?;
+    }
+    let file = writer.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()
 }

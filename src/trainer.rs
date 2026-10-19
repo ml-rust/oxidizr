@@ -2,8 +2,8 @@ use crate::checkpoint_set::{
     apply_optimizer_resume, commit_set, remove_old_checkpoints, snapshot_set, CheckpointLabel,
     FrozenCache, NameMaps, OptimizerResume, SetSnapshot, SnapshotInput,
 };
-use crate::config::{compute_file_hash, OxidizrModelConfig, TrainerConfig};
-use crate::data::{DataLoader, DataPosition, RowLayout};
+use crate::config::{OxidizrModelConfig, TrainerConfig};
+use crate::data::{source_records, DataLoader, DataPosition, DataSourceRecord, RowLayout};
 use crate::dp::{reduce_step_gradients, reduce_step_weighting, AbortHook};
 use crate::eval::Evaluator;
 use crate::fit::CheckpointQueue;
@@ -44,7 +44,8 @@ pub struct TrainerRunConfig {
     pub headless: bool,
     pub start_step: usize,
     pub model_config: OxidizrModelConfig,
-    pub data_file_path: Option<String>,
+    /// Training data files in stream order. Empty for generated data.
+    pub data_files: Vec<String>,
     /// Resolved weight decay rule, from `crate::weight_decay::resolve_weight_decay`.
     pub weight_decay: WeightDecaySpec,
 }
@@ -80,9 +81,8 @@ pub struct LitTrainer<'a, R: Runtime<DType = DType>> {
     start_position: DataPosition,
     // Checkpoint metadata
     pub(crate) model_config: OxidizrModelConfig,
-    data_file_path: Option<String>,
-    /// `compute_file_hash` of `data_file_path`, taken once at construction.
-    data_file_hash: Option<String>,
+    /// Records of the training data files, taken once at construction.
+    data_sources: Vec<DataSourceRecord>,
     /// Host copies of the frozen parameters, shared by every checkpoint snapshot.
     frozen_host: FrozenCache,
     /// The background checkpoint writer and the checkpoint outcomes not yet reported.
@@ -144,23 +144,21 @@ where
             headless,
             start_step,
             model_config,
-            data_file_path,
+            data_files,
             weight_decay,
         } = run;
 
         config.distributed.validate()?;
         let name_maps = NameMaps::new(&parameter_names, &parameter_ids)?;
-        // Every checkpoint meta records this hash. One read here serves every save.
-        let data_file_hash = data_file_path
-            .as_deref()
-            .map(compute_file_hash)
-            .transpose()
-            .map_err(|e| Error::TrainingError {
+        // Every checkpoint meta records these hashes. One read here serves every save.
+        let data_sources = source_records(&data_files, model_config.max_seq_len).map_err(|e| {
+            Error::TrainingError {
                 reason: format!(
                     "the training data file hash for checkpoint metas failed: {e}. Check \
-                     that the data file is readable."
+                         that every data file is readable."
                 ),
-            })?;
+            }
+        })?;
 
         // The no-decay group is config, not state: build it before any state load.
         let decay_plan =
@@ -206,8 +204,7 @@ where
             start_step,
             start_position,
             model_config,
-            data_file_path,
-            data_file_hash,
+            data_sources,
             frozen_host: FrozenCache::default(),
             checkpoints: CheckpointQueue::default(),
             lr_plan,
@@ -840,10 +837,7 @@ where
             step,
             position: self.data_position_after(step),
             model_config: &self.model_config,
-            data_file: self
-                .data_file_path
-                .as_deref()
-                .zip(self.data_file_hash.as_deref()),
+            data_sources: &self.data_sources,
             model,
             params: self.params,
             optimizer: &self.optimizer,

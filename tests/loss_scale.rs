@@ -39,7 +39,7 @@ fn trainer_error(cfg: &LitConfig) -> Option<String> {
             headless: true,
             start_step: 0,
             model_config: cfg.model.clone(),
-            data_file_path: None,
+            data_files: Vec::new(),
             weight_decay,
         },
     )

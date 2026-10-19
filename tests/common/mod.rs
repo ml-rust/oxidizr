@@ -14,14 +14,19 @@ use boostr::{
     ReduceOps, RoPEOps, Runtime, RuntimeClient, ScalarOps, ShapeOps, Tensor, TensorOps,
     TypeConversionOps, UnaryOps, VarMap,
 };
-use oxidizr::checkpoint_set::plan_optimizer_resume;
+use oxidizr::checkpoint_set::{plan_optimizer_resume, CheckpointLabel};
 use oxidizr::commands::train_data::{run_loaders, TokenSource};
+use oxidizr::commands::TrainArgs;
 use oxidizr::config::{
     find_latest_checkpoint, ActivationCheckpointing, CheckpointMeta, DTypePrecision,
     DistributedConfig, GdnSpec, LitConfig, LoraConfig, OxidizrModelConfig, TargetDevice,
     TrainerConfig,
 };
-use oxidizr::data::{DataPosition, LitDataLoader, RowLayout, RowOrder};
+use oxidizr::data::{
+    DataPosition, LitDataLoader, RowLayout, RowOrder, TokenMeta, TokenOptions, TokenizerRecord,
+    TOKEN_META_VERSION,
+};
+use oxidizr::data_hash::HashAlgo;
 use oxidizr::eval::{read_eval_resume, EvalConfig, Evaluator};
 use oxidizr::fit::{CheckpointNote, EvalReport, FitStart, FitSummary, StepReport, StepSink};
 use oxidizr::loss_scale::read_loss_scale_state;
@@ -188,6 +193,7 @@ pub fn tiny_config(checkpoint_dir: &Path, max_steps: usize) -> LitConfig {
             target_mask: None,
             shuffle_rows: true,
             loss_scale: None,
+            data: None,
             eval: None,
             metrics: None,
             spike_guard: None,
@@ -376,7 +382,7 @@ where
             headless: true,
             start_step,
             model_config: cfg.model.clone(),
-            data_file_path: None,
+            data_files: Vec::new(),
             weight_decay,
         },
     )
@@ -727,4 +733,83 @@ pub fn read_tokens_le(path: &Path) -> Vec<u32> {
     assert_eq!(bytes.len() % 4, 0, "a token file holds whole u32 ids");
     let (ids, _) = bytes.as_chunks::<4>();
     ids.iter().map(|c| u32::from_le_bytes(*c)).collect()
+}
+
+/// Headless CPU train args that run `cfg` on `data`, in order, into the run directory `dir/<run>`.
+///
+/// The config goes to `dir/<run>.yaml`. No data files means generated tokens.
+pub fn cli_train_args(dir: &Path, cfg: &LitConfig, data: &[PathBuf], run: &str) -> TrainArgs {
+    let cfg_path = dir.join(format!("{run}.yaml"));
+    write_config_yaml(&cfg_path, cfg);
+    TrainArgs {
+        config_file: cfg_path.to_string_lossy().into_owned(),
+        data_files: data
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        target_device: Some("cpu".to_string()),
+        seq_length: None,
+        batch_size: None,
+        gradient_accumulation: None,
+        headless: true,
+        max_steps: Some(cfg.trainer.max_steps),
+        resume: None,
+        gpus: None,
+        sync_backend: None,
+        prefetch: 0,
+        max_checkpoints: None,
+        async_checkpoint: false,
+        dtype: None,
+        checkpoint_dir: None,
+        run_dir: Some(dir.join(run).to_string_lossy().into_owned()),
+    }
+}
+
+/// The weights file of `label` in `cfg`'s checkpoint directory.
+pub fn checkpoint_weights(cfg: &LitConfig, label: CheckpointLabel) -> String {
+    let name = label.weights_file_name(&cfg.model.checkpoint_prefix());
+    Path::new(&cfg.trainer.checkpoint_dir)
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The meta path of `label` in `cfg`'s checkpoint directory.
+pub fn checkpoint_meta_path(cfg: &LitConfig, label: CheckpointLabel) -> PathBuf {
+    Path::new(&cfg.trainer.checkpoint_dir).join(label.meta_file_name())
+}
+
+/// Bit patterns of every trainable tensor in the weights file at `path`.
+pub fn weights_file_bits(cfg: &LitConfig, path: &str) -> BTreeMap<String, Vec<u32>> {
+    let mut model = build_model(cfg);
+    load_checkpoint_into_model(&mut model, path).expect("load weights");
+    bits_by_name(&train_parts(&model))
+}
+
+/// A `.tokens.json` sidecar of a file of `num_tokens` tokens whose highest id is `max_token_id`.
+pub fn sample_token_meta(num_tokens: u64, max_token_id: Option<u32>) -> TokenMeta {
+    TokenMeta {
+        format_version: TOKEN_META_VERSION,
+        oxidizr_version: "0.0.0".to_owned(),
+        splintr_version: "unknown".to_owned(),
+        tokenizer: TokenizerRecord::Name {
+            name: "test".to_owned(),
+        },
+        separator_id: 0,
+        bos_id: None,
+        tokenizer_vocab_size: u64::from(max_token_id.unwrap_or(0)) + 1,
+        max_token_id,
+        num_tokens,
+        num_documents: 1,
+        skipped_empty_documents: 0,
+        hash_algo: HashAlgo::Fnv1a64,
+        file_hash: "0000000000000000".to_owned(),
+        inputs: Vec::new(),
+        options: TokenOptions {
+            format: "auto".to_owned(),
+            field: "text".to_owned(),
+            txt_docs: "file".to_owned(),
+            allow_special: false,
+        },
+    }
 }

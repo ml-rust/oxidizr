@@ -1,7 +1,7 @@
 //! The eval state a trainer carries: its loader, its schedule and its stop counters.
 
 use super::config::EvalConfig;
-use super::holdout::HoldoutPlan;
+use super::holdout::HoldoutSplit;
 use super::resume::{EvalCheckpoint, EvalResume};
 use super::stopper::EarlyStopper;
 use crate::data::{LitDataLoader, RowOrder};
@@ -42,17 +42,21 @@ pub struct Evaluator<R: Runtime<DType = DType>> {
 impl<R: Runtime<DType = DType>> Evaluator<R> {
     /// The eval of `config` over `loader`.
     ///
-    /// `loader` must read the same source and loss mask as training does.
-    /// Under a holdout plan it narrows to the held-out rows. An eval on
-    /// `trainer.eval.data_file` reads every row of that file. Rows go in
-    /// stream order, so every eval sees the same batches.
+    /// `loader` must read the same sources and loss mask as training does.
+    /// Under held-out rows it narrows to `split.eval_ranges`, read in order.
+    /// An eval on `trainer.eval.data_file` reads every row of that file. Rows
+    /// go in stream order, so every eval sees the same batches.
     ///
     /// # Errors
     /// Returns an error when the eval rows hold no whole batch.
-    pub fn new(config: &EvalConfig, plan: HoldoutPlan, loader: LitDataLoader<R>) -> Result<Self> {
+    pub fn new(
+        config: &EvalConfig,
+        split: &HoldoutSplit,
+        loader: LitDataLoader<R>,
+    ) -> Result<Self> {
+        let plan = split.plan;
         let loader = if plan.holdout_rows > 0 {
-            let end = plan.train_rows + plan.holdout_rows;
-            loader.with_row_range(plan.train_rows, end)?
+            loader.with_row_ranges(&split.eval_ranges)?
         } else {
             loader
         };
@@ -96,8 +100,16 @@ impl<R: Runtime<DType = DType>> Evaluator<R> {
     }
 
     /// The stream rows `(start, end)` each eval reads, end exclusive.
+    ///
+    /// Over several sources this spans the first held-out range to the end
+    /// of the last. [`row_ranges`](Self::row_ranges) gives each range.
     pub fn row_range(&self) -> (usize, usize) {
         self.loader.row_range()
+    }
+
+    /// The global row ranges each eval reads, in order.
+    pub fn row_ranges(&self) -> &[(usize, usize)] {
+        self.loader.row_ranges()
     }
 
     /// Whether an eval runs once `completed` of `total_steps` steps are done.

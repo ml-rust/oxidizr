@@ -199,15 +199,37 @@ trainer:
 
 The checkpoint meta records the scale, so a resume continues it exactly. See [Resume Behavior](training/checkpoints.md#resume-behavior).
 
+### Training Data
+
+`trainer.data.sources` lists the token files of a run. The run reads them as one row stream, in list order. Repeated `-d/--data` flags name the same list.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `data.sources[i].path` | Token file `i`. `${VAR}` expands | none |
+
+- Setting `trainer.data.sources` and `-d` together is an error naming both.
+- An empty list, an empty path or an unknown key is an error.
+- Each file drops its own tail shorter than a row. No row spans two files.
+- One source trains bit-identical to `-d` with that file.
+- See [Several Files](data/format.md#several-files) for the holdout and resume rules.
+
+```yaml
+trainer:
+  data:
+    sources:
+      - path: data/web.bin
+      - path: ${DATA_DIR}/code.bin
+```
+
 ### Validation and Early Stopping
 
 `trainer.eval` scores held-out data at step boundaries. Without the key the run evaluates nothing and trains as before.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `eval.data_file` | Token file the eval reads in full. Training keeps every row of `--data` | none |
-| `eval.holdout_rows` | Whole rows split off the end of the training data | none |
-| `eval.holdout_fraction` | Fraction of the training rows split off the end, in `(0, 1)`. Rounds down | none |
+| `eval.data_file` | Token file the eval reads in full. Training keeps every row of its data | none |
+| `eval.holdout_rows` | Whole rows split off the end of the training data. One data source only | none |
+| `eval.holdout_fraction` | Fraction of each data source's rows split off its end, in `(0, 1)`. Rounds down per source | none |
 | `eval.interval` | Steps between evals. Positive | 500 |
 | `eval.batches` | Batches per eval. Positive. Capped at the whole batches the eval rows hold | 50 |
 | `eval.early_stopping.patience` | Evals in a row without an improvement that stop the run. Positive | 5 |
@@ -218,6 +240,7 @@ Rules:
 - Without `data_file`, set exactly one of `holdout_rows` and `holdout_fraction`. With `data_file`, set neither.
 - Each error names the key it rejects. An unknown key inside `eval` is an error.
 - A holdout of `h` rows from `N`: training reads rows `[0, N - h)` and the eval reads `[N - h, N)`. A held-out row never reaches a training batch. Both sides must hold one batch of `batch_size` rows.
+- Over several data sources, each source holds out `holdout_fraction` of its own rows off its end. The eval reads the held-out ranges in source order. `holdout_rows` with more than one source is an error naming `holdout_fraction`.
 - An eval reads its rows in stream order from the first row, with no shuffle, so every eval sees the same batches. It owns its own loader and never moves the training loader or its row order.
 - An eval runs when the completed step count is a multiple of `interval`, and once after the last step. It runs before the interval checkpoint of the same step.
 - The eval batches use `batch_size` rows and the training loss mask. The forward pass runs without a graph. The eval loss is the cross-entropy summed over every scored token of every eval batch, divided by the scored token count. MoE auxiliary and z-losses stay out. Perplexity is `exp(loss)`.

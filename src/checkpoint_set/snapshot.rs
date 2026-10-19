@@ -7,7 +7,7 @@
 use super::names::NameMaps;
 use super::optimizer_io::stage_optimizer_state;
 use crate::config::{CheckpointMeta, OxidizrModelConfig};
-use crate::data::DataPosition;
+use crate::data::{DataPosition, DataSourceRecord};
 use crate::eval::EvalCheckpoint;
 use crate::metrics::SpikeGuardState;
 use crate::model::{stage_checkpoint_tensors, LitGPT, StageScope};
@@ -183,8 +183,8 @@ pub struct SnapshotInput<'a, R: Runtime<DType = DType>> {
     pub position: DataPosition,
     /// Model config, recorded in the meta.
     pub model_config: &'a OxidizrModelConfig,
-    /// Training data file and its hash. `None` for a run on generated data.
-    pub data_file: Option<(&'a str, &'a str)>,
+    /// Training data sources in stream order. Empty for a run on generated data.
+    pub data_sources: &'a [DataSourceRecord],
     /// Source of the frozen parameters.
     pub model: &'a LitGPT<R>,
     /// The optimizer's parameter map.
@@ -241,7 +241,7 @@ where
     let mut meta = CheckpointMeta::with_data_hash(
         input.step,
         input.model_config,
-        input.data_file,
+        input.data_sources,
         "",
         Some(input.position),
     );

@@ -25,9 +25,11 @@ pub struct TrainArgs {
     #[arg(short = 'f', long = "config", default_value = "models/nano.yaml")]
     pub config_file: String,
 
-    /// Path to training data file (memory-mapped binary token file)
-    #[arg(short = 'd', long = "data")]
-    pub data_file: Option<String>,
+    /// Training data file of raw little-endian u32 tokens. Repeat the flag to
+    /// read several files as one stream, in flag order. Setting it and
+    /// `trainer.data.sources` together is an error.
+    #[arg(id = "data_file", short = 'd', long = "data")]
+    pub data_files: Vec<String>,
 
     /// Override target device: "gpu" or "cpu" (default from config, fallback to gpu)
     #[arg(long = "target-device")]

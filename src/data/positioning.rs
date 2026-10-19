@@ -51,8 +51,7 @@ where
         let mut window = Vec::with_capacity(self.batch_size * width);
         for slot in first_slot..first_slot + self.batch_size {
             let row = self.order.row(&layout, start.epoch, slot);
-            let offset = (self.first_row + row) * width;
-            window.extend_from_slice(self.data_source.tokens(offset, width));
+            window.extend_from_slice(self.store.row(self.ranges.global_row(row))?);
         }
 
         self.position = DataPosition {
