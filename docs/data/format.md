@@ -297,7 +297,7 @@ Limits:
 
 - Mamba, Mamba2, Mamba3 and Gated DeltaNet layers reset their conv window and state at a document start.
 - No `model.sliding_window`.
-- On CUDA a GQA model needs head dim 64, 128 or 256, and f32 or f16.
+- On CUDA a GQA model needs head dim 64, 128 or 256.
 
 ## Vocab Size
 

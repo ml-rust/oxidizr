@@ -5,7 +5,7 @@
 //! document. A Mamba or Gated DeltaNet layer resets its conv window and state at
 //! each separator. This module holds the config, the meta record, and the model checks.
 
-use super::{DTypePrecision, LitConfig};
+use super::LitConfig;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -84,12 +84,12 @@ fn has_attention_layer(model: &super::OxidizrModelConfig) -> bool {
 
 /// Refuses `trainer.document_mask` on a GQA model the CUDA varlen kernel cannot run.
 ///
-/// The kernel takes a head_dim in [`CUDA_VARLEN_HEAD_DIMS`] and F32 or F16.
+/// The kernel takes a head_dim in [`CUDA_VARLEN_HEAD_DIMS`] and F32, F16 and BF16.
 /// An MLA model runs its document mask through a bias, so this check skips it.
 /// A model with no attention layer has no varlen kernel to run, so it skips too.
 ///
 /// # Errors
-/// Returns an error naming the head_dim or the dtype, with the accepted values.
+/// Returns an error naming the head_dim, with the accepted values.
 pub fn check_document_mask_cuda(config: &LitConfig) -> anyhow::Result<()> {
     let model = &config.model;
     if config.trainer.document_mask.is_none()
@@ -111,19 +111,13 @@ pub fn check_document_mask_cuda(config: &LitConfig) -> anyhow::Result<()> {
              or train on CPU."
         );
     }
-    if model.dtype == DTypePrecision::BF16 {
-        anyhow::bail!(
-            "trainer.document_mask on CUDA needs model.dtype f32 or f16, got bf16: the varlen \
-             attention kernel has no bf16 path. Set model.dtype: f16 or f32."
-        );
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GdnSpec;
+    use crate::config::{DTypePrecision, GdnSpec};
 
     /// A GQA model with head_dim 64 and the document mask on.
     fn masked() -> LitConfig {
@@ -221,13 +215,16 @@ mod tests {
     }
 
     #[test]
-    fn cuda_refuses_bf16() {
+    fn cuda_accepts_every_dtype() {
         let mut cfg = masked();
-        cfg.model.dtype = DTypePrecision::BF16;
-        let e = check_document_mask_cuda(&cfg)
-            .expect_err("bf16")
-            .to_string();
-        assert!(e.contains("bf16"), "{e}");
+        for dtype in [
+            DTypePrecision::F32,
+            DTypePrecision::F16,
+            DTypePrecision::BF16,
+        ] {
+            cfg.model.dtype = dtype;
+            check_document_mask_cuda(&cfg).expect("the varlen kernel runs F32, F16 and BF16");
+        }
     }
 
     #[test]

@@ -390,7 +390,7 @@ Model limits. Each is an error naming the keys:
 - Mamba, Mamba2, Mamba3 and Gated DeltaNet layers take the mask. Each resets its conv window and recurrent state at a document start, so a document sees nothing of the one before it.
 - `model.sliding_window` is refused. Varlen attention has no window.
 - An MLA model takes the mask in f32, f16 and bf16. Its mask bias uses the model dtype.
-- A GQA model on CUDA needs a head dim of 64, 128 or 256, and `model.dtype` f32 or f16. The error names the head dim. The CLI checks this once the target device is final.
+- A GQA model on CUDA needs a head dim of 64, 128 or 256. The error names the head dim. The CLI checks this once the target device is final.
 
 Checkpoint and run rules:
 
