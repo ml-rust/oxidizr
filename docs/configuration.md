@@ -366,7 +366,7 @@ trainer:
 
 ### Document Masking
 
-`trainer.document_mask` stops attention and loss at document boundaries inside a packed row. [Document Boundaries](data/format.md#document-boundaries) gives the segment and loss rules.
+`trainer.document_mask` stops attention, recurrent state and loss at document boundaries inside a packed row. [Document Boundaries](data/format.md#document-boundaries) gives the segment and loss rules.
 
 | Key | Description | Default |
 |-----|-------------|---------|
@@ -387,7 +387,7 @@ Separator rules:
 
 Model limits. Each is an error naming the keys:
 
-- Attention layers only. A layer in `model.mamba_layers` or `model.gdn_layers` is refused: its recurrent state carries across documents. The error names the layer index.
+- Mamba, Mamba2, Mamba3 and Gated DeltaNet layers take the mask. Each resets its conv window and recurrent state at a document start, so a document sees nothing of the one before it.
 - `model.sliding_window` is refused. Varlen attention has no window.
 - An MLA model needs `model.dtype: f32`. Its mask is an F32 bias on the attention scores.
 - A GQA model on CUDA needs a head dim of 64, 128 or 256, and `model.dtype` f32 or f16. The error names the head dim. The CLI checks this once the target device is final.

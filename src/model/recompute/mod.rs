@@ -2,5 +2,5 @@
 
 mod alias;
 #[cfg(test)]
-mod fixtures;
+pub(in crate::model) mod fixtures;
 mod segment;

@@ -3,6 +3,7 @@ use crate::prelude::{DType, Embedding, Init, Linear, Result, RmsNorm, Tensor, Va
 use crate::config::{ActivationCheckpointing, LoraConfig, OxidizrModelConfig};
 use crate::data::BatchSegments;
 use boostr::model::config::{default_rms_norm_eps, ModelConfig};
+use boostr::nn::segment_masks::SegmentMasks;
 use boostr::tensor::TensorId;
 // `cast` is a TypeConversionOps method; the trait must be in scope to call it.
 use boostr::TypeConversionOps;
@@ -2743,13 +2744,17 @@ where
     }
 
     /// `segments`: the batch's document segments. The attention arms keep
-    /// attention inside each document. A Mamba or GDN arm refuses them: its
-    /// recurrent state crosses documents.
+    /// attention inside each document.
+    ///
+    /// `masks`: the boundary masks built from `segments`. The Mamba and GDN
+    /// arms reset their conv window and state at a document start. `None`
+    /// treats each row as one document.
     fn forward<C>(
         &self,
         client: &C,
         x: &boostr::autograd::Var<R>,
         segments: Option<&BatchSegments<R>>,
+        masks: Option<&SegmentMasks<R>>,
     ) -> Result<BlockOutput<R>>
     where
         // `BinaryOps` is carried for `CausalSelfAttention::forward`, whose
@@ -2778,16 +2783,13 @@ where
             + boostr::DequantOps<R>
             + boostr::GatedDeltaNetOps<R>,
     {
-        if segments.is_some() {
-            self.check_segments_supported()?;
-        }
         match &self.block_type {
-            BlockType::Gdn(layer) => layer.forward(client, x),
+            BlockType::Gdn(layer) => layer.forward(client, x, masks),
             BlockType::Mamba { block, norm } => {
                 // Mamba1: single layer with normalization and residual
                 let residual = x;
                 let x = norm.forward(client, x)?;
-                let x = block.forward(client, &x, None)?;
+                let x = block.forward(client, &x, masks)?;
                 let x = boostr::autograd::var_add(&x, residual, client)
                     .map_err(boostr::error::Error::Numr)?;
 
@@ -2802,7 +2804,7 @@ where
                 // pre-norm and residual here: pre-norm -> mixer -> + residual.
                 let residual = x;
                 let x = norm.forward(client, x)?;
-                let x = block.forward(client, &x, None)?;
+                let x = block.forward(client, &x, masks)?;
                 let x = boostr::autograd::var_add(&x, residual, client)
                     .map_err(boostr::error::Error::Numr)?;
 
@@ -2819,7 +2821,7 @@ where
                 // pre-norm and residual here: pre-norm -> mixer -> + residual.
                 let residual = x;
                 let x = norm.forward(client, x)?;
-                let x = block.forward(client, &x, None)?;
+                let x = block.forward(client, &x, masks)?;
                 let x = boostr::autograd::var_add(&x, residual, client)
                     .map_err(boostr::error::Error::Numr)?;
 
@@ -3206,8 +3208,8 @@ pub struct LitGPT<R: boostr::Runtime> {
     norm: RmsNorm<R>,
     lm_head: Linear<R>,
     /// Model dtype (F32/F16/BF16 as configured)
-    /// RmsNorm and SSM computations use F32 internally for numerical stability
-    #[allow(dead_code)]
+    /// RmsNorm and SSM computations use F32 internally for numerical stability.
+    /// The document boundary masks take this dtype.
     compute_dtype: DType,
     /// Parameters that must stay frozen. Carried on the model and handed to
     /// every `*_with_ids` constructor, so `rebuild_with_parameters` — which the
@@ -3698,12 +3700,13 @@ where
     ///
     /// `segments`: the batch's document segments, from
     /// [`Batch::segments`](crate::data::Batch::segments). `Some` keeps every
-    /// attention layer inside each document. `None` attends across the whole row.
+    /// attention layer inside each document and resets every Mamba and GDN
+    /// layer at a document start. `None` treats the whole row as one document.
+    /// The boundary masks are built once here and shared by the recurrent layers.
     ///
     /// # Errors
     ///
     /// The errors of the embedding, each layer, the final norm and `lm_head`.
-    /// A Mamba or GDN layer given `segments` is an error.
     pub fn forward_with<C>(
         &self,
         client: &C,
@@ -3816,11 +3819,15 @@ where
         let mut aux_losses = Vec::new();
         let mut z_losses = Vec::new();
 
+        // One set of masks serves every recurrent layer of this forward.
+        let masks =
+            segments::build_segment_masks(client, &self.layers, segments, self.compute_dtype)?;
+
         for (i, layer) in self.layers.iter().enumerate() {
             let output = if checkpointing.covers(i) {
-                layer.forward_checkpointed(client, &x, i, segments)?
+                layer.forward_checkpointed(client, &x, i, segments, masks.as_ref())?
             } else {
-                layer.forward(client, &x, segments)?
+                layer.forward(client, &x, segments, masks.as_ref())?
             };
             x = boostr::nn::var_contiguous(&output.hidden)?; // Force contiguous after each layer
 

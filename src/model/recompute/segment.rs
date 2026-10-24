@@ -8,6 +8,7 @@ use crate::data::BatchSegments;
 use crate::model::{Block, BlockOutput, BlockType, FfnLayer};
 use crate::prelude::{DType, Error, Result};
 use boostr::autograd::{checkpoint_many_with_client, checkpoint_with_client, Var};
+use boostr::nn::segment_masks::SegmentMasks;
 use boostr::{NumrError, NumrResult};
 
 /// The auxiliary losses the plain [`Block::forward`] returns.
@@ -47,8 +48,8 @@ where
     /// runs the layer again. On CPU the result equals the plain forward bit for
     /// bit, auxiliary losses included. CUDA agrees within a relative 1e-5.
     ///
-    /// `segments` are plain data, not segment inputs. The closure keeps a
-    /// shared handle to them, so the recompute masks the same documents.
+    /// `segments` and `masks` are plain data, not segment inputs. The closure
+    /// keeps a shared handle to each, so the recompute masks the same documents.
     ///
     /// # Errors
     ///
@@ -59,6 +60,7 @@ where
         x: &Var<R>,
         layer_idx: usize,
         segments: Option<&BatchSegments<R>>,
+        masks: Option<&SegmentMasks<R>>,
     ) -> Result<BlockOutput<R>>
     where
         C: boostr::RuntimeClient<R>
@@ -91,12 +93,13 @@ where
         let owned = self.alias();
         // `BatchSegments` clones share one `Arc`, so the closure holds no copy.
         let segments = segments.cloned();
+        let masks = masks.cloned();
         match self.aux_losses() {
             AuxLosses::Routed => {
                 let outputs = checkpoint_many_with_client(
                     move |xs: &[Var<R>], c: &C| {
                         let out = owned
-                            .forward(c, first(xs, layer_idx)?, segments.as_ref())
+                            .forward(c, first(xs, layer_idx)?, segments.as_ref(), masks.as_ref())
                             .map_err(|e| segment_error(layer_idx, e))?;
                         match (out.aux_loss, out.z_loss) {
                             (Some(aux), Some(z)) => Ok(vec![out.hidden, aux, z]),
@@ -129,7 +132,7 @@ where
                 let hidden = checkpoint_with_client(
                     move |xs: &[Var<R>], c: &C| {
                         owned
-                            .forward(c, first(xs, layer_idx)?, segments.as_ref())
+                            .forward(c, first(xs, layer_idx)?, segments.as_ref(), masks.as_ref())
                             .map(|out| out.hidden)
                             .map_err(|e| segment_error(layer_idx, e))
                     },
@@ -386,27 +389,6 @@ mod tests {
                 "{label}: the mask changed nothing"
             );
         }
-    }
-
-    /// A recurrent arm refuses document segments instead of crossing documents.
-    #[test]
-    fn a_mamba_layer_refuses_segments() {
-        let (device, client) = fixtures::setup();
-        let (ids, segments) = fixtures::segmented_batch(&device);
-        let model = fixtures::build(&fixtures::mamba2());
-        let Err(e) = model.forward_with(
-            &client,
-            &ids,
-            &ActivationCheckpointing::None,
-            Some(&segments),
-        ) else {
-            panic!("a Mamba layer must refuse document segments");
-        };
-        assert!(
-            e.to_string()
-                .contains("Mamba layer cannot take document segments"),
-            "{e}"
-        );
     }
 
     /// `{layers: [1]}` on three layers checkpoints the middle layer alone.

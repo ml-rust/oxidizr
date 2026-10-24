@@ -4,6 +4,7 @@
 //! - Changing document A leaves the logits of document B bit-identical.
 //! - A stopped run resumes bit-identical, and its meta records the mask.
 //! - Recompute under the mask trains bit-identical to a run without recompute.
+//! - A model with Mamba2 and Gated DeltaNet layers masks and trains the same way.
 //! - The YAML loader refuses the mask on a model it cannot mask.
 
 mod common;
@@ -16,7 +17,7 @@ use common::{
 use oxidizr::checkpoint_set::plan_optimizer_resume;
 use oxidizr::config::{
     check_document_mask_resume, find_latest_checkpoint, ActivationCheckpointing, CheckpointMeta,
-    DocumentMaskRecord, LitConfig, OxidizrModelConfig,
+    DocumentMaskRecord, GdnSpec, LitConfig, OxidizrModelConfig,
 };
 use oxidizr::data::{Batch, DataPosition, LitDataLoader};
 use oxidizr::model::{load_checkpoint_into_model, LitGPT};
@@ -47,6 +48,32 @@ fn mla() -> OxidizrModelConfig {
         kv_latent_dim: Some(8),
         q_latent_dim: Some(8),
         d_rope: Some(2),
+        ..tiny_model_config(false)
+    }
+}
+
+/// GQA layer 0, Mamba2 layer 1 and Gated DeltaNet layer 2.
+fn hybrid() -> OxidizrModelConfig {
+    OxidizrModelConfig {
+        num_layers: 3,
+        kv_heads: Some(2),
+        mamba_layers: Some(vec![1]),
+        mamba2_num_heads: Some(4),
+        mamba2_head_dim: Some(8),
+        mamba2_state_size: Some(4),
+        mamba2_chunk_size: Some(4),
+        mamba2_n_groups: Some(1),
+        mamba2_conv_kernel: Some(4),
+        mamba2_expand: Some(2),
+        gdn_layers: Some(vec![2]),
+        gdn: Some(GdnSpec {
+            state_size: 4,
+            key_heads: 2,
+            value_heads: 4,
+            conv_kernel: 3,
+            chunk_size: 4,
+            rms_eps: 1e-6,
+        }),
         ..tiny_model_config(false)
     }
 }
@@ -116,7 +143,7 @@ fn row_logits(logits: &[f32], vocab: usize, row: usize, positions: Range<usize>)
 }
 
 /// Document A is 4 tokens with its separator, document B the 4 tokens after it.
-fn packed_matches_separate_rows(model: OxidizrModelConfig, label: &str) {
+fn packed_matches_separate_rows(model: OxidizrModelConfig, label: &str, rel: f64) {
     let vocab = model.vocab_size;
     let net = model_of(model);
     let packed = vec![1, 2, 3, SEP, 7, 8, 9, 10, 11];
@@ -142,15 +169,20 @@ fn packed_matches_separate_rows(model: OxidizrModelConfig, label: &str) {
     let packed_loss = ce_sum(&z, &targets, vocab, 0, 0..3) + ce_sum(&z, &targets, vocab, 0, 4..8);
     let separate = ce_sum(&z, &targets, vocab, 1, 0..3) + ce_sum(&z, &targets, vocab, 2, 0..4);
     assert!(
-        (packed_loss - separate).abs() <= 1e-6 * separate.abs(),
+        (packed_loss - separate).abs() <= rel * separate.abs(),
         "{label}: packed loss {packed_loss} vs separate rows {separate}"
     );
 }
 
 #[test]
 fn a_packed_row_has_the_loss_of_its_documents_in_separate_rows() {
-    packed_matches_separate_rows(gqa(), "gqa");
-    packed_matches_separate_rows(mla(), "mla");
+    packed_matches_separate_rows(gqa(), "gqa", 1e-6);
+    packed_matches_separate_rows(mla(), "mla", 1e-6);
+}
+
+#[test]
+fn a_recurrent_packed_row_has_the_loss_of_its_documents_in_separate_rows() {
+    packed_matches_separate_rows(hybrid(), "hybrid", 1e-4);
 }
 
 fn document_b_ignores_document_a(model: OxidizrModelConfig, label: &str) {
@@ -177,6 +209,32 @@ fn document_b_ignores_document_a(model: OxidizrModelConfig, label: &str) {
 fn changing_document_a_leaves_document_b_bit_identical() {
     document_b_ignores_document_a(gqa(), "gqa");
     document_b_ignores_document_a(mla(), "mla");
+}
+
+#[test]
+fn changing_document_a_leaves_a_recurrent_document_b_unchanged() {
+    let vocab = hybrid().vocab_size;
+    let net = model_of(hybrid());
+    let batch = masked_batch(&[
+        vec![1, 2, 3, SEP, 7, 8, 9, 10, 11],
+        vec![4, 6, 2, SEP, 7, 8, 9, 10, 11],
+    ]);
+    let z = logits(&net, &batch);
+    let at = |row: usize, positions: Range<usize>| -> Vec<f32> {
+        let span = (row * SEQ + positions.start) * vocab..(row * SEQ + positions.end) * vocab;
+        z[span].to_vec()
+    };
+    let drift = at(0, 4..SEQ)
+        .iter()
+        .zip(at(1, 4..SEQ))
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(drift <= 1e-5, "document B saw document A: drift {drift}");
+    assert_ne!(
+        row_logits(&z, vocab, 0, 0..4),
+        row_logits(&z, vocab, 1, 0..4),
+        "the changed document A kept its logits"
+    );
 }
 
 /// Trains `steps` steps from the stream start and saves the step set when `save`.
@@ -273,6 +331,39 @@ fn recompute_under_the_mask_trains_bit_identical() {
         train_fresh(&cfg, 2, false),
         "recompute changed the step"
     );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_recurrent_model_trains_under_the_mask_with_and_without_recompute() {
+    let dir = scratch_dir("document-mask-recurrent");
+    let mut cfg = document_masked(tiny_config(&dir, STEPS));
+    cfg.model = hybrid();
+    let plain = train_fresh(&cfg, 2, false);
+    let mut unmasked = cfg.clone();
+    unmasked.trainer.document_mask = None;
+    assert_ne!(
+        plain,
+        train_fresh(&unmasked, 2, false),
+        "the mask changed nothing"
+    );
+    cfg.trainer.activation_checkpointing = ActivationCheckpointing::All;
+    assert_eq!(
+        plain,
+        train_fresh(&cfg, 2, false),
+        "recompute changed the step"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_yaml_loader_accepts_a_mask_on_a_recurrent_model() {
+    let dir = scratch_dir("document-mask-yaml-recurrent");
+    let mut cfg = document_masked(tiny_config(&dir, STEPS));
+    cfg.model = hybrid();
+    let path = dir.join("hybrid.yaml");
+    write_config_yaml(&path, &cfg);
+    LitConfig::from_yaml(&path).expect("Mamba and GDN layers take the mask");
     let _ = fs::remove_dir_all(dir);
 }
 

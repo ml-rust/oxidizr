@@ -2,7 +2,8 @@
 //!
 //! A separator token ends each document. With the key set, no token attends
 //! across a separator, and no position predicts the first token of the next
-//! document. This module holds the config, the meta record, and the model checks.
+//! document. A Mamba or Gated DeltaNet layer resets its conv window and state at
+//! each separator. This module holds the config, the meta record, and the model checks.
 
 use super::{DTypePrecision, LitConfig};
 use serde::{Deserialize, Serialize};
@@ -55,38 +56,18 @@ pub fn describe_document_mask(record: Option<DocumentMaskRecord>) -> String {
 
 /// Refuses `trainer.document_mask` on a model it cannot mask.
 ///
-/// - A Mamba or GDN layer carries recurrent state across documents.
 /// - `model.sliding_window`: varlen attention has no window.
 /// - An MLA model needs `model.dtype: f32`: its document mask adds an F32 bias to the scores.
 ///
 /// `--dtype` can change the dtype after this check, so the run plan calls it again.
 ///
 /// # Errors
-/// Returns an error naming the key and the layer that conflict.
+/// Returns an error naming the keys that conflict.
 pub fn check_document_mask_model(config: &LitConfig) -> anyhow::Result<()> {
     if config.trainer.document_mask.is_none() {
         return Ok(());
     }
     let model = &config.model;
-    let listed = |layers: &Option<Vec<usize>>, i: usize| {
-        layers.as_ref().is_some_and(|layers| layers.contains(&i))
-    };
-    for i in 0..model.num_layers {
-        if listed(&model.mamba_layers, i) {
-            anyhow::bail!(
-                "trainer.document_mask cannot mask layer {i}: model.mamba_layers makes it a Mamba \
-                 layer, and its recurrent state carries across documents. Remove \
-                 trainer.document_mask, or remove {i} from model.mamba_layers."
-            );
-        }
-        if listed(&model.gdn_layers, i) {
-            anyhow::bail!(
-                "trainer.document_mask cannot mask layer {i}: model.gdn_layers makes it a Gated \
-                 DeltaNet layer, and its recurrent state carries across documents. Remove \
-                 trainer.document_mask, or remove {i} from model.gdn_layers."
-            );
-        }
-    }
     if let Some(window) = model.sliding_window.filter(|&w| w > 0) {
         anyhow::bail!(
             "trainer.document_mask cannot run with model.sliding_window {window}: varlen \
@@ -104,16 +85,28 @@ pub fn check_document_mask_model(config: &LitConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether any layer is attention: one in neither `mamba_layers` nor `gdn_layers`.
+fn has_attention_layer(model: &super::OxidizrModelConfig) -> bool {
+    let listed = |layers: &Option<Vec<usize>>, i: usize| {
+        layers.as_ref().is_some_and(|layers| layers.contains(&i))
+    };
+    (0..model.num_layers).any(|i| !listed(&model.mamba_layers, i) && !listed(&model.gdn_layers, i))
+}
+
 /// Refuses `trainer.document_mask` on a GQA model the CUDA varlen kernel cannot run.
 ///
 /// The kernel takes a head_dim in [`CUDA_VARLEN_HEAD_DIMS`] and F32 or F16.
 /// An MLA model runs its document mask through a bias, so this check skips it.
+/// A model with no attention layer has no varlen kernel to run, so it skips too.
 ///
 /// # Errors
 /// Returns an error naming the head_dim or the dtype, with the accepted values.
 pub fn check_document_mask_cuda(config: &LitConfig) -> anyhow::Result<()> {
     let model = &config.model;
-    if config.trainer.document_mask.is_none() || model.kv_latent_dim.is_some() {
+    if config.trainer.document_mask.is_none()
+        || model.kv_latent_dim.is_some()
+        || !has_attention_layer(model)
+    {
         return Ok(());
     }
     if model.num_heads == 0 {
@@ -172,19 +165,16 @@ mod tests {
     }
 
     #[test]
-    fn a_mamba_layer_is_refused_by_index() {
+    fn a_mamba_layer_is_accepted() {
         let mut cfg = masked();
         cfg.model.mamba_layers = Some(vec![3]);
-        let e = model_error(&cfg);
-        assert!(
-            e.contains("layer 3") && e.contains("model.mamba_layers"),
-            "{e}"
-        );
+        check_document_mask_model(&cfg).expect("Mamba layers take the mask");
     }
 
     #[test]
-    fn a_gdn_layer_is_refused_by_index() {
+    fn a_hybrid_model_with_mamba_and_gdn_layers_is_accepted() {
         let mut cfg = masked();
+        cfg.model.mamba_layers = Some(vec![0]);
         cfg.model.gdn_layers = Some(vec![1]);
         cfg.model.gdn = Some(GdnSpec {
             state_size: 4,
@@ -194,11 +184,7 @@ mod tests {
             chunk_size: 4,
             rms_eps: 1e-6,
         });
-        let e = model_error(&cfg);
-        assert!(
-            e.contains("layer 1") && e.contains("model.gdn_layers"),
-            "{e}"
-        );
+        check_document_mask_model(&cfg).expect("Mamba and GDN layers take the mask");
     }
 
     #[test]
@@ -233,6 +219,15 @@ mod tests {
     }
 
     #[test]
+    fn cuda_skips_a_model_without_attention_layers() {
+        let mut cfg = masked();
+        cfg.model.head_dim = Some(48);
+        cfg.model.dtype = DTypePrecision::BF16;
+        cfg.model.mamba_layers = Some((0..cfg.model.num_layers).collect());
+        check_document_mask_cuda(&cfg).expect("no attention layer, no varlen kernel");
+    }
+
+    #[test]
     fn cuda_refuses_bf16() {
         let mut cfg = masked();
         cfg.model.dtype = DTypePrecision::BF16;
@@ -245,7 +240,7 @@ mod tests {
     #[test]
     fn off_skips_every_check() {
         let mut cfg = LitConfig::nano_baseline();
-        cfg.model.mamba_layers = Some(vec![0]);
+        cfg.model.sliding_window = Some(16);
         cfg.model.head_dim = Some(48);
         check_document_mask_model(&cfg).expect("off");
         check_document_mask_cuda(&cfg).expect("off");

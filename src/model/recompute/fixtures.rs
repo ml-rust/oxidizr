@@ -10,16 +10,16 @@ use crate::prelude::{Tensor, VarBuilder, VarMap};
 use boostr::{CpuClient, CpuDevice, CpuRuntime};
 
 /// The model type every fixture builds.
-pub(super) type Model = LitGPT<CpuRuntime>;
+pub(in crate::model) type Model = LitGPT<CpuRuntime>;
 
 /// Batch rows of [`token_ids`].
-pub(super) const BATCH: usize = 2;
+pub(in crate::model) const BATCH: usize = 2;
 /// Tokens per row, equal to `max_seq_len`.
-pub(super) const SEQ: usize = 8;
+pub(in crate::model) const SEQ: usize = 8;
 const VOCAB: usize = 12;
 
 /// A two-layer dense GQA model with a SwiGLU MLP.
-pub(super) fn legacy_mlp() -> OxidizrModelConfig {
+pub(in crate::model) fn legacy_mlp() -> OxidizrModelConfig {
     let mut cfg = LitConfig::nano_baseline().model;
     cfg.name = "recompute-test".to_string();
     cfg.hidden_size = 16;
@@ -44,12 +44,12 @@ fn with_moe(cfg: OxidizrModelConfig) -> OxidizrModelConfig {
 }
 
 /// [`legacy_mlp`] with an MoE FFN.
-pub(super) fn legacy_moe() -> OxidizrModelConfig {
+pub(in crate::model) fn legacy_moe() -> OxidizrModelConfig {
     with_moe(legacy_mlp())
 }
 
 /// [`legacy_mlp`] with MLA attention.
-pub(super) fn mla_mlp() -> OxidizrModelConfig {
+pub(in crate::model) fn mla_mlp() -> OxidizrModelConfig {
     OxidizrModelConfig {
         kv_heads: None,
         kv_latent_dim: Some(8),
@@ -60,12 +60,12 @@ pub(super) fn mla_mlp() -> OxidizrModelConfig {
 }
 
 /// [`mla_mlp`] with an MoE FFN.
-pub(super) fn mla_moe() -> OxidizrModelConfig {
+pub(in crate::model) fn mla_moe() -> OxidizrModelConfig {
     with_moe(mla_mlp())
 }
 
 /// Every layer a bare Mamba1 block.
-pub(super) fn mamba1() -> OxidizrModelConfig {
+pub(in crate::model) fn mamba1() -> OxidizrModelConfig {
     OxidizrModelConfig {
         mamba_layers: Some(vec![0, 1]),
         mamba2_state_size: Some(4),
@@ -75,7 +75,7 @@ pub(super) fn mamba1() -> OxidizrModelConfig {
 }
 
 /// Every layer a Mamba2 block. `16 * expand 2 == 4 heads * 8`.
-pub(super) fn mamba2() -> OxidizrModelConfig {
+pub(in crate::model) fn mamba2() -> OxidizrModelConfig {
     OxidizrModelConfig {
         mamba_layers: Some(vec![0, 1]),
         mamba2_num_heads: Some(4),
@@ -90,7 +90,7 @@ pub(super) fn mamba2() -> OxidizrModelConfig {
 }
 
 /// [`mamba2`] with the Mamba3 mixer.
-pub(super) fn mamba3() -> OxidizrModelConfig {
+pub(in crate::model) fn mamba3() -> OxidizrModelConfig {
     OxidizrModelConfig {
         mamba3_enabled: Some(true),
         ..mamba2()
@@ -98,7 +98,7 @@ pub(super) fn mamba3() -> OxidizrModelConfig {
 }
 
 /// GDN layer 0 and attention layer 1, both over an MoE FFN.
-pub(super) fn gdn_moe() -> OxidizrModelConfig {
+pub(in crate::model) fn gdn_moe() -> OxidizrModelConfig {
     with_moe(OxidizrModelConfig {
         gdn_layers: Some(vec![0]),
         gdn: Some(GdnSpec {
@@ -114,7 +114,7 @@ pub(super) fn gdn_moe() -> OxidizrModelConfig {
 }
 
 /// [`legacy_mlp`] with LoRA on `q_proj` and `v_proj` over frozen bases.
-pub(super) fn legacy_lora_frozen() -> OxidizrModelConfig {
+pub(in crate::model) fn legacy_lora_frozen() -> OxidizrModelConfig {
     OxidizrModelConfig {
         lora: Some(LoraConfig {
             rank: 2,
@@ -128,14 +128,14 @@ pub(super) fn legacy_lora_frozen() -> OxidizrModelConfig {
 }
 
 /// The CPU device and a client on it.
-pub(super) fn setup() -> (CpuDevice, CpuClient) {
+pub(in crate::model) fn setup() -> (CpuDevice, CpuClient) {
     let device = CpuDevice::new();
     let client = CpuClient::new(device.clone());
     (device, client)
 }
 
 /// A seeded model of `cfg`.
-pub(super) fn build(cfg: &OxidizrModelConfig) -> Model {
+pub(in crate::model) fn build(cfg: &OxidizrModelConfig) -> Model {
     let (device, client) = setup();
     let mut map = VarMap::<CpuRuntime>::new();
     let mut vb = VarBuilder::new(&mut map, &device).with_seed(0x5eed);
@@ -143,7 +143,7 @@ pub(super) fn build(cfg: &OxidizrModelConfig) -> Model {
 }
 
 /// `[BATCH, SEQ]` token ids that cover the whole vocab.
-pub(super) fn token_ids(device: &CpuDevice) -> Tensor<CpuRuntime> {
+pub(in crate::model) fn token_ids(device: &CpuDevice) -> Tensor<CpuRuntime> {
     let ids: Vec<i64> = (0..BATCH * SEQ)
         .map(|i| ((i * 5 + i / 3) % VOCAB) as i64)
         .collect();
@@ -156,7 +156,7 @@ const SEPARATOR: u32 = 9;
 /// `[BATCH, SEQ]` input ids and their document segments, built by the data loader.
 ///
 /// Each row splits into two documents after its separator.
-pub(super) fn segmented_batch(
+pub(in crate::model) fn segmented_batch(
     device: &CpuDevice,
 ) -> (Tensor<CpuRuntime>, BatchSegments<CpuRuntime>) {
     let tokens: Vec<u32> = (0..BATCH * (SEQ + 1))

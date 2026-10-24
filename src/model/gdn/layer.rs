@@ -17,6 +17,7 @@ use crate::prelude::{DType, Result, RmsNorm, Tensor, VarBuilder};
 use boostr::autograd::{TensorId, Var};
 use boostr::model::config::{GdnConfig, ModelConfig};
 use boostr::model::hybrid::GdnBlock;
+use boostr::nn::segment_masks::SegmentMasks;
 use std::collections::HashMap;
 
 /// Name segment of the mixer under `layers.N`, as Qwen3.5 checkpoints name it.
@@ -209,7 +210,8 @@ where
     /// `norm -> mixer -> + x -> norm -> ffn -> + residual`.
     ///
     /// The mixer runs `GdnBlock::forward_train`. Each call starts from a
-    /// zero conv window and a zero recurrent state. Under
+    /// zero conv window and a zero recurrent state. With `masks`, the conv
+    /// window and the state also reset at each document start. Under
     /// `trainer.activation_checkpointing`, `Block::forward_checkpointed` runs
     /// this whole call as one recompute segment.
     ///
@@ -218,7 +220,12 @@ where
     /// # Errors
     ///
     /// The errors of the norms, the mixer, the FFN and the residual adds.
-    pub(in crate::model) fn forward<C>(&self, client: &C, x: &Var<R>) -> Result<BlockOutput<R>>
+    pub(in crate::model) fn forward<C>(
+        &self,
+        client: &C,
+        x: &Var<R>,
+        masks: Option<&SegmentMasks<R>>,
+    ) -> Result<BlockOutput<R>>
     where
         C: boostr::RuntimeClient<R>
             + boostr::TensorOps<R>
@@ -237,7 +244,7 @@ where
             + boostr::GatedDeltaNetOps<R>,
     {
         let h = self.input_layernorm.forward(client, x)?;
-        let h = self.block.forward_train(client, &h)?;
+        let h = self.block.forward_train(client, &h, masks)?;
         let x = boostr::autograd::var_add(&h, x, client).map_err(boostr::error::Error::Numr)?;
 
         let h = self.post_attention_layernorm.forward(client, &x)?;
@@ -436,8 +443,11 @@ mod tests {
             .expect("boostr loads the mixer's tensors");
 
         let x = input(&device);
-        let ours = layer.block.forward_train(&client, &x).expect("forward");
-        let want = reference.forward_train(&client, &x).expect("forward");
+        let ours = layer
+            .block
+            .forward_train(&client, &x, None)
+            .expect("forward");
+        let want = reference.forward_train(&client, &x, None).expect("forward");
         assert_eq!(bits(ours.tensor()), bits(want.tensor()));
 
         let grads = backward(&weighted_loss(&client, &ours), &client).expect("backward");
@@ -470,7 +480,7 @@ mod tests {
         let x = input(&device);
 
         let h = layer.input_layernorm.forward(&client, &x).expect("norm");
-        let h = layer.block.forward_train(&client, &h).expect("mixer");
+        let h = layer.block.forward_train(&client, &h, None).expect("mixer");
         let mid = var_add(&h, &x, &client).expect("residual");
         let h = layer
             .post_attention_layernorm
@@ -479,7 +489,7 @@ mod tests {
         let (h, _, _) = layer.ffn.forward(&client, &h).expect("ffn");
         let want = var_add(&h, &mid, &client).expect("residual");
 
-        let got = layer.forward(&client, &x).expect("layer forward");
+        let got = layer.forward(&client, &x, None).expect("layer forward");
         assert_eq!(bits(got.hidden.tensor()), bits(want.tensor()));
         assert!(got.aux_loss.is_none() && got.z_loss.is_none());
     }
@@ -507,8 +517,8 @@ mod tests {
         assert_eq!(flags(&alias), flags(layer));
         assert!(flags(layer).iter().any(|(_, trains)| !trains));
         let x = input(&device);
-        let got = alias.forward(&client, &x).expect("alias forward");
-        let want = layer.forward(&client, &x).expect("layer forward");
+        let got = alias.forward(&client, &x, None).expect("alias forward");
+        let want = layer.forward(&client, &x, None).expect("layer forward");
         assert_eq!(bits(got.hidden.tensor()), bits(want.hidden.tensor()));
     }
 
