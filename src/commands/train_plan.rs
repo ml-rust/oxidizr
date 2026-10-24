@@ -7,8 +7,8 @@ use crate::commands::train_overrides::apply_cli_overrides;
 use crate::commands::train_resume::{resolve_resume, ResumePoint};
 use crate::commands::TrainArgs;
 use crate::config::{
-    check_document_mask_cuda, check_document_mask_model, check_document_mask_resume,
-    resolve_run_separator, DTypePrecision, LitConfig,
+    check_document_mask_cuda, check_document_mask_resume, resolve_run_separator, DTypePrecision,
+    LitConfig,
 };
 use crate::data::resolve_data_files;
 use crate::distributed::{
@@ -152,15 +152,13 @@ impl RunPlan {
 
 /// Checks `trainer.document_mask` against the final config and fills in its separator.
 ///
-/// `--dtype` can change the dtype after `LitConfig::validate`, so the model
-/// check runs again. A CLI launch on CUDA also checks the varlen kernel's limits.
+/// A CLI launch on CUDA checks the varlen kernel's limits.
 /// The resolved separator goes into the config, so the run record shows it.
 fn resolve_document_mask(
     config: &mut LitConfig,
     data_files: &[String],
     launch: Launch,
 ) -> Result<()> {
-    check_document_mask_model(config)?;
     if launch == (Launch::Cli { uses_cpu: false }) {
         check_document_mask_cuda(config)?;
     }

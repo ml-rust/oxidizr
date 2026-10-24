@@ -5,7 +5,8 @@
 //! - A stopped run resumes bit-identical, and its meta records the mask.
 //! - Recompute under the mask trains bit-identical to a run without recompute.
 //! - A model with Mamba2 and Gated DeltaNet layers masks and trains the same way.
-//! - The YAML loader refuses the mask on a model it cannot mask.
+//! - A sliding window counts inside each document.
+//! - The YAML loader accepts the mask with a sliding window.
 
 mod common;
 
@@ -49,6 +50,14 @@ fn mla() -> OxidizrModelConfig {
         q_latent_dim: Some(8),
         d_rope: Some(2),
         ..tiny_model_config(false)
+    }
+}
+
+/// [`gqa`] with a 2-token sliding window, narrower than each document.
+fn windowed() -> OxidizrModelConfig {
+    OxidizrModelConfig {
+        sliding_window: Some(2),
+        ..gqa()
     }
 }
 
@@ -181,6 +190,11 @@ fn a_packed_row_has_the_loss_of_its_documents_in_separate_rows() {
 }
 
 #[test]
+fn a_windowed_packed_row_has_the_loss_of_its_documents_in_separate_rows() {
+    packed_matches_separate_rows(windowed(), "windowed gqa", 1e-6);
+}
+
+#[test]
 fn a_recurrent_packed_row_has_the_loss_of_its_documents_in_separate_rows() {
     packed_matches_separate_rows(hybrid(), "hybrid", 1e-4);
 }
@@ -209,6 +223,11 @@ fn document_b_ignores_document_a(model: OxidizrModelConfig, label: &str) {
 fn changing_document_a_leaves_document_b_bit_identical() {
     document_b_ignores_document_a(gqa(), "gqa");
     document_b_ignores_document_a(mla(), "mla");
+}
+
+#[test]
+fn changing_document_a_leaves_a_windowed_document_b_bit_identical() {
+    document_b_ignores_document_a(windowed(), "windowed gqa");
 }
 
 #[test]
@@ -368,18 +387,12 @@ fn the_yaml_loader_accepts_a_mask_on_a_recurrent_model() {
 }
 
 #[test]
-fn the_yaml_loader_refuses_a_mask_with_a_sliding_window() {
+fn the_yaml_loader_accepts_a_mask_with_a_sliding_window() {
     let dir = scratch_dir("document-mask-yaml");
     let mut cfg = document_masked(tiny_config(&dir, STEPS));
     cfg.model.sliding_window = Some(4);
     let path = dir.join("window.yaml");
     write_config_yaml(&path, &cfg);
-    let e = LitConfig::from_yaml(&path)
-        .expect_err("window and mask")
-        .to_string();
-    assert!(
-        e.contains("model.sliding_window 4") && e.contains("trainer.document_mask"),
-        "{e}"
-    );
+    LitConfig::from_yaml(&path).expect("the window runs inside each document");
     let _ = fs::remove_dir_all(dir);
 }

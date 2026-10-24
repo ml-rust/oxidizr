@@ -385,10 +385,10 @@ Separator rules:
 - No `separator_id` and no sidecar is an error naming `trainer.document_mask.separator_id`.
 - Unknown keys under `document_mask` are an error.
 
-Model limits. Each is an error naming the keys:
+Model rules:
 
 - Mamba, Mamba2, Mamba3 and Gated DeltaNet layers take the mask. Each resets its conv window and recurrent state at a document start, so a document sees nothing of the one before it.
-- `model.sliding_window` is refused. Varlen attention has no window.
+- `model.sliding_window` is accepted. The window counts tokens inside one document, so a document behaves as if it ran alone.
 - An MLA model takes the mask in f32, f16 and bf16. Its mask bias uses the model dtype.
 - A GQA model on CUDA needs a head dim of 64, 128 or 256. The error names the head dim. The CLI checks this once the target device is final.
 

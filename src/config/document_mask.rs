@@ -3,7 +3,7 @@
 //! A separator token ends each document. With the key set, no token attends
 //! across a separator, and no position predicts the first token of the next
 //! document. A Mamba or Gated DeltaNet layer resets its conv window and state at
-//! each separator. This module holds the config, the meta record, and the model checks.
+//! each separator. This module holds the config, the meta record, and the CUDA check.
 
 use super::LitConfig;
 use serde::{Deserialize, Serialize};
@@ -52,26 +52,6 @@ impl fmt::Display for DocumentMaskRecord {
 /// `record` as resume messages print it: `off`, or its separator.
 pub fn describe_document_mask(record: Option<DocumentMaskRecord>) -> String {
     record.map_or_else(|| "off".to_string(), |r| r.to_string())
-}
-
-/// Refuses `trainer.document_mask` on a model it cannot mask.
-///
-/// - `model.sliding_window`: varlen attention has no window.
-///
-/// # Errors
-/// Returns an error naming the keys that conflict.
-pub fn check_document_mask_model(config: &LitConfig) -> anyhow::Result<()> {
-    if config.trainer.document_mask.is_none() {
-        return Ok(());
-    }
-    let model = &config.model;
-    if let Some(window) = model.sliding_window.filter(|&w| w > 0) {
-        anyhow::bail!(
-            "trainer.document_mask cannot run with model.sliding_window {window}: varlen \
-             attention has no window. Remove one of the two keys."
-        );
-    }
-    Ok(())
 }
 
 /// Whether any layer is attention: one in neither `mamba_layers` nor `gdn_layers`.
@@ -126,12 +106,6 @@ mod tests {
         cfg
     }
 
-    fn model_error(cfg: &LitConfig) -> String {
-        check_document_mask_model(cfg)
-            .expect_err("the check must refuse this config")
-            .to_string()
-    }
-
     #[test]
     fn yaml_parses_with_and_without_a_separator() {
         let set: DocumentMaskConfig = serde_yaml::from_str("separator_id: 2").expect("parse");
@@ -143,7 +117,6 @@ mod tests {
 
     #[test]
     fn an_attention_model_passes() {
-        check_document_mask_model(&masked()).expect("GQA passes");
         check_document_mask_cuda(&masked()).expect("head_dim 64 passes on CUDA");
     }
 
@@ -151,7 +124,7 @@ mod tests {
     fn a_mamba_layer_is_accepted() {
         let mut cfg = masked();
         cfg.model.mamba_layers = Some(vec![3]);
-        check_document_mask_model(&cfg).expect("Mamba layers take the mask");
+        check_document_mask_cuda(&cfg).expect("Mamba layers take the mask");
     }
 
     #[test]
@@ -167,18 +140,14 @@ mod tests {
             chunk_size: 4,
             rms_eps: 1e-6,
         });
-        check_document_mask_model(&cfg).expect("Mamba and GDN layers take the mask");
+        check_document_mask_cuda(&cfg).expect("Mamba and GDN layers take the mask");
     }
 
     #[test]
-    fn a_sliding_window_is_refused_naming_both_keys() {
+    fn a_sliding_window_is_accepted() {
         let mut cfg = masked();
         cfg.model.sliding_window = Some(16);
-        let e = model_error(&cfg);
-        assert!(
-            e.contains("model.sliding_window 16") && e.contains("trainer.document_mask"),
-            "{e}"
-        );
+        check_document_mask_cuda(&cfg).expect("the window runs inside each document");
     }
 
     #[test]
@@ -191,7 +160,7 @@ mod tests {
             DTypePrecision::BF16,
         ] {
             cfg.model.dtype = dtype;
-            check_document_mask_model(&cfg).expect("MLA builds its mask bias in the model dtype");
+            check_document_mask_cuda(&cfg).expect("MLA builds its mask bias in the model dtype");
         }
     }
 
@@ -230,9 +199,7 @@ mod tests {
     #[test]
     fn off_skips_every_check() {
         let mut cfg = LitConfig::nano_baseline();
-        cfg.model.sliding_window = Some(16);
         cfg.model.head_dim = Some(48);
-        check_document_mask_model(&cfg).expect("off");
         check_document_mask_cuda(&cfg).expect("off");
     }
 }

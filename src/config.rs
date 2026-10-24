@@ -22,8 +22,8 @@ mod document_mask_source;
 mod gdn;
 pub use activation_checkpointing::ActivationCheckpointing;
 pub use document_mask::{
-    check_document_mask_cuda, check_document_mask_model, describe_document_mask,
-    DocumentMaskConfig, DocumentMaskRecord, CUDA_VARLEN_HEAD_DIMS,
+    check_document_mask_cuda, describe_document_mask, DocumentMaskConfig, DocumentMaskRecord,
+    CUDA_VARLEN_HEAD_DIMS,
 };
 pub use document_mask_source::{
     check_document_mask_resume, document_mask_files, resolve_run_separator, resolve_separator,
@@ -937,7 +937,6 @@ impl LitConfig {
         if let Some(guard) = &self.trainer.spike_guard {
             guard.check()?;
         }
-        check_document_mask_model(self)?;
 
         // Mamba2 constraint: hidden_size * expand == num_heads * head_dim
         if let (Some(num_heads), Some(head_dim), Some(expand)) = (
