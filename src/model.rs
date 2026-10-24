@@ -2787,7 +2787,7 @@ where
                 // Mamba1: single layer with normalization and residual
                 let residual = x;
                 let x = norm.forward(client, x)?;
-                let x = block.forward(client, &x)?;
+                let x = block.forward(client, &x, None)?;
                 let x = boostr::autograd::var_add(&x, residual, client)
                     .map_err(boostr::error::Error::Numr)?;
 
@@ -2802,7 +2802,7 @@ where
                 // pre-norm and residual here: pre-norm -> mixer -> + residual.
                 let residual = x;
                 let x = norm.forward(client, x)?;
-                let x = block.forward(client, &x)?;
+                let x = block.forward(client, &x, None)?;
                 let x = boostr::autograd::var_add(&x, residual, client)
                     .map_err(boostr::error::Error::Numr)?;
 
