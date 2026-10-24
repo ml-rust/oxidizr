@@ -57,9 +57,6 @@ pub fn describe_document_mask(record: Option<DocumentMaskRecord>) -> String {
 /// Refuses `trainer.document_mask` on a model it cannot mask.
 ///
 /// - `model.sliding_window`: varlen attention has no window.
-/// - An MLA model needs `model.dtype: f32`: its document mask adds an F32 bias to the scores.
-///
-/// `--dtype` can change the dtype after this check, so the run plan calls it again.
 ///
 /// # Errors
 /// Returns an error naming the keys that conflict.
@@ -72,14 +69,6 @@ pub fn check_document_mask_model(config: &LitConfig) -> anyhow::Result<()> {
         anyhow::bail!(
             "trainer.document_mask cannot run with model.sliding_window {window}: varlen \
              attention has no window. Remove one of the two keys."
-        );
-    }
-    if model.kv_latent_dim.is_some() && model.dtype != DTypePrecision::F32 {
-        anyhow::bail!(
-            "trainer.document_mask on an MLA model needs model.dtype f32, got {}: the document \
-             mask adds an F32 bias to the attention scores. Set model.dtype: f32, or remove \
-             trainer.document_mask.",
-            model.dtype
         );
     }
     Ok(())
@@ -199,13 +188,17 @@ mod tests {
     }
 
     #[test]
-    fn mla_needs_f32() {
+    fn an_mla_model_is_accepted_in_every_dtype() {
         let mut cfg = masked();
         cfg.model.kv_latent_dim = Some(64);
-        cfg.model.dtype = DTypePrecision::BF16;
-        assert!(model_error(&cfg).contains("model.dtype f32"));
-        cfg.model.dtype = DTypePrecision::F32;
-        check_document_mask_model(&cfg).expect("f32 MLA passes");
+        for dtype in [
+            DTypePrecision::F32,
+            DTypePrecision::F16,
+            DTypePrecision::BF16,
+        ] {
+            cfg.model.dtype = dtype;
+            check_document_mask_model(&cfg).expect("MLA builds its mask bias in the model dtype");
+        }
     }
 
     #[test]
