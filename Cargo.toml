@@ -86,7 +86,7 @@ vocabs = ["boostr/vocabs"]
 # boostr: Complete ML framework replacing Candle
 # Provides: Tensor, Device, DType, Linear, Embedding, VarBuilder, etc.
 # Also re-exports cubecl_cuda::CudaRuntime when cuda feature is enabled
-boostr = { path = "../boostr", version = "0.9" }
+boostr = "0.9"
 # Text tokenizers for `oxidizr tokenize` and `--tokenizer`. The same crate and
 # requirement boostr declares, so the `vocab-*` features above reach it too.
 splintr = "0.22"
