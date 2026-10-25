@@ -170,6 +170,14 @@ Key `trainer` fields:
 
 The full key reference is in [docs/configuration.md](docs/configuration.md).
 
+Behavior changes that alter what an existing config trains:
+
+- MLA (`kv_latent_dim`) applies `rope_scaling`. It used to ignore it. A checkpoint trained before this change with `kv_latent_dim` and `rope_scaling` resumes with different rotary frequencies.
+- MLA refuses an explicit `head_dim` other than `hidden_size / num_heads`.
+- A fresh run with no `weight_decay_rule` uses `skip_1d`. A resume keeps the checkpoint's rule.
+
+See [Behavior Changes](docs/configuration.md#behavior-changes).
+
 ### Sample Configs
 
 Start from a file in `models/`. [models/README.md](models/README.md) describes each one. `models/nano-start/nano-start.yaml` is the educational hybrid model (Mamba2 + MLA + MoE).

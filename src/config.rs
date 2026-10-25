@@ -180,8 +180,9 @@ pub struct OxidizrModelConfig {
     pub tokenizer_vocab: String,
     pub max_seq_len: usize,
     pub rope_theta: f32,
-    /// RoPE frequency scaling (linear / llama3 / yarn). Only honored on the
-    /// dense-attention and hybrid model paths; see `RopeScalingSpec`.
+    /// RoPE frequency scaling (linear / llama3 / yarn). Honored by the dense
+    /// attention block (attention-only and hybrid models) and by MLA. An
+    /// SSM-only model refuses it. See `RopeScalingSpec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rope_scaling: Option<RopeScalingSpec>,
     /// Sliding-window attention span (Mistral-style). Only honored on the

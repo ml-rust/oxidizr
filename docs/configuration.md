@@ -465,6 +465,14 @@ trainer:
 
 The checkpoint meta records the rule, and a resume inherits each unset key. A meta without a rule reads as `decay_all`, so a run started before this key resumes bit for bit. A set key that differs from the checkpoint's rule prints a warning, and the resume is not exact. Under `--headless` it is an error. The run logs the rule once at start, with the tensor and parameter count of each side. Headless mode writes that line to stderr.
 
+## Behavior Changes
+
+These changes alter what an existing config trains:
+
+- **MLA applies `rope_scaling`.** A model with `kv_latent_dim` passes `rope_scaling` to MLA's rotary embedding. MLA used to ignore it. A checkpoint trained before this change with `kv_latent_dim` and `rope_scaling` resumes with different rotary frequencies, so the resume is not exact.
+- **MLA refuses a foreign `head_dim`.** MLA's head width is `hidden_size / num_heads`. A model with `kv_latent_dim` and an explicit `head_dim` of any other value is refused when the model is built. Remove `head_dim`.
+- **Fresh runs default to `skip_1d`.** A fresh run with no `weight_decay_rule` uses `skip_1d`. Runs used to decay every parameter. A resume keeps the checkpoint's rule, and a checkpoint that records none resumes as `decay_all`. See [Weight Decay](#weight-decay).
+
 ## Complete Example
 
 ### Standard Transformer

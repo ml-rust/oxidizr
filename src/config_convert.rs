@@ -109,11 +109,6 @@ fn to_rope_scaling(spec: &RopeScalingSpec) -> RopeScalingConfig {
     }
 }
 
-/// Reject `rope_scaling`/`sliding_window` combinations boostr cannot honor.
-/// Must run before conversion: boostr accepts these fields structurally on
-/// every model type but only the `llama` (`AttentionOnly`) path actually
-/// reads `sliding_window`, and only `llama`/`hybrid` read `rope_scaling` —
-/// the rest would silently do nothing.
 /// `speech_layout` must describe exactly the id space the embedding table covers.
 ///
 /// A mismatch means the audio range the loss mask selects and the row count the
@@ -214,6 +209,18 @@ fn validate_lora(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Result<()> {
     Ok(())
 }
 
+/// Reject attention extras (`rope_scaling`, `sliding_window`, `qk_norm`) that
+/// boostr ignores for this model shape.
+///
+/// Runs before conversion. boostr accepts these fields on every model type,
+/// but not every attention path reads them:
+/// - `rope_scaling`: the dense attention block (attention-only and hybrid)
+///   and MLA (`MlaConfig::from_universal`) read it. An SSM-only model has no
+///   attention block to apply it to.
+/// - `sliding_window`: only the attention-only path reads it. 0 is boostr's
+///   "disabled" sentinel, so it is refused as a value.
+/// - `qk_norm`: the dense attention block reads it. MLA has no per-head
+///   Q/K norm.
 fn validate_attention_extras(cfg: &OxidizrModelConfig, shape: &LayerShape) -> Result<()> {
     if matches!(shape, LayerShape::SsmOnly) {
         if cfg.rope_scaling.is_some() {
