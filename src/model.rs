@@ -2783,27 +2783,21 @@ where
                 // Attention sub-block
                 let residual = x;
                 let x = input_layernorm.forward(client, x)?;
-                LitGPT::check_nan(x.tensor(), "attn_input_norm")?;
 
                 let x = attn.forward(client, &x, segments.map(BatchSegments::segment_ids))?;
-                LitGPT::check_nan(x.tensor(), "attn_output")?;
 
                 let x = boostr::autograd::var_add(&x, residual, client)
                     .map_err(boostr::error::Error::Numr)?;
-                LitGPT::check_nan(x.tensor(), "attn_residual")?;
 
                 // MoE sub-block
                 let residual = &x;
                 let x = post_attention_layernorm.forward(client, &x)?;
-                LitGPT::check_nan(x.tensor(), "moe_input_norm")?;
 
                 // MoE forward returns (output, load_balance_loss, z_loss)
                 let (x, moe_loss, z_loss) = ffn.forward(client, &x)?;
-                LitGPT::check_nan(x.tensor(), "moe_output")?;
 
                 let x = boostr::autograd::var_add(&x, residual, client)
                     .map_err(boostr::error::Error::Numr)?;
-                LitGPT::check_nan(x.tensor(), "moe_residual")?;
 
                 Self::debug_activation(client, "MLA+MoE output", &x)?;
 
@@ -3755,9 +3749,6 @@ where
             }
         }
 
-        // Debug: check for NaN after embedding
-        Self::check_nan(x.tensor(), "embed_tokens")?;
-
         let mut aux_losses = Vec::new();
         let mut z_losses = Vec::new();
 
@@ -3773,9 +3764,6 @@ where
             };
             x = boostr::nn::var_contiguous(&output.hidden)?; // Force contiguous after each layer
 
-            // Debug: check for NaN after each layer
-            Self::check_nan(x.tensor(), &format!("layer_{}", i))?;
-
             // Collect MoE auxiliary losses
             if let Some(loss) = output.aux_loss {
                 aux_losses.push(loss);
@@ -3788,10 +3776,8 @@ where
         }
 
         let x = self.norm.forward(client, &x)?;
-        Self::check_nan(x.tensor(), "final_norm")?;
 
         let logits = self.lm_head.forward(client, &x)?;
-        Self::check_nan(logits.tensor(), "lm_head")?;
 
         Ok(ModelOutput {
             logits,
@@ -4923,30 +4909,6 @@ where
                 }
             }
         }
-        Ok(())
-    }
-
-    /// Check if tensor contains NaN/Inf values (debug helper)
-    /// NOTE: Disabled for performance - enable when debugging NaN issues
-    #[allow(unused_variables)]
-    fn check_nan(_tensor: &Tensor<R>, _name: &str) -> Result<()> {
-        // Debug code disabled for performance - uncomment to enable NaN checking:
-        // let vals = tensor.contiguous()?.to_vec::<f32>();
-        // let nan_count = vals.iter().filter(|x| x.is_nan()).count();
-        // let inf_count = vals.iter().filter(|x| x.is_infinite()).count();
-        // let neg_inf_count = vals.iter().filter(|x| **x == f32::NEG_INFINITY).count();
-        // let pos_inf_count = vals.iter().filter(|x| **x == f32::INFINITY).count();
-        // // Also check for very large values (potential memory corruption)
-        // const LARGE_THRESHOLD: f32 = 1e10;
-        // let large_count = vals.iter().filter(|x| x.is_finite() && x.abs() > LARGE_THRESHOLD).count();
-        // if nan_count > 0 || inf_count > 0 || large_count > 0 {
-        //     eprintln!("[NaN DEBUG] {} has {} NaN, {} Inf ({} +Inf, {} -Inf), {} LARGE (>1e10) out of {} values",
-        //         name, nan_count, inf_count, pos_inf_count, neg_inf_count, large_count, vals.len());
-        //     // Also print some stats
-        //     let max_val = vals.iter().filter(|x| x.is_finite()).fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        //     let min_val = vals.iter().filter(|x| x.is_finite()).fold(f32::INFINITY, |a, &b| a.min(b));
-        //     eprintln!("[NaN DEBUG] {} finite range: [{:.4}, {:.4}]", name, min_val, max_val);
-        // }
         Ok(())
     }
 }
