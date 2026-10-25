@@ -344,33 +344,9 @@ where
         self.mla.trainable_parameters()
     }
 
+    /// boostr's MLA config for `cfg`, the one serving reads too.
     fn mla_config(cfg: &ModelConfig) -> Result<boostr::nn::MlaConfig> {
-        let attn = cfg
-            .attention
-            .as_ref()
-            .ok_or_else(|| boostr::error::Error::ModelError {
-                reason: "attention config missing while building MLA config".into(),
-            })?;
-        let head_dim = Self::head_dim(cfg)?;
-        let kv_latent_dim = Self::required_dim("kv_latent_dim", attn.kv_latent_dim)?;
-        let q_latent_dim = Self::required_dim("q_latent_dim", attn.q_latent_dim)?;
-        let d_rope = Self::required_dim("d_rope", attn.d_rope)?;
-
-        let config = boostr::nn::MlaConfig {
-            hidden_size: cfg.hidden_size,
-            num_heads: attn.num_heads,
-            head_dim,
-            head_dim_v: head_dim,
-            kv_lora_rank: kv_latent_dim,
-            q_lora_rank: q_latent_dim,
-            rope_head_dim: d_rope,
-            max_seq_len: cfg.max_seq_len,
-            rope_theta: attn.rope_theta,
-            use_norm: true,
-            norm_eps: 1e-6,
-        };
-        config.validate()?;
-        Ok(config)
+        boostr::nn::MlaConfig::from_universal(cfg)
     }
 
     fn take_weights<C>(
@@ -534,41 +510,6 @@ where
         Ok(boostr::nn::RmsNorm::with_id(
             weight, weight_id, eps, trainable,
         ))
-    }
-
-    fn head_dim(cfg: &ModelConfig) -> Result<usize> {
-        let attn = cfg
-            .attention
-            .as_ref()
-            .ok_or_else(|| boostr::error::Error::ModelError {
-                reason: "attention config missing while computing MLA head_dim".into(),
-            })?;
-        if attn.num_heads == 0 {
-            return Err(boostr::error::Error::ModelError {
-                reason: "MLA num_heads must be non-zero".into(),
-            });
-        }
-        if !cfg.hidden_size.is_multiple_of(attn.num_heads) {
-            return Err(boostr::error::Error::ModelError {
-                reason: format!(
-                    "MLA hidden_size ({}) must be divisible by num_heads ({})",
-                    cfg.hidden_size, attn.num_heads
-                ),
-            });
-        }
-        Ok(cfg.hidden_size / attn.num_heads)
-    }
-
-    fn required_dim(name: &str, value: Option<usize>) -> Result<usize> {
-        let dim = value.ok_or_else(|| boostr::error::Error::ModelError {
-            reason: format!("MLA requires {name}"),
-        })?;
-        if dim == 0 {
-            return Err(boostr::error::Error::ModelError {
-                reason: format!("MLA {name} must be non-zero"),
-            });
-        }
-        Ok(dim)
     }
 
     fn ensure_shape(name: &str, weight: &Tensor<R>, expected_shape: &[usize]) -> Result<()> {
@@ -1960,7 +1901,7 @@ where
         experts_per_tok: usize,
     ) -> boostr::nn::moe::router::MoeRouterConfig {
         boostr::nn::moe::router::MoeRouterConfig {
-            router_temperature: 2.0,
+            router_temperature: boostr::nn::moe::MOE_ROUTER_TEMPERATURE,
             load_balance_loss_mode:
                 boostr::nn::moe::router::MoeLoadBalanceLossMode::SwitchPlusSquaredProb,
             ..boostr::nn::moe::router::MoeRouterConfig::new(num_experts, experts_per_tok)
@@ -1980,7 +1921,7 @@ where
     }
 
     fn shared_expert_scale(experts_per_tok: usize) -> f32 {
-        1.0 / (experts_per_tok as f32 + 1.0)
+        boostr::nn::moe::moe_shared_expert_scale(experts_per_tok)
     }
 
     fn required_moe_dims(cfg: &ModelConfig) -> Result<(usize, usize, usize)> {
@@ -2171,8 +2112,9 @@ pub struct BlockOutput<R: boostr::Runtime> {
 ///
 /// Deliberately 1e-6, not the 1e-5 used by the attention blocks' norms — the
 /// deleted `Mamba2Block`/`Mamba3Block` wrappers both used 1e-6 and changing it
-/// would silently alter training.
-const MAMBA_PRENORM_EPS: f32 = 1e-6;
+/// silently alters training. boostr's hybrid model reads the same
+/// constant when it serves these layers.
+const MAMBA_PRENORM_EPS: f32 = boostr::model::hybrid::SSM_PRENORM_EPS;
 
 enum BlockType<R: boostr::Runtime> {
     // The SSM blocks are far larger than the attention variants; boxing them
