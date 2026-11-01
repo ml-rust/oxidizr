@@ -25,7 +25,7 @@ pub struct PackArgs {
     #[arg(short = 'n', long)]
     pub name: Option<String>,
 
-    /// Output directory (default: hf/<username>/<model>)
+    /// Output directory (default: hf/{username}/{model})
     #[arg(short = 'o', long)]
     pub output: Option<String>,
 

@@ -247,7 +247,7 @@ pub fn run_push(args: PushArgs) -> Result<()> {
     // Build hf upload command
     let mut cmd = Command::new("hf");
     cmd.arg("upload")
-        .arg(&model.repo_id())
+        .arg(model.repo_id())
         .arg(&model.path)
         .arg("--repo-type")
         .arg("model");

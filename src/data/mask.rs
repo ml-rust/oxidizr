@@ -7,7 +7,7 @@ use boostr::model::SpeechLayout;
 /// One facility for every masked-loss scheme, so a second consumer never
 /// forks a parallel copy of the mask builder. Both loaders
 /// (`LitDataLoader::next_batch` and `PrefetchDataLoader::prefetch_worker`)
-/// build their mask through [`build_target_mask`], so the two shift paths
+/// build their mask through `build_target_mask`, so the two shift paths
 /// cannot diverge.
 pub enum TargetMask {
     /// boostr's speech-LM id layout: a target scores iff it falls in the

@@ -173,7 +173,7 @@ impl OxidizrModelConfig {
     ///
     /// # Errors
     ///
-    /// The errors of `mamba_layers` and [`checked_gdn_layers`].
+    /// The errors of `mamba_layers` and `checked_gdn_layers`.
     pub fn gdn_config(&self) -> Result<Option<GdnConfig>> {
         let mamba_layers = checked_mamba_layers(self)?;
         if checked_gdn_layers(self, &mamba_layers)?.is_empty() {

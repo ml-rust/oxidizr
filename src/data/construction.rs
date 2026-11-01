@@ -18,7 +18,7 @@ use std::path::Path;
 ///
 /// # Rows
 /// The stream is cut into fixed rows of `seq_len + 1` tokens (see
-/// [`super::rows`]). A batch is `batch_size` rows: inputs are
+/// `super::rows`). A batch is `batch_size` rows: inputs are
 /// `row[0..seq_len]`, targets are `row[1..seq_len + 1]`. Tokens past the last
 /// whole row of a source are never read.
 ///
@@ -49,7 +49,7 @@ use std::path::Path;
 ///
 /// # Supported Formats
 /// - `.bin` files: raw little-endian `u32` token arrays
-/// - In-memory: Vec<u32> for small datasets or testing
+/// - In-memory: `Vec<u32>` for small datasets or testing
 ///
 /// # Memory Mapping
 /// On a little-endian target files are memory-mapped, so the OS pages the

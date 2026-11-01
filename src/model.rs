@@ -5095,7 +5095,7 @@ where
 /// initialized to zeros (see `CausalSelfAttention::projection`), making `B·A` zero:
 /// the adapted model computes the base model's function at step 0.
 ///
-/// The exemption is narrow. Only names [`fresh_lora_names`] returns are
+/// The exemption is narrow. Only names `fresh_lora_names` returns are
 /// waived — the `lora_a`/`lora_b` of projections the config actually targets.
 /// A missing base weight, norm, or embedding is the same hard error it is on
 /// resume.

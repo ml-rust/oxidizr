@@ -1,7 +1,7 @@
 //! The `train` command: its flags, the run directory and record, and the launch of every rank.
 //!
 //! The run plan resolves the config, the GPU ids and the resume once. Each
-//! rank then trains in [`crate::commands::train_rank`]. One GPU, or the CPU,
+//! rank then trains in `crate::commands::train_rank`. One GPU, or the CPU,
 //! is one rank on the calling thread.
 
 use crate::commands::train_plan::{Launch, RunPlan};
@@ -97,7 +97,7 @@ pub struct TrainArgs {
     pub checkpoint_dir: Option<String>,
 
     /// Run directory for run.json, steps.json and evals.json. Default: $OXIDIZED_RUN_DIR,
-    /// else ./runs/<timestamp>. The directory is created when absent.
+    /// else ./runs/{timestamp}. The directory is created when absent.
     #[arg(long = "run-dir")]
     pub run_dir: Option<String>,
 }
