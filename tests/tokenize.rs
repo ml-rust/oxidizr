@@ -246,10 +246,10 @@ fn directory_inputs_are_read_in_path_byte_order() {
     );
     assert_eq!(read_tokens_le(&output), want);
     let meta = read_token_meta(&output).expect("read").expect("sidecar");
-    let order: Vec<String> = meta.inputs.iter().map(|i| i.path.clone()).collect();
-    let want_order: Vec<String> = ["A.txt", "a/c.txt", "b.txt"]
+    let order: Vec<PathBuf> = meta.inputs.iter().map(|i| PathBuf::from(&i.path)).collect();
+    let want_order: Vec<PathBuf> = ["A.txt", "a/c.txt", "b.txt"]
         .iter()
-        .map(|name| corpus.join(name).display().to_string())
+        .map(|name| corpus.join(name))
         .collect();
     assert_eq!(order, want_order);
 }
