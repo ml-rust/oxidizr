@@ -2233,10 +2233,13 @@ mod tests {
         fs::write(&config_path, yaml).expect("write temp config");
 
         let loaded = LitConfig::from_yaml(&config_path).expect("sidecar file exists");
-        assert_eq!(
-            loaded.trainer.checkpoint_sidecars,
-            vec![vocab_path.to_str().unwrap().to_string()]
-        );
+        let sidecars: Vec<&Path> = loaded
+            .trainer
+            .checkpoint_sidecars
+            .iter()
+            .map(Path::new)
+            .collect();
+        assert_eq!(sidecars, [vocab_path.as_path()]);
 
         fs::remove_dir_all(&scratch).ok();
         unsafe { std::env::remove_var("OXIDIZR_TEST_SIDECAR_DIR") };

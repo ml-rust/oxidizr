@@ -192,7 +192,7 @@ mod tests {
             "b.txt",
             "a/z.jsonl",
             "a/b.TXT",
-            "B.txt",
+            "Z.txt",
             "notes.md",
             "c/d/e.txt",
         ] {
@@ -210,13 +210,15 @@ mod tests {
                 f.path
                     .strip_prefix(&dir)
                     .expect("under dir")
-                    .display()
-                    .to_string()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
             })
             .collect();
         assert_eq!(
             names,
-            ["B.txt", "a/b.TXT", "a/z.jsonl", "b.txt", "c/d/e.txt"]
+            ["Z.txt", "a/b.TXT", "a/z.jsonl", "b.txt", "c/d/e.txt"]
         );
         assert_eq!(files[2].format, FileFormat::Jsonl);
         assert_eq!(files[1].format, FileFormat::Txt);
