@@ -248,7 +248,7 @@ where
 pub fn create_dummy_data(vocab_size: usize, total_tokens: usize) -> Vec<u32> {
     let mut data = Vec::with_capacity(total_tokens);
     for _ in 0..total_tokens {
-        data.push((rand::random::<usize>() % vocab_size) as u32);
+        data.push(rand::random_range(0..vocab_size) as u32);
     }
     data
 }
