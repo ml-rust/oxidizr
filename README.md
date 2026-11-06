@@ -2,7 +2,7 @@
 
 # oxidizr
 
-<h3>LLM training from a YAML config, in Rust.</h3>
+<h3>LLM training framework in Rust. Train models from a YAML config with no Python.</h3>
 
 <p>
 Trains GPT-style language models from a YAML config and a tokenized dataset.
@@ -57,6 +57,11 @@ oxidizr trains a language model from two inputs:
 oxidizr runs the training loop, optimizer, checkpointing, and metrics. It writes
 checkpoints as `.safetensors` files and packages them for distribution.
 
+- Language: training runs in Rust on [boostr](https://github.com/ml-rust/boostr) and [numr](https://github.com/ml-rust/numr). Training needs no Python. Only the optional `push` command uses Python tools, through the `hf` CLI.
+- Hardware: CPU, and NVIDIA GPUs through the `cuda` feature. Multi-GPU on one machine needs `cuda,nccl`.
+- Serve a trained model with [blazr](https://github.com/ml-rust/blazr).
+- Not supported yet: FSDP, ZeRO sharding, tensor parallelism, pipeline parallelism, and training across machines. blazr cannot serve Gated DeltaNet layers yet.
+
 | Layer | Config keys | Notes |
 |-------|-------------|-------|
 | Dense GQA transformer | `kv_heads`, with `kv_latent_dim` unset | Grouped-query attention with RoPE and RMSNorm |
@@ -73,10 +78,9 @@ Mamba2 and Mamba3 require `hidden_size * mamba2_expand == mamba2_num_heads * mam
 
 ## Installation
 
-oxidizr depends on `boostr` through the path `../boostr`. Clone both repositories into the same parent directory:
+oxidizr needs a Rust toolchain. It fetches `boostr` from crates.io. Clone and build:
 
 ```bash
-git clone https://github.com/ml-rust/boostr
 git clone https://github.com/ml-rust/oxidizr
 cd oxidizr
 cargo build --release
@@ -89,12 +93,11 @@ Add `--features cuda` to the build for GPU support. The CUDA build uses the tool
 Build the project, download the educational dataset, and start training:
 
 ```bash
-git clone https://github.com/ml-rust/boostr
 git clone https://github.com/ml-rust/oxidizr
 cd oxidizr
 cargo build --release
 
-pip install huggingface_hub
+pip install huggingface_hub   # only to download this dataset
 hf download fs90/nano-start-data-bin --local-dir data/nano-start/tokenized --repo-type dataset
 
 cargo run --release -- train -f models/nano-start/nano-start.yaml -d data/nano-start/tokenized/combined.bin
@@ -281,6 +284,18 @@ cargo build --release --features cuda,nccl
 Not supported: FSDP, ZeRO sharding, tensor parallelism, pipeline parallelism, and more than one machine.
 
 The CPU test suite runs every data-parallel path on in-process CPU ranks. The NCCL communicator, the NCCL abort, and the multi-GPU device setup are untested on real GPUs.
+
+## Tracking a Run
+
+Each run keeps its own history in its run directory:
+
+| File | Holds |
+|------|-------|
+| `run.json` | One record of the finished run |
+| `steps.json` | One JSON object per log interval |
+| `evals.json` | One JSON object per eval. Absent for a run without `trainer.eval` |
+
+A build with `--features tensorboard` also writes TensorBoard event files of the training and eval scalars. `--headless` prints JSON metrics to stdout. `--resume` continues a run from its weights, optimizer state and data position.
 
 ## Features
 
