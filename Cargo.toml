@@ -1,6 +1,6 @@
 [package]
 name = "oxidizr"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Farhan Syah "]
 description = "LLM training framework in Rust: train Transformer, Mamba, MLA and MoE models from a YAML config, with no Python"
